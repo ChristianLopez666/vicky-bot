@@ -1,12 +1,41 @@
-from flask import Flask, reqfrom flask import Flask, request, jsonify
+from flask import Flask, request, jsonify
 import os
-import json
+import openai
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 app = Flask(__name__)
 
+# Configuración de OpenAI (opcional si estás usando GPT en local)
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Configurar Google Sheets
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# Credenciales desde variable de entorno (Render)
+google_creds = os.getenv("GOOGLE_CREDENTIALS_JSON")
+creds_dict = eval(google_creds)
+credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+client = gspread.authorize(credentials)
+
+# Abrir la hoja de Google
+sheet = client.open("Prospectos SECOM Auto").sheet1
+
+# Obtener nombre desde número
+def get_client_name_from_whatsapp(phone):
+    registros = sheet.get_all_records()
+    for fila in registros:
+        numero = str(fila.get("Whatsapp", "")).strip().replace("+52", "").replace(" ", "")
+        if numero.endswith(phone[-10:]):
+            return fila.get("Nombre", "")
+    return None
+
 @app.route("/", methods=["GET"])
-def home():
-    return "Vicky está en línea"
+def index():
+    return "Bot Vicky activo 🚀"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -19,29 +48,25 @@ def webhook():
         nombre = get_client_name_from_whatsapp(from_number)
 
         if nombre:
-            respuesta = f"Hola {nombre}, soy Vicky 🤖. ¡Tienes un beneficio especial en tu seguro de auto!"
+            respuesta = f"Hola {nombre}, soy Vicky 🤖. ¡Tienes un beneficio especial en tu seguro de auto! 🚗"
         else:
-            respuesta = "Hola, soy Vicky 🤖, asistente de Christian López. Aquí para ayudarte 😊"
+            respuesta = "Hola, soy Vicky 🤖, asistente de Christian López. Aquí tienes nuestro menú de servicios disponibles: [Menú]"
 
-        return {
+        return jsonify({
             "messages": [
                 {
                     "to": from_number,
+                    "type": "text",
                     "text": {
                         "body": respuesta
                     }
                 }
             ]
-        }
-    except Exception as e:
-        print("Error:", e)
-        return jsonify({"error": "Ocurrió un error"}), 500
+        })
 
-def get_client_name_from_whatsapp(whatsapp_number):
-    # Lógica provisional o conexión con Google Sheets
-    return None
+    except Exception as e:
+        print(f"Error en webhook: {e}")
+        return "error", 500
 
 if __name__ == "__main__":
     app.run(debug=True)
-
-
