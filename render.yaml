@@ -1,0 +1,33 @@
+
+services:
+- type: web
+  name: vicky-bot
+  env: python
+  plan: starter
+  buildCommand: pip install -r requirements.txt
+  startCommand: gunicorn app:app --timeout 120 --workers 2 --threads 4
+  envVars:
+  - key: WHATSAPP_PROVIDER
+    value: 360dialog
+  - key: VERIFY_TOKEN
+    generateValue: true
+  - key: D360_API_KEY
+    sync: false
+  - key: D360_URL
+    value: https://waba.360dialog.io/v1/messages
+  - key: META_TOKEN
+    sync: false
+  - key: PHONE_NUMBER_ID
+    sync: false
+  - key: SHEET_NAME
+    value: Prospectos SECOM Auto
+  - key: REQUESTS_SHEET_NAME
+    value: Solicitudes Vicky
+  - key: ADVISOR_NUMBER
+    value: 5216682478005
+  - key: MENU_AUTO_DISCOUNT
+    value: "60"
+  - key: GOOGLE_CREDENTIALS_JSON
+    sync: false
+  - key: NOTIFY_WEBHOOK_URL
+    sync: false
