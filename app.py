@@ -1,6 +1,6 @@
 import os
-from flask import Flask, request
 import logging
+from flask import Flask, request
 
 app = Flask(__name__)
 
@@ -22,14 +22,19 @@ def verify():
         logging.warning("❌ Fallo en la verificación del webhook.")
         return "Verification failed", 403
 
-# Ruta para recibir mensajes (POST)
+# Ruta para recibir mensajes de WhatsApp (POST)
 @app.route('/webhook', methods=['POST'])
 def receive_message():
     data = request.get_json()
     logging.info(f"📩 Mensaje recibido: {data}")
     return "EVENT_RECEIVED", 200
 
-# Ruta de prueba para saber si el bot está activo
+# Endpoint de salud para Render
 @app.route('/health', methods=['GET'])
-def health():
+def health_check():
     return "OK", 200
+
+# Solo para pruebas locales
+if __name__ == '__main__':
+    app.run(debug=True)
+
