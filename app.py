@@ -1,72 +1,40 @@
 from flask import Flask, request, jsonify
 import os
-import openai
-import gspread
-import json
-from oauth2client.service_account import ServiceAccountCredentials
+import logging
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# Configuración de OpenAI (opcional)
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# Cargar credenciales desde variable de entorno
-google_creds_raw = os.getenv("GOOGLE_CREDENTIALS_JSON")
-if isinstance(google_creds_raw, str):
-    creds_dict = json.loads(google_creds_raw)
-else:
-    creds_dict = google_creds_raw  # En caso Render ya la haya interpretado
-
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
-]
-credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-client = gspread.authorize(credentials)
-sheet = client.open("Prospectos SECOM Auto").sheet1
-
-def get_client_name_from_whatsapp(phone):
-    registros = sheet.get_all_records()
-    for fila in registros:
-        numero = str(fila.get("Whatsapp", "")).strip().replace("+52", "").replace(" ", "")
-        if numero.endswith(phone[-10:]):
-            return fila.get("Nombre", "")
-    return None
+# Token que Meta usará para verificar el webhook
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "vicky-verify-token")
 
 @app.route("/", methods=["GET"])
 def index():
+    # Respuesta simple para health/landing
     return "Bot Vicky activo 🚀"
 
-@app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    try:
-        incoming_data = request.get_json(force=True)
-        message = incoming_data['messages'][0]
-        from_number = message['from']
-        body = message.get('text', {}).get('body', '')
+    if request.method == "GET":
+        # Verificación de Meta (debe devolver el challenge en TEXTO plano)
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
 
-        nombre = get_client_name_from_whatsapp(from_number)
+        ok = (mode == "subscribe") and (token == VERIFY_TOKEN) and bool(challenge)
+        if ok:
+            logging.info("✅ Webhook verificado por Meta.")
+            return challenge, 200  # ← Importante: texto plano
+        logging.warning("❌ Verificación fallida: mode=%s token_ok=%s", mode, token == VERIFY_TOKEN)
+        return jsonify({"error": "Forbidden"}), 403
 
-        if nombre:
-            respuesta = f"Hola {nombre}, soy Vicky 🤖. ¡Tienes un beneficio especial en tu seguro de auto! 🚗"
-        else:
-            respuesta = "Hola, soy Vicky 🤖, asistente de Christian López. Aquí tienes nuestro menú de servicios disponibles: [Menú]"
+    # POST: eventos entrantes
+    data = request.get_json(silent=True) or {}
+    logging.info("📩 Evento recibido: %s", str(data)[:1200])
 
-        return jsonify({
-            "messages": [
-                {
-                    "to": from_number,
-                    "type": "text",
-                    "text": {
-                        "body": respuesta
-                    }
-                }
-            ]
-        })
-
-    except Exception as e:
-        print(f"Error en webhook: {e}")
-        return "error", 500
+    # Devolvemos JSON consistente
+    return jsonify({"status": "EVENT_RECEIVED"}), 200
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
