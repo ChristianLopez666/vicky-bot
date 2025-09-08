@@ -1,0 +1,31 @@
+# render.yaml — Infra as code for Render.com
+# Docs: https://render.com/docs/yaml-spec
+services:
+  - type: web
+    name: vicky-bot
+    env: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: META_TOKEN
+        sync: false
+      - key: PHONE_NUMBER_ID
+        sync: false
+      - key: VERIFY_TOKEN
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: PORT
+        value: "10000"
+      - key: FLASK_DEBUG
+        value: "false"
+      - key: ADVISOR_NOTIFY_NUMBER
+        value: "5216682478005"
+      - key: TZ
+        value: "America/Mazatlan"
