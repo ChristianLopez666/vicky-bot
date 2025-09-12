@@ -14,7 +14,7 @@ load_dotenv(override=True)
 
 # Módulos del proyecto (usan variables ya cargadas)
 from config_env import VERIFY_TOKEN, ADVISOR_NUMBER, LOG_LEVEL
-from core_whatsapp import send_whatsapp_message
+from integrations_gpt import send_whatsapp_message   # ✅ corregido: ya no usamos core_whatsapp
 from core_router import route_message
 
 # =======================
@@ -88,11 +88,9 @@ def webhook_verify() -> Response:
 @app.post("/webhook")
 def webhook_receive() -> Response:
     """Recepción de eventos de WhatsApp (POST)."""
-    # 1) Seguridad
     if not _valid_signature(request):
         return Response(status=403)
 
-    # 2) Parseo y filtro
     data = request.get_json(silent=True) or {}
     log.info("Incoming WA payload: %s", str(data)[:1000])
 
@@ -136,12 +134,10 @@ def webhook_receive() -> Response:
                         )
                         send_whatsapp_message(ADVISOR_NUMBER, notify)
 
-        # 6) Siempre 200 para evitar reintentos
         return jsonify({"ok": True}), 200
 
     except Exception as e:
         log.exception("Error procesando webhook")
-        # Responder 200 igualmente, pero reportar en cuerpo (útil para tests)
         return jsonify({"ok": False, "error": str(e)}), 200
 
 
@@ -162,3 +158,4 @@ def send_test() -> Response:
 # =======================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
+
