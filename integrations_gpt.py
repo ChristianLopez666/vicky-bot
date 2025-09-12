@@ -1,187 +1,121 @@
-# integrations_gpt.py
-# Módulo para integrar GPT (OpenAI) y la API de WhatsApp (Meta Cloud) usando requests y logging.
-# Diseñado para importarse en app.py y core_router.py de Vicky Bot (Flask).
-from typing import Optional
 import os
+import time
 import logging
+from typing import Optional
+
 import requests
-import re
+from dotenv import load_dotenv
 
-logger = logging.getLogger(__name__)
-# Evita "No handler found" si la app no configura logging explícitamente.
-logger.addHandler(logging.NullHandler())
+# Load envs (allow override)
+load_dotenv(override=True)
 
-# Cargar variables de entorno de forma segura (no lanzar si faltan; validar en tiempo de uso).
-OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
-GPT_MODEL: str = os.getenv("GPT_MODEL", "gpt-4o-mini")
-META_TOKEN: Optional[str] = os.getenv("META_TOKEN")
-PHONE_NUMBER_ID: Optional[str] = os.getenv("PHONE_NUMBER_ID")
+logger = logging.getLogger("vicky.gpt")
 
-# URL base de WhatsApp (Meta Cloud)
-_WHATSAPP_API_URL_TEMPLATE = "https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+# Configuración GPT
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
 
-# Configuración de la solicitud
-_OPENAI_CHAT_COMPLETION_URL = "https://api.openai.com/v1/chat/completions"
-_REQUEST_TIMEOUT_SECONDS = 10  # tiempo de espera para llamadas HTTP
+# Configuración WhatsApp / Meta
+META_TOKEN = os.getenv("META_TOKEN", "")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
+WA_API_VERSION = os.getenv("WA_API_VERSION", "v20.0")
 
-
-def _clean_text(text: str) -> str:
-    """
-    Limpia y normaliza texto devuelto por GPT:
-    - elimina espacios múltiples y saltos de línea innecesarios
-    - recorta espacios al inicio/fin
-    - asegura que sea una cadena
-    """
-    if not isinstance(text, str):
-        text = str(text or "")
-    # Reemplaza múltiples espacios y tabs por uno
-    text = re.sub(r"[ \t]+", " ", text)
-    # Normaliza saltos de línea (más de uno -> uno)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
-    text = text.strip()
-    return text
+WHATSAPP_API_URL = (
+    f"https://graph.facebook.com/{WA_API_VERSION}/{PHONE_NUMBER_ID}/messages"
+    if PHONE_NUMBER_ID
+    else None
+)
 
 
 def ask_gpt(prompt: str) -> str:
     """
-    Envía el prompt a OpenAI Chat Completions y devuelve la respuesta (texto en español).
-    Manejo robusto de errores según requisitos.
-
-    Retorna:
-      - Texto respuesta en español (limpio).
-      - En caso de problemas, una cadena con el mensaje de error en español.
+    Consulta al endpoint chat/completions de OpenAI y devuelve texto.
+    Manejo de 429 con reintentos exponenciales (2,4,8s) hasta 3 intentos.
     """
-    system_context = (
-        "Eres Vicky, asistente de Christian López. Responde siempre en español de forma clara, útil y conversacional."
-    )
-
     if not OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY no está configurada. No es posible conectar con GPT.")
-        return "⚠️ No tengo conexión con GPT en este momento."
+        logger.error("OPENAI_API_KEY no está configurada. ask_gpt no puede ejecutarse.")
+        return ⚠️ No tengo conexión con GPT en este momento."
 
+    url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
-
     payload = {
         "model": GPT_MODEL,
         "messages": [
-            {"role": "system", "content": system_context},
+            {"role": "system", "content": "Eres Vicky, asistente de Christian López. Responde siempre en español, de forma clara y útil."},
             {"role": "user", "content": prompt},
         ],
         "max_tokens": 400,
         "temperature": 0.7,
     }
 
-    try:
-        resp = requests.post(
-            _OPENAI_CHAT_COMPLETION_URL, json=payload, headers=headers, timeout=_REQUEST_TIMEOUT_SECONDS
-        )
-    except requests.exceptions.RequestException as exc:
-        # Error de red / conexión
-        logger.exception("Error de red al conectar con OpenAI: %s", exc)
-        return "⚠️ Hubo un error al conectarme con GPT."
-
-    # Manejo por código de estado
-    if resp.status_code == 429:
-        logger.warning("OpenAI rate limit (429) al solicitar completions.")
-        return "⚠️ Estoy recibiendo demasiadas solicitudes. Intenta más tarde."
-
-    if not (200 <= resp.status_code < 300):
-        # Intenta leer mensaje de error para detalles
-        err_text = ""
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            err_json = resp.json()
-            err_text = err_json.get("error", {}).get("message", "") or str(err_json)
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            if resp.status_code == 429:
+                backoff = 2 ** (attempt + 1)
+                logger.warning("GPT rate limit (429). Reintentando en %s segundos (intento %s/%s).", backoff, attempt + 1, max_retries)
+                time.sleep(backoff)
+                continue
+            # For other non-2xx codes, raise for handling below
+            resp.raise_for_status()
+            data = resp.json()
+            # Validate structure
+            choices = data.get("choices") or []
+            if not choices or not isinstance(choices, list):
+                logger.error("Respuesta de GPT sin 'choices' válido. Resp preview: %s", str(data)[:500])
+                break
+            message = choices[0].get("message", {})
+            content = message.get("content", "") if isinstance(message, dict) else ""
+            if not content:
+                logger.error("Respuesta de GPT sin contenido. Resp preview: %s", str(data)[:500])
+                break
+            return content.strip()
+        except requests.RequestException:
+            logger.exception("Error en petición a OpenAI (intento %s/%s).", attempt + 1, max_retries)
+            # If last attempt, fallthrough to fallback
+            if attempt + 1 < max_retries:
+                backoff = 2 ** (attempt + 1)
+                time.sleep(backoff)
+                continue
+            else:
+                break
         except Exception:
-            err_text = resp.text or f"HTTP {resp.status_code}"
-        logger.error(
-            "Respuesta inesperada de OpenAI: status=%s, body=%s", resp.status_code, err_text[:1000]
-        )
-        return "⚠️ Hubo un error al conectarme con GPT."
+            logger.exception("Error procesando respuesta de OpenAI.")
+            break
 
-    # Parsear respuesta exitosa
-    try:
-        data = resp.json()
-        # Estructura estándar: choices[0].message.content
-        choices = data.get("choices", [])
-        if not choices:
-            logger.error("OpenAI devolvió estructura inesperada (sin choices). Payload: %s", data)
-            return "⚠️ Hubo un error al conectarme con GPT."
-
-        message_content = choices[0].get("message", {}).get("content") or choices[0].get("text")
-        if not message_content:
-            # algunos modelos antiguos usan 'text' directo
-            logger.error("OpenAI devolvió choice sin contenido textual. choice: %s", choices[0])
-            return "⚠️ Hubo un error al conectarme con GPT."
-
-        cleaned = _clean_text(message_content)
-        # Aseguramos que haya contenido
-        if not cleaned:
-            logger.warning("OpenAI devolvió respuesta vacía.")
-            return "⚠️ Hubo un error al conectarme con GPT."
-
-        logger.info("Respuesta de GPT obtenida correctamente (long=%d).", len(cleaned))
-        return cleaned
-
-    except ValueError as ve:
-        logger.exception("No se pudo decodificar JSON de OpenAI: %s", ve)
-        return "⚠️ Hubo un error al conectarme con GPT."
-    except Exception as exc:
-        logger.exception("Error procesando la respuesta de OpenAI: %s", exc)
-        return "⚠️ Hubo un error al conectarme con GPT."
+    return "⚠️ Estoy teniendo problemas para conectarme a GPT en este momento. Intenta de nuevo más tarde."
 
 
 def send_whatsapp_message(to: str, message: str) -> None:
     """
     Envía un mensaje de texto a través de la API de WhatsApp (Meta Cloud).
-    - to: número en formato E.164 (ej. 5216681234567)
-    - message: cuerpo del texto a enviar
-
-    No lanza excepciones hacia fuera por errores previsibles; los registra en logs.
+    No devuelve nada; loggea errores en caso de fallo.
     """
-    if not META_TOKEN or not PHONE_NUMBER_ID:
-        logger.error(
-            "No se envió mensaje: falta configuración de META_TOKEN o PHONE_NUMBER_ID. META_TOKEN_set=%s, PHONE_NUMBER_ID_set=%s",
-            bool(META_TOKEN),
-            bool(PHONE_NUMBER_ID),
-        )
+    if not META_TOKEN or not PHONE_NUMBER_ID or not WHATSAPP_API_URL:
+        logger.error("META_TOKEN o PHONE_NUMBER_ID no están configurados; no se puede enviar mensaje WhatsApp.")
         return
 
-    url = _WHATSAPP_API_URL_TEMPLATE.format(phone_number_id=PHONE_NUMBER_ID)
     headers = {
         "Authorization": f"Bearer {META_TOKEN}",
         "Content-Type": "application/json",
     }
-
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"preview_url": False, "body": message},
+        "text": {"body": message},
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=_REQUEST_TIMEOUT_SECONDS)
-    except requests.exceptions.RequestException as exc:
-        logger.exception("Error de red al enviar mensaje por WhatsApp a %s: %s", to, exc)
-        return
-
-    # Graph API típicamente devuelve 200 OK (o 201 en algunos casos); tratamos cualquier 2xx como éxito.
-    if 200 <= resp.status_code < 300:
-        logger.info("Mensaje enviado a %s vía WhatsApp (status=%s).", to, resp.status_code)
-        return
-
-    # Si no es 2xx, registrar fallo con detalle
-    resp_text_snippet = (resp.text or "")[:2000]
-    logger.error(
-        "Fallo al enviar mensaje por WhatsApp a %s: status=%s, body=%s",
-        to,
-        resp.status_code,
-        resp_text_snippet,
-    )
-    return
-
-
-__all__ = ["ask_gpt", "send_whatsapp_message"]
+        resp = requests.post(WHATSAPP_API_URL, headers=headers, json=payload, timeout=30)
+        if resp.status_code != 200:
+            text_preview = (resp.text[:1000] + "...") if resp.text and len(resp.text) > 1000 else resp.text
+            logger.error("WhatsApp API returned status %s. Response: %s", resp.status_code, text_preview)
+    except requests.RequestException:
+        logger.exception("Error realizando petición a la API de WhatsApp.")
+    except Exception:
+        logger.exception("Error inesperado enviando mensaje WhatsApp.")
