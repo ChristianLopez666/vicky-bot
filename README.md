@@ -1,74 +1,139 @@
-# Vicky Bot — Fase 1 (Flask + WhatsApp Cloud API)
+# 🤖 Vicky Bot
 
-Servicio Flask listo para Render.com que atiende el webhook de WhatsApp, gestiona menú, funneles y reenvía medios al asesor mediante **download → upload → send** (requisito de la API).
-
----
-
-## Variables de entorno (Render → *Environment*)
-| Variable | Requerida | Descripción |
-|---|---|---|
-| `META_TOKEN` | ✅ | Token de la app con permisos `whatsapp_business_messaging` |
-| `PHONE_NUMBER_ID` | ✅ | ID del número de WhatsApp Business |
-| `VERIFY_TOKEN` | ✅ | Se usa en la verificación GET del webhook |
-| `META_APP_SECRET` | Opcional | Activa validación HMAC SHA-256 del webhook |
-| `ADMIN_TOKEN` | Opcional | Token para `/admin/status` |
-| `ADVISOR_NOTIFY_NUMBER` | ✅ | Número E.164 al que se reenvían medios |
-| `PORT` | Opcional | `10000` en Render |
-| `FLASK_DEBUG` | Opcional | `false` en producción |
-| `TZ` | Opcional | `America/Mazatlan` |
-
-> **Nota:** Define todas las variables en Render **antes** de desplegar. No subas secretos al repo.
+Asistente de **Christian López**, integrado con **WhatsApp Cloud API** y **OpenAI GPT**.  
+Permite atención automática de clientes, menú de opciones y respuestas inteligentes.
 
 ---
 
-## Endpoints
-- `GET /health` → `200 OK`
-- `GET /webhook` → Handshake de verificación (`hub.verify_token` vs `VERIFY_TOKEN`)
-- `POST /webhook` → Recepción de mensajes; soporta `text`, `interactive`, `image`, `document`, `video`, `audio`
-- `GET /admin/status` → Estado del servicio (**requiere** header `X-Admin-Token: <ADMIN_TOKEN>`)
+## 🚀 Funcionalidad
+
+- Respuesta automática en WhatsApp.
+- Menú inicial (pensiones, seguros, préstamos, etc.).
+- Integración con GPT para interpretar texto libre.
+- Notificación al asesor (`ADVISOR_NUMBER`) cuando corresponde.
+- Deploy automático en **Render**.
 
 ---
 
-## Despliegue en Render (Infra as code)
-1. Sube este repo (con `app.py`, `requirements.txt`, `render.yaml`, `Procfile`).
-2. En Render → **New +** → **From YAML** → selecciona `render.yaml`.
-3. Configura las **Environment Variables** indicadas arriba.
-4. Render instalará dependencias y levantará `web: python app.py`.
-5. Copia la URL pública del servicio para configurarla como **Webhook URL** en Meta:
-   - **Callback URL:** `https://<tu-servicio>.onrender.com/webhook`
-   - **Verify Token:** el valor de `VERIFY_TOKEN`
+## 📂 Estructura del proyecto
+
+.
+├── app.py
+├── config_env.py
+├── core_router.py
+├── core_whatsapp.py
+├── integrations_gpt.py
+├── requirements.txt
+├── Procfile
+├── render.yaml
+├── .env.sample
+└── README.md
+
+makefile
+Copiar código
 
 ---
 
-## Pruebas rápidas
-```bash
-curl -sSf https://<tu-servicio>.onrender.com/health
-# -> OK
-```
+## ⚙️ Variables de entorno
 
-Para verificar webhook desde Meta, asegúrate de que `VERIFY_TOKEN` coincida.
-El endpoint `POST /webhook` responderá `EVENT_RECEIVED` si procesa el payload.
+Configura en Render → **Environment** (y en `.env` en local):
 
----
+```ini
+# Meta / WhatsApp
+VERIFY_TOKEN=vicky-verify-2025
+META_TOKEN=your_meta_token_here
+META_APP_SECRET=your_meta_app_secret_here
+PHONE_NUMBER_ID=your_phone_number_id_here
+WA_API_VERSION=v20.0
 
-## Local (opcional)
-```bash
-python -m venv .venv && . .venv/bin/activate  # Windows: .venv\Scripts\activate
+# Asesor
+ADVISOR_NUMBER=5216682478005
+
+# OpenAI
+OPENAI_API_KEY=your_openai_api_key_here
+GPT_MODEL=gpt-4o-mini
+
+# Flask / Render
+PORT=5000
+LOG_LEVEL=INFO
+PYTHON_VERSION=3.11.9
+🖥️ Uso en local
+Clona el repo:
+
+bash
+Copiar código
+git clone https://github.com/ChristianLopez666/vicky-bot.git
+cd vicky-bot
+Crea entorno virtual:
+
+bash
+Copiar código
+python -m venv venv
+source venv/bin/activate   # Linux/Mac
+venv\Scripts\activate      # Windows
+Instala dependencias:
+
+bash
+Copiar código
 pip install -r requirements.txt
-export META_TOKEN=... PHONE_NUMBER_ID=... VERIFY_TOKEN=...
+Ejecuta en local:
+
+bash
+Copiar código
 python app.py
-# http://127.0.0.1:5000/health
-```
+Expón con ngrok:
+
+bash
+Copiar código
+ngrok http 5000
+Configura tu Webhook en Meta con la URL de ngrok.
+
+☁️ Deploy en Render
+Sube todo el repo a GitHub.
+
+En Render:
+
+New Web Service → conecta el repo.
+
+Build Command: pip install -r requirements.txt
+
+Start Command: gunicorn app:app --bind 0.0.0.0:$PORT
+
+Revisa que el servicio quede Live.
+
+Configura la URL de Render en tu App de Meta (/webhook).
+
+✅ Pruebas rápidas
+Saludo inicial: envía “hola” → muestra menú.
+
+Opción numérica: envía “2” → muestra seguros de auto.
+
+Texto libre: envía “Quiero un préstamo de 50 mil” → GPT responde.
+
+Notificación a Christian: envía “8” → llega mensaje al asesor.
+
+📌 Notas
+No subas tu .env real a GitHub, usa solo .env.sample.
+
+GPT solo responde si tienes OPENAI_API_KEY configurada en Render.
+
+Meta puede tardar 1–2 minutos en propagar cambios de webhook.
+
+yaml
+Copiar código
 
 ---
 
-## Troubleshooting
-- **Duplicación de mensajes en debug:** el archivo ya desactiva el *reloader* (`use_reloader=False`).
-- **403 en reenvío de medios:** recuerda que se hace `download → upload → send`. Si falla, revisa permisos y tamaño.
-- **403 firma inválida:** si defines `META_APP_SECRET`, Meta firmará el webhook; el servicio lo validará. Si no, deja la var vacía.
-- **502 en Render:** revisa logs, variables y que el puerto sea `10000` (Render lo inyecta pero aquí se fija por env).
+¿Quieres que te prepare también un **checklist paso a paso** (tipo bitácora) para que no se te pase nada en la activación de Vicky Bot Fase 1 + GPT?
 
----
 
-## Licencia
-Uso interno COHIFIS / Christian López.
+
+
+
+
+
+Preguntar a ChatGPT
+
+
+
+
