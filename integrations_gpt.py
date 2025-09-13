@@ -1,26 +1,25 @@
 # -*- coding: utf-8 -*-
 import os
-import time
 import logging
-from typing import Optional
-
 import requests
-from dotenv import load_dotenv
+import time
+import random
 
-# Load envs (allow override)
-load_dotenv(override=True)
+log = logging.getLogger("vicky.gpt")
 
-logger = logging.getLogger("vicky.gpt")
+_session = requests.Session()
 
-# Configuración GPT
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
 
-# Configuración WhatsApp / Meta
+# Opcionales para reintentos/backoff
+MAX_TRIES = int(os.getenv("GPT_MAX_RETRIES", "5"))
+BASE_DELAY = float(os.getenv("GPT_BACKOFF_BASE", "2.0"))
+
+# WhatsApp (mantener como estaba)
 META_TOKEN = os.getenv("META_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
 WA_API_VERSION = os.getenv("WA_API_VERSION", "v20.0")
-
 WHATSAPP_API_URL = (
     f"https://graph.facebook.com/{WA_API_VERSION}/{PHONE_NUMBER_ID}/messages"
     if PHONE_NUMBER_ID
@@ -30,11 +29,10 @@ WHATSAPP_API_URL = (
 
 def ask_gpt(prompt: str) -> str:
     """
-    Consulta al endpoint chat/completions de OpenAI y devuelve texto.
-    Manejo de 429 con reintentos exponenciales (2,4,8s) hasta 3 intentos.
+    Envía una consulta a la API de OpenAI (chat/completions) y devuelve la respuesta en texto.
+    Maneja 429 y errores de red con reintentos exponenciales con jitter.
     """
     if not OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY no está configurada. ask_gpt no puede ejecutarse.")
         return "⚠️ No tengo conexión con GPT en este momento."
 
     url = "https://api.openai.com/v1/chat/completions"
@@ -47,7 +45,7 @@ def ask_gpt(prompt: str) -> str:
         "messages": [
             {
                 "role": "system",
-                "content": "Eres Vicky, asistente de Christian López. Responde siempre en español, de forma clara y útil.",
+                "content": "Eres Vicky, asistente de Christian López. Responde siempre en español de forma clara y útil.",
             },
             {"role": "user", "content": prompt},
         ],
@@ -55,54 +53,86 @@ def ask_gpt(prompt: str) -> str:
         "temperature": 0.7,
     }
 
-    max_retries = 3
-    for attempt in range(max_retries):
+    for attempt in range(1, MAX_TRIES + 1):
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 429:
-                backoff = 2 ** (attempt + 1)
-                logger.warning(
-                    "GPT rate limit (429). Reintentando en %s segundos (intento %s/%s).",
-                    backoff,
-                    attempt + 1,
-                    max_retries,
-                )
-                time.sleep(backoff)
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            choices = data.get("choices") or []
-            if not choices or not isinstance(choices, list):
-                logger.error("Respuesta de GPT sin 'choices' válido. Resp preview: %s", str(data)[:500])
-                break
-            message = choices[0].get("message", {})
-            content = message.get("content", "") if isinstance(message, dict) else ""
-            if not content:
-                logger.error("Respuesta de GPT sin contenido. Resp preview: %s", str(data)[:500])
-                break
-            return content.strip()
+            resp = _session.post(url, headers=headers, json=payload, timeout=30)
         except requests.RequestException:
-            logger.exception("Error en petición a OpenAI (intento %s/%s).", attempt + 1, max_retries)
-            if attempt + 1 < max_retries:
-                backoff = 2 ** (attempt + 1)
-                time.sleep(backoff)
-                continue
-            else:
+            # Error de red: reintentar con backoff si quedan intentos
+            if attempt >= MAX_TRIES:
+                log.exception("Error de red al contactar GPT en intento %d/%d", attempt, MAX_TRIES)
                 break
-        except Exception:
-            logger.exception("Error procesando respuesta de OpenAI.")
+            delay = BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            log.warning(
+                "Error de red contactando a GPT. Reintentando en %.1fs (intento %d/%d).",
+                delay,
+                attempt,
+                MAX_TRIES,
+            )
+            time.sleep(delay)
+            continue
+
+        # Manejo explícito de 429
+        if resp.status_code == 429:
+            if attempt >= MAX_TRIES:
+                log.warning("GPT rate limit persistente (429) tras %d intentos.", MAX_TRIES)
+                break
+            delay = BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            log.warning(
+                "GPT rate limit (429). Reintentando en %.1fs (intento %d/%d).",
+                delay,
+                attempt,
+                MAX_TRIES,
+            )
+            time.sleep(delay)
+            continue
+
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError:
+            # No incluir tokens/keys en los logs
+            body_preview = resp.text[:500] if resp is not None else ""
+            log.exception("Respuesta inesperada de GPT: %s %s", resp.status_code, body_preview)
             break
 
+        try:
+            data = resp.json()
+        except ValueError:
+            log.exception("Respuesta JSON inválida desde GPT")
+            break
+
+        # Validar estructura esperada
+        try:
+            choices = data.get("choices") or []
+            if not choices or not isinstance(choices, list):
+                log.error("Respuesta de GPT sin 'choices' válido")
+                break
+            first_choice = choices[0]
+            message = None
+            if isinstance(first_choice, dict):
+                message = first_choice.get("message")
+            if not message or not isinstance(message, dict):
+                log.error("Respuesta de GPT sin 'message' en choices[0]")
+                break
+            content = message.get("content", "")
+            if not content or not content.strip():
+                log.error("Contenido de respuesta de GPT vacío")
+                break
+            return content.strip()
+        except Exception:
+            log.exception("Error procesando la respuesta de GPT")
+            break
+
+    # Fallback final tras agotar reintentos o excepciones
     return "⚠️ Estoy teniendo problemas para conectarme a GPT en este momento. Intenta de nuevo más tarde."
 
 
 def send_whatsapp_message(to: str, message: str) -> None:
     """
-    Envía un mensaje de texto a través de la API de WhatsApp (Meta Cloud).
-    No devuelve nada; loggea errores en caso de fallo.
+    Envía un mensaje de texto vía la API de WhatsApp (Graph API).
+    No retorna nada. Loggea errores sin exponer tokens.
     """
     if not META_TOKEN or not PHONE_NUMBER_ID or not WHATSAPP_API_URL:
-        logger.error("META_TOKEN o PHONE_NUMBER_ID no están configurados; no se puede enviar mensaje WhatsApp.")
+        log.error("Falta configuración de WhatsApp: META_TOKEN o PHONE_NUMBER_ID. No se enviará el mensaje.")
         return
 
     headers = {
@@ -117,11 +147,10 @@ def send_whatsapp_message(to: str, message: str) -> None:
     }
 
     try:
-        resp = requests.post(WHATSAPP_API_URL, headers=headers, json=payload, timeout=30)
+        resp = _session.post(WHATSAPP_API_URL, headers=headers, json=payload, timeout=30)
         if resp.status_code != 200:
-            text_preview = (resp.text[:1000] + "...") if resp.text and len(resp.text) > 1000 else resp.text
-            logger.error("WhatsApp API returned status %s. Response: %s", resp.status_code, text_preview)
+            # Loggear el error pero no exponer tokens
+            log.error("Error al enviar mensaje WA: %s %s", resp.status_code, resp.text)
     except requests.RequestException:
-        logger.exception("Error realizando petición a la API de WhatsApp.")
-    except Exception:
-        logger.exception("Error inesperado enviando mensaje WhatsApp.")
+        log.exception("Excepción al intentar enviar mensaje WhatsApp")
+    # No return necesario
