@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import time
 import logging
@@ -34,7 +35,7 @@ def ask_gpt(prompt: str) -> str:
     """
     if not OPENAI_API_KEY:
         logger.error("OPENAI_API_KEY no está configurada. ask_gpt no puede ejecutarse.")
-        return ⚠️ No tengo conexión con GPT en este momento."
+        return "⚠️ No tengo conexión con GPT en este momento."
 
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
@@ -44,7 +45,10 @@ def ask_gpt(prompt: str) -> str:
     payload = {
         "model": GPT_MODEL,
         "messages": [
-            {"role": "system", "content": "Eres Vicky, asistente de Christian López. Responde siempre en español, de forma clara y útil."},
+            {
+                "role": "system",
+                "content": "Eres Vicky, asistente de Christian López. Responde siempre en español, de forma clara y útil.",
+            },
             {"role": "user", "content": prompt},
         ],
         "max_tokens": 400,
@@ -57,13 +61,16 @@ def ask_gpt(prompt: str) -> str:
             resp = requests.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 429:
                 backoff = 2 ** (attempt + 1)
-                logger.warning("GPT rate limit (429). Reintentando en %s segundos (intento %s/%s).", backoff, attempt + 1, max_retries)
+                logger.warning(
+                    "GPT rate limit (429). Reintentando en %s segundos (intento %s/%s).",
+                    backoff,
+                    attempt + 1,
+                    max_retries,
+                )
                 time.sleep(backoff)
                 continue
-            # For other non-2xx codes, raise for handling below
             resp.raise_for_status()
             data = resp.json()
-            # Validate structure
             choices = data.get("choices") or []
             if not choices or not isinstance(choices, list):
                 logger.error("Respuesta de GPT sin 'choices' válido. Resp preview: %s", str(data)[:500])
@@ -76,7 +83,6 @@ def ask_gpt(prompt: str) -> str:
             return content.strip()
         except requests.RequestException:
             logger.exception("Error en petición a OpenAI (intento %s/%s).", attempt + 1, max_retries)
-            # If last attempt, fallthrough to fallback
             if attempt + 1 < max_retries:
                 backoff = 2 ** (attempt + 1)
                 time.sleep(backoff)
