@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #!/usr/bin/env python3
 import os
 import hmac
@@ -7,9 +8,6 @@ from typing import Any, Dict
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, Response
 
-# =========================
-# Carga de entorno + logging
-# =========================
 load_dotenv(override=True)
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -19,28 +17,20 @@ logger = logging.getLogger("vicky")
 DEPLOY_SHA = os.getenv("RENDER_GIT_COMMIT", os.getenv("COMMIT_SHA", "unknown"))
 logger.info("BOOT OK | DEPLOY_SHA=%s", DEPLOY_SHA)
 
-# =========================
-# Imports del proyecto
-# =========================
 from core_router import route_message
 from integrations_gpt import send_whatsapp_message, ask_gpt
 
 app = Flask(__name__)
-app.config["JSON_AS_ASCII"] = False  # evita escapar caracteres en JSON
+app.config["JSON_AS_ASCII"] = False
 
-# =========================
-# Env vars requeridas
-# =========================
 META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN", "")
 ADVISOR_NUMBER   = os.getenv("ADVISOR_NUMBER", "")
 PORT             = int(os.getenv("PORT", 5000))
 
-
 def _valid_signature(req: request) -> bool:
-    """Valida la firma de Meta si existe META_APP_SECRET."""
     if not META_APP_SECRET:
-        logger.warning("META_APP_SECRET not set → skipping signature check.")
+        logger.warning("META_APP_SECRET not set -> skipping signature check.")
         return True
     signature = req.headers.get("X-Hub-Signature-256", "")
     if not signature:
@@ -52,15 +42,13 @@ def _valid_signature(req: request) -> bool:
         expected = "sha256=" + mac.hexdigest()
         ok = hmac.compare_digest(expected, signature)
         if not ok:
-            logger.warning("Invalid signature. expected=%s got=%s", expected[:20]+"...", signature[:20]+"...")
+            logger.warning("Invalid signature.")
         return ok
     except Exception:
         logger.exception("Exception validating signature")
         return False
 
-
 def _extract_text_from_message(msg: Dict[str, Any]) -> str:
-    """Extrae texto de message (text o interactive)."""
     try:
         mtype = msg.get("type", "")
         if mtype == "text":
@@ -77,14 +65,9 @@ def _extract_text_from_message(msg: Dict[str, Any]) -> str:
         logger.exception("Error extracting text from message")
         return ""
 
-
-# ==============
-# Health & Verify
-# ==============
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "message": "Vicky Bot funcionando", "deploy_sha": DEPLOY_SHA}), 200
-
 
 @app.route("/webhook", methods=["GET"])
 def webhook_verify():
@@ -94,13 +77,9 @@ def webhook_verify():
     if mode == "subscribe" and token and token == VERIFY_TOKEN:
         logger.info("WEBHOOK VERIFY OK")
         return Response(challenge, status=200, content_type="text/plain")
-    logger.warning("WEBHOOK VERIFY FAIL | mode=%s token_match=%s", mode, (token == VERIFY_TOKEN))
+    logger.warning("WEBHOOK VERIFY FAIL")
     return Response("Forbidden", status=403, content_type="text/plain")
 
-
-# ==========
-# Webhook RX
-# ==========
 @app.route("/webhook", methods=["POST"])
 def webhook_receive():
     if not _valid_signature(request):
@@ -116,7 +95,6 @@ def webhook_receive():
             for change in entry.get("changes", []):
                 value = change.get("value") or {}
                 if value.get("statuses"):
-                    # estatus de entregas/lecturas; no procesamos
                     continue
                 for msg in value.get("messages", []) or []:
                     wa_from = msg.get("from", "")
@@ -138,7 +116,7 @@ def webhook_receive():
                             reply = ask_gpt(text_in)
                     except Exception:
                         logger.exception("Error building reply for from=%s", wa_from)
-                        reply =  Lo siento, tuve un problema procesando tu mensaje."
+                        reply = "Lo siento, tuve un problema procesando tu mensaje."
 
                     if reply:
                         try:
@@ -146,10 +124,9 @@ def webhook_receive():
                         except Exception:
                             logger.exception("Error sending reply to %s", wa_from)
 
-                        # Notificación al asesor (si tu flujo lo usa)
                         try:
                             if ADVISOR_NUMBER and ADVISOR_NUMBER != wa_from and "Notifiqué a Christian" in reply:
-                                notify_text = f"Notificación de {wa_from}\nÚltimo mensaje:\n{(text_in or '[sin texto]')}"
+                                notify_text = f"Notificacion de {wa_from}\nUltimo mensaje:\n{(text_in or '[sin texto]')}"
                                 send_whatsapp_message(ADVISOR_NUMBER, notify_text)
                         except Exception:
                             logger.exception("Error notifying advisor")
@@ -158,32 +135,26 @@ def webhook_receive():
 
     return jsonify({"ok": True}), 200
 
-
-# =========
-# Test tools
-# =========
 @app.route("/send_test", methods=["GET"])
 def send_test():
     if not ADVISOR_NUMBER:
         return jsonify({"ok": False, "error": "ADVISOR_NUMBER no configurado"}), 200
     try:
-        send_whatsapp_message(ADVISOR_NUMBER, "Mensaje de prueba desde Vicky Bot ✅")
+        send_whatsapp_message(ADVISOR_NUMBER, "Mensaje de prueba desde Vicky Bot")
         return jsonify({"ok": True}), 200
     except Exception:
         logger.exception("Error sending test message")
         return jsonify({"ok": False, "error": "Fallo al enviar mensaje de prueba"}), 200
 
-
 @app.route("/gpt_test", methods=["GET"])
 def gpt_test():
-    """Prueba directa de GPT sin WhatsApp."""
     try:
-        respuesta = ask_gpt("Dame un consejo financiero para un trabajador en México")
+        respuesta = ask_gpt("Dame un consejo financiero para un trabajador en Mexico")
         return jsonify({"ok": True, "deploy_sha": DEPLOY_SHA, "respuesta": respuesta}), 200
     except Exception as e:
         logger.exception("GPT_TEST failed")
         return jsonify({"ok": False, "deploy_sha": DEPLOY_SHA, "error": str(e)}), 500
 
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
+
