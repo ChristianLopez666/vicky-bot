@@ -100,11 +100,9 @@ def webhook_receive():
                     reply = None
 
                     try:
-                        # 👉 Menú solo si es "menu" o un número
                         if text_in.lower() == "menu" or text_in.isdigit():
                             reply = route_message(wa_id=wa_id, wa_e164_no_plus=wa_from, text_in=text_in)
                         else:
-                            # 👉 Todo lo demás → GPT directo
                             reply = ask_gpt(text_in)
                     except Exception:
                         reply = "⚠️ Lo siento, tuve un problema procesando tu mensaje."
@@ -112,7 +110,6 @@ def webhook_receive():
                     if reply:
                         send_whatsapp_message(wa_from, reply)
 
-                        # Notificación al asesor si aplica
                         if ADVISOR_NUMBER and ADVISOR_NUMBER != wa_from and "Notifiqué a Christian" in reply:
                             notify_text = f"Notificación de {wa_from}\nÚltimo mensaje:\n{(text_in or '[sin texto]')}"
                             send_whatsapp_message(ADVISOR_NUMBER, notify_text)
@@ -131,6 +128,16 @@ def send_test():
         return jsonify({"ok": True}), 200
     except Exception:
         return jsonify({"ok": False, "error": "Fallo al enviar mensaje de prueba"}), 200
+
+
+# 🚀 Nueva ruta de prueba para GPT
+@app.route("/gpt_test", methods=["GET"])
+def gpt_test():
+    try:
+        respuesta = ask_gpt("Dame un consejo financiero para un trabajador en México")
+        return jsonify({"ok": True, "respuesta": respuesta}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":
