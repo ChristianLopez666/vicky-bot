@@ -138,7 +138,7 @@ def webhook_receive():
                             reply = ask_gpt(text_in)
                     except Exception:
                         logger.exception("Error building reply for from=%s", wa_from)
-                        reply = ⚠️ Lo siento, tuve un problema procesando tu mensaje."
+                        reply =  Lo siento, tuve un problema procesando tu mensaje."
 
                     if reply:
                         try:
