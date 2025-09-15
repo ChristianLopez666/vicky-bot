@@ -16,12 +16,12 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("vicky")
 
-from core_router import route_message  # must keep exact import/signature
-from integrations_gpt import send_whatsapp_message  # must keep exact function name
+from core_router import route_message  # keep exact import/signature
+from integrations_gpt import send_whatsapp_message, ask_gpt  # ahora también ask_gpt
 
 app = Flask(__name__)
 
-# Required envs (we won't fail startup here; functions will validate as needed)
+# Required envs
 META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "")
@@ -29,10 +29,6 @@ PORT = int(os.getenv("PORT", 5000))
 
 
 def _valid_signature(req: request) -> bool:
-    """
-    Validate X-Hub-Signature-256 header against request.data using META_APP_SECRET.
-    If META_APP_SECRET is empty, allow (but warn).
-    """
     if not META_APP_SECRET:
         logger.warning("META_APP_SECRET is not set; skipping signature validation.")
         return True
@@ -46,7 +42,6 @@ def _valid_signature(req: request) -> bool:
         body = req.get_data() or b""
         mac = hmac.new(META_APP_SECRET.encode("utf-8"), msg=body, digestmod=hashlib.sha256)
         expected = "sha256=" + mac.hexdigest()
-        # Use hmac.compare_digest for timing-attack resistant comparison
         valid = hmac.compare_digest(expected, header)
         if not valid:
             logger.warning("Invalid X-Hub-Signature-256 for incoming request.")
@@ -57,30 +52,20 @@ def _valid_signature(req: request) -> bool:
 
 
 def _extract_text_from_message(msg: Dict[str, Any]) -> str:
-    """
-    Extract text from WhatsApp message dict.
-    - text: msg["text"]["body"]
-    - interactive: button_reply.title OR list_reply.title
-    - others: return "[{type}]"
-    """
     try:
         mtype = msg.get("type", "")
         if mtype == "text":
             return msg.get("text", {}).get("body", "") or ""
         if mtype == "interactive":
             interactive = msg.get("interactive", {}) or {}
-            # button_reply or list_reply
             if "button_reply" in interactive:
                 return interactive.get("button_reply", {}).get("title", "") or ""
             if "list_reply" in interactive:
                 return interactive.get("list_reply", {}).get("title", "") or ""
-            # fallback to text in interactive if present
             return interactive.get("text", "") or ""
-        # Other types: return [type]
         return f"[{mtype}]"
     except Exception:
         logger.exception("Error extracting text from message.")
-        # In case of unexpected structure, return empty string to trigger menu
         return ""
 
 
@@ -96,7 +81,6 @@ def webhook_verify():
     challenge = request.args.get("hub.challenge", "")
 
     if mode == "subscribe" and token and token == VERIFY_TOKEN:
-        # Return challenge as plain text
         return Response(challenge, status=200, content_type="text/plain")
     logger.warning("Webhook verification failed: mode=%s token_provided=%s", mode, bool(token))
     return Response("Forbidden", status=403, content_type="text/plain")
@@ -104,12 +88,10 @@ def webhook_verify():
 
 @app.route("/webhook", methods=["POST"])
 def webhook_receive():
-    # Validate signature
     if not _valid_signature(request):
         return jsonify({"ok": False, "error": "Invalid signature"}), 403
 
     data = request.get_json(silent=True)
-    # Truncate for safe logging
     data_preview = (str(data)[:1000] + "...") if data is not None and len(str(data)) > 1000 else str(data)
     if not isinstance(data, dict):
         logger.warning("Payload vacío o no es JSON dict: %s", data_preview)
@@ -120,7 +102,6 @@ def webhook_receive():
         for entry in entries:
             for change in entry.get("changes", []):
                 value = change.get("value") or {}
-                # Ignore statuses (delivery/read)
                 if value.get("statuses"):
                     logger.debug("Ignored statuses in value.")
                     continue
@@ -141,12 +122,21 @@ def webhook_receive():
                     except Exception:
                         logger.exception("Error en route_message para wa_id=%s", wa_id)
                         reply = None
+
+                    # 👇 Nuevo bloque: fallback a GPT
+                    if not reply and text_in:
+                        try:
+                            reply = ask_gpt(text_in)
+                        except Exception:
+                            logger.exception("Error consultando GPT para wa_id=%s", wa_id)
+                            reply = "⚠️ Lo siento, tuve un problema procesando tu mensaje."
+
                     if reply:
                         try:
                             send_whatsapp_message(wa_from, reply)
                         except Exception:
                             logger.exception("Error enviando respuesta a %s", wa_from)
-                        # Notificar al asesor si corresponde
+
                         try:
                             if ADVISOR_NUMBER and ADVISOR_NUMBER != wa_from and "Notifiqué a Christian" in reply:
                                 notify_text = (
@@ -161,7 +151,6 @@ def webhook_receive():
                             logger.exception("Error comprobando necesidad de notificar al asesor.")
     except Exception:
         logger.exception("Error general procesando webhook; payload preview: %s", data_preview)
-        # Continue to return ok per spec
 
     return jsonify({"ok": True}), 200
 
@@ -180,5 +169,4 @@ def send_test():
 
 
 if __name__ == "__main__":
-    # Local development server
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
