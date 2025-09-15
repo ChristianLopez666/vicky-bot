@@ -30,7 +30,6 @@ PORT = int(os.getenv("PORT", 5000))
 
 def _valid_signature(req: request) -> bool:
     if not META_APP_SECRET:
-        logger.warning("META_APP_SECRET is not set; skipping signature validation.")
         return True
     header = req.headers.get("X-Hub-Signature-256", "")
     if not header:
@@ -101,11 +100,11 @@ def webhook_receive():
                     reply = None
 
                     try:
-                        # Menú solo si es "menu" o un número
+                        # 👉 Menú solo si es "menu" o un número
                         if text_in.lower() == "menu" or text_in.isdigit():
                             reply = route_message(wa_id=wa_id, wa_e164_no_plus=wa_from, text_in=text_in)
                         else:
-                            # Todo lo demás → GPT
+                            # 👉 Todo lo demás → GPT directo
                             reply = ask_gpt(text_in)
                     except Exception:
                         reply = "⚠️ Lo siento, tuve un problema procesando tu mensaje."
