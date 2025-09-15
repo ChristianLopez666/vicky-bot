@@ -30,6 +30,7 @@ VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN", "")
 ADVISOR_NUMBER   = os.getenv("ADVISOR_NUMBER", "")
 PORT             = int(os.getenv("PORT", 5000))
 
+# Todo ASCII para evitar problemas de codificacion
 SAFE_FALLBACK    = "Lo siento, tuve un problema procesando tu mensaje."
 WELCOME_FALLBACK = "Hola, soy Vicky. Escribe menu para ver opciones o dime en que te ayudo."
 
@@ -55,7 +56,7 @@ def _valid_signature(req: request) -> bool:
         return False
 
 def _extract_text_from_message(msg: Dict[str, Any]) -> str:
-    """Devuelve texto útil del mensaje WA (text/interactive) o cadena vacía."""
+    """Devuelve texto util del mensaje WA (text/interactive) o cadena vacia."""
     try:
         mtype = msg.get("type", "")
         if mtype == "text":
@@ -78,7 +79,7 @@ def _extract_text_from_message(msg: Dict[str, Any]) -> str:
         logger.exception("Error extracting text from message")
         return ""
 
-# ------------ Rutas de diagnóstico ------------
+# ------------ Rutas de diagnostico ------------
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"status": "ok", "message": "Vicky Bot raiz", "deploy_sha": DEPLOY_SHA}), 200
@@ -87,7 +88,7 @@ def root():
 def health():
     return jsonify({"status": "ok", "message": "Vicky Bot funcionando", "deploy_sha": DEPLOY_SHA}), 200
 
-# ------------ Verificación de webhook ------------
+# ------------ Verificacion de webhook ------------
 @app.route("/webhook", methods=["GET"])
 def webhook_verify():
     mode      = request.args.get("hub.mode", "")
@@ -99,7 +100,7 @@ def webhook_verify():
     logger.warning("WEBHOOK VERIFY FAIL")
     return Response("Forbidden", status=403, content_type="text/plain")
 
-# ------------ Recepción de mensajes ------------
+# ------------ Recepcion de mensajes ------------
 @app.route("/webhook", methods=["POST"])
 def webhook_receive():
     if not _valid_signature(request):
@@ -124,8 +125,11 @@ def webhook_receive():
                         continue
 
                     text_in = _extract_text_from_message(msg).strip()
-                    logger.info("BRANCH_DECISION | from=%s | text='%s'",
-                                wa_from, (text_in[:120] if text_in else ""))
+                    logger.info(
+                        "BRANCH_DECISION | from=%s | text='%s'",
+                        wa_from,
+                        (text_in[:120] if text_in else "")
+                    )
 
                     reply = None
                     try:
@@ -144,7 +148,7 @@ def webhook_receive():
                                 reply = route_message(wa_id=wa_id, wa_e164_no_plus=wa_from, text_in="menu")
                     except Exception:
                         logger.exception("Error building reply for from=%s", wa_from)
-                        reply = "Lo siento, tuve un problema procesando tu mensaje."
+                        reply = SAFE_FALLBACK
 
                     if reply:
                         try:
@@ -155,8 +159,8 @@ def webhook_receive():
                             if ADVISOR_NUMBER and ADVISOR_NUMBER != wa_from and \
                                "Notifique a Christian" in reply:
                                 notify_text = (
-                                    f"Notificacion de {wa_from}\n"
-                                    f"Ultimo mensaje:\n{(text_in or '[sin texto]')}"
+                                    "Notificacion de " + wa_from + "\n" +
+                                    "Ultimo mensaje:\n" + (text_in or "[sin texto]")
                                 )
                                 send_whatsapp_message(ADVISOR_NUMBER, notify_text)
                         except Exception:
