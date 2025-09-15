@@ -1,25 +1,11 @@
-"""
-Main Flask application for Vicky WhatsApp bot.
-
-Requirements met:
-- Flask app with endpoints /health, /gpt_test, /webhook (GET and POST)
-- JSON structured logs per line (UTC timestamps)
-- Idempotency via in-memory LRU cache
-- Integration with WhatsApp Cloud API via httpx with retries and timeout
-- Uses integrations_gpt.ask_gpt for GPT responses
-- Uses core_router for menu routing
-- Reads configuration from config_env
-"""
-
-import os
-import time
 import json
-import logging
-from typing import Optional, Tuple, Dict, Any
-from collections import OrderedDict, defaultdict
+import os
+import sys
+import time
+import typing as t
+from collections import OrderedDict
 
-from flask import Flask, request, Response, jsonify
-
+from flask import Flask, jsonify, request
 import httpx
 
 from config_env import (
@@ -27,327 +13,217 @@ from config_env import (
     get_deploy_sha,
     get_graph_base_url,
 )
-from core_router import is_menu_message, route_message, menu_text
+from core_router import is_menu_message, menu_text, route_message
 from integrations_gpt import ask_gpt
 
-# Deploy sha
+# -----------------------------------------------------------------------------
+# Configuracion
+# -----------------------------------------------------------------------------
+APP_NAME = "vicky-bot"
 DEPLOY_SHA = get_deploy_sha()
 
-# Configure logger to output JSON lines
-logger = logging.getLogger("vicky")
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setLevel(logging.INFO)
+GRAPH_API_VERSION = get_env_str("GRAPH_API_VERSION", default="v20.0")
+BASE_URL = get_graph_base_url(GRAPH_API_VERSION)
+PHONE_NUMBER_ID = get_env_str("PHONE_NUMBER_ID", required=True)
+WHATSAPP_TOKEN = get_env_str("WHATSAPP_TOKEN", required=True)
+VERIFY_TOKEN = get_env_str("VERIFY_TOKEN", required=True)
+ADVISOR_NUMBER = get_env_str("ADVISOR_NUMBER", required=False)
+
+FORCE_BRANCH = get_env_str("FORCE_BRANCH", default="").upper().strip()
+
+# -----------------------------------------------------------------------------
+# Utilidades
+# -----------------------------------------------------------------------------
+def log_json(level: str, msg: str, **fields: t.Any) -> None:
+    row = {"ts": int(time.time()), "level": level, "app": APP_NAME, "msg": msg, "deploy_sha": DEPLOY_SHA}
+    row.update(fields)
+    sys.stdout.write(json.dumps(row, ensure_ascii=True) + "\n")
+    sys.stdout.flush()
 
 
-class JSONLineFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        # Basic JSON fields
-        log_record = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
-            "level": record.levelname,
-            "message": record.getMessage(),
-            "deploy_sha": DEPLOY_SHA,
-        }
-        # Allow extra data passed via record.args if dict
-        try:
-            if isinstance(record.args, dict):
-                # Avoid overwriting core fields
-                for k, v in record.args.items():
-                    if k not in log_record:
-                        log_record[k] = v
-        except Exception:
-            pass
-        return json.dumps(log_record, ensure_ascii=True)
-
-
-handler.setFormatter(JSONLineFormatter())
-# Avoid duplicate handlers during re-imports
-if not logger.handlers:
-    logger.addHandler(handler)
-else:
-    logger.handlers = [handler]
-
-# Flask app
-app = Flask(__name__)
-
-# Load environment variables used at runtime
-WHATSAPP_TOKEN = get_env_str("WHATSAPP_TOKEN", default=None, required=False)
-PHONE_NUMBER_ID = get_env_str("PHONE_NUMBER_ID", default=None, required=False)
-VERIFY_TOKEN = get_env_str("VERIFY_TOKEN", default=None, required=False)
-GRAPH_API_VERSION = get_env_str("GRAPH_API_VERSION", default="v20.0", required=False)
-ADVISOR_NUMBER = get_env_str("ADVISOR_NUMBER", default=None, required=False)
-FORCE_BRANCH = get_env_str("FORCE_BRANCH", default=None, required=False)
-
-GRAPH_BASE = get_graph_base_url()
-
-# HTTP client default settings
-HTTP_TIMEOUT = 10.0  # seconds
-HTTP_RETRIES = 3
-HTTP_BACKOFF = 0.5  # seconds
-
-# Idempotency cache
-class IdempotencyCache:
-    """Simple LRU cache for wamid idempotency with optional TTL."""
-
-    def __init__(self, capacity: int = 1000, ttl_seconds: int = 24 * 3600):
+class LruSeen:
+    """Conjunto LRU simple para idempotencia (wamid)."""
+    def __init__(self, capacity: int = 1000) -> None:
         self.capacity = capacity
-        self.ttl = ttl_seconds
-        self.store: "OrderedDict[str, float]" = OrderedDict()
+        self.data: "OrderedDict[str, None]" = OrderedDict()
 
-    def _evict_if_needed(self) -> None:
-        while len(self.store) > self.capacity:
-            self.store.popitem(last=False)
-
-    def add(self, key: str) -> None:
-        now = time.time()
-        if key in self.store:
-            # move to end
-            self.store.move_to_end(key)
-            self.store[key] = now
-            return
-        self.store[key] = now
-        self._evict_if_needed()
-
-    def exists(self, key: str) -> bool:
-        now = time.time()
-        if key in self.store:
-            ts = self.store.get(key, 0)
-            if self.ttl and (now - ts) > self.ttl:
-                # expired
-                try:
-                    del self.store[key]
-                except KeyError:
-                    pass
-                return False
-            # move to end as recently used
-            self.store.move_to_end(key)
-            return True
-        return False
+    def add(self, key: str) -> bool:
+        # True si se agrego nuevo; False si ya existia
+        if key in self.data:
+            self.data.move_to_end(key, last=True)
+            return False
+        self.data[key] = None
+        self.data.move_to_end(key, last=True)
+        if len(self.data) > self.capacity:
+            self.data.popitem(last=False)
+        return True
 
 
-idempotency = IdempotencyCache(capacity=1000, ttl_seconds=24 * 3600)
+seen_wamids = LruSeen(capacity=1000)
 
-# Simple counters for metrics in memory
-counters = defaultdict(int)
+# -----------------------------------------------------------------------------
+# Cliente HTTP
+# -----------------------------------------------------------------------------
+def _headers() -> dict:
+    return {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
 
-def log_event(level: str, event: str, extra: Optional[Dict[str, Any]] = None) -> None:
-    payload = {"event": event, "branch": FORCE_BRANCH or "auto"}
-    if extra:
-        payload.update(extra)
-    if level.upper() == "INFO":
-        logger.info(event, payload)
-    else:
-        logger.error(event, payload)
+async def _post_json(client: httpx.AsyncClient, url: str, payload: dict) -> httpx.Response:
+    # reintentos simples
+    backoff = [0.5, 1.0, 2.0]
+    for i, delay in enumerate(backoff):
+        try:
+            return await client.post(url, json=payload, headers=_headers(), timeout=10.0)
+        except Exception as e:
+            if i == len(backoff) - 1:
+                raise
+            time.sleep(delay)
 
-def _extract_text_from_whatsapp_event(data: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
-    """
-    Extract wamid, wa_id and text from WhatsApp Cloud webhook payload.
-
-    Returns tuple (wamid, wa_id, text) or None if no message text found.
-    """
-    try:
-        entry = data.get("entry", [])
-        if not entry:
-            return None
-        for e in entry:
-            changes = e.get("changes", [])
-            for ch in changes:
-                value = ch.get("value", {})
-                messages = value.get("messages", [])
-                if not messages:
-                    continue
-                for m in messages:
-                    # Only handle text messages
-                    if "text" in m and isinstance(m.get("text"), dict):
-                        wamid = m.get("id")
-                        wa_id = m.get("from")
-                        text = m.get("text", {}).get("body", "")
-                        if text is None:
-                            text = ""
-                        # normalize to plain ASCII by ensuring JSON serialization will escape non-ascii
-                        return (str(wamid), str(wa_id), str(text))
-        return None
-    except Exception as e:
-        # log and return None to ignore non-standard payloads
-        logger.error("extract_text_error", {"error": str(e)})
-        return None
-
-def send_whatsapp_message(to: str, text: str) -> Tuple[bool, Optional[str]]:
-    """
-    Send a text message via WhatsApp Cloud API.
-
-    Returns (success, error_message).
-    """
-    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        err = "WHATSAPP_TOKEN or PHONE_NUMBER_ID not configured"
-        logger.error("whatsapp_send_config_error", {"error": err})
-        return False, err
-
-    url = f"{GRAPH_BASE}/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
+def send_whatsapp_message(to_number: str, text: str) -> bool:
+    url = f"{BASE_URL}/{PHONE_NUMBER_ID}/messages"
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "recipient_type": "individual",
+        "to": to_number,
         "type": "text",
-        "text": {"body": text},
+        "text": {"preview_url": False, "body": text},
     }
-
-    last_err = None
-    for attempt in range(1, HTTP_RETRIES + 1):
-        try:
-            with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-                resp = client.post(url, headers=headers, json=payload)
-                if resp.status_code in (200, 201):
-                    logger.info("whatsapp_message_sent", {"to": to, "status_code": resp.status_code})
-                    return True, None
-                else:
-                    last_err = f"status={{resp.status_code}}, body={{resp.text}}"
-                    logger.error("whatsapp_send_failed", {"to": to, "attempt": attempt, "error": last_err})
-        except Exception as exc:
-            last_err = str(exc)
-            logger.error("whatsapp_send_exception", {"to": to, "attempt": attempt, "error": last_err})
-        time.sleep(HTTP_BACKOFF * attempt)
-    return False, last_err
-
-@app.route("/health", methods=["GET"])
-def health():
-    """
-    Health endpoint.
-    """
-    resp = {"status": "ok", "message": "Vicky Bot funcionando", "deploy_sha": DEPLOY_SHA}
-    return jsonify(resp), 200
-
-@app.route("/gpt_test", methods=["GET"])
-def gpt_test():
-    """
-    Call GPT with a small prompt and return the result.
-    """
     try:
-        reply = ask_gpt("Responde solo: OK")
-        return jsonify({"ok": True, "gpt_reply": reply}), 200
+        with httpx.Client(timeout=10.0) as client:
+            res = client.post(url, headers=_headers(), json=payload)
+            ok = res.status_code in (200, 201)
+            if not ok:
+                log_json("warn", "whatsapp_send_failed", status=res.status_code, body=res.text[:500])
+            return ok
     except Exception as e:
-        err = str(e)
-        logger.error("gpt_test_error", {"error": err})
-        return jsonify({"ok": False, "error": err}), 200
+        log_json("error", "whatsapp_send_exception", err=str(e))
+        return False
 
-@app.route("/webhook", methods=["GET"])
-def webhook_verify():
-    """
-    Verify webhook from Meta/WhatsApp.
-    """
-    hub_mode = request.args.get("hub.mode")
-    hub_challenge = request.args.get("hub.challenge")
-    hub_verify_token = request.args.get("hub.verify_token")
-    if hub_mode == "subscribe" and hub_verify_token and VERIFY_TOKEN and hub_verify_token == VERIFY_TOKEN:
-        logger.info("webhook_verified", {"mode": hub_mode})
-        return Response(hub_challenge or "", status=200)
-    logger.error("webhook_verify_failed", {"provided_token": bool(hub_verify_token)})
-    return Response("Forbidden", status=403)
+def notify_advisor(wa_id: str, user_text: str) -> None:
+    if not ADVISOR_NUMBER:
+        log_json("info", "advisor_notify_skipped", reason="no_advisor_number")
+        return
+    text = f"Nuevo contacto de WhatsApp: {wa_id}. Mensaje: {user_text}"
+    ok = send_whatsapp_message(ADVISOR_NUMBER, text)
+    log_json("info", "advisor_notified", ok=ok)
 
-@app.route("/webhook", methods=["POST"])
-def webhook_message():
+# -----------------------------------------------------------------------------
+# Parseo Webhook
+# -----------------------------------------------------------------------------
+def extract_message(payload: dict) -> t.Tuple[str, str, str]:
     """
-    Handle incoming WhatsApp webhook events.
+    Devuelve (wamid, wa_id, text). Lanza ValueError si no se pudo extraer.
     """
     try:
-        data = request.get_json(silent=True)
-        if not data:
-            logger.error("webhook_no_json")
-            return "", 200
+        entry = payload.get("entry", [])[0]
+        change = entry.get("changes", [])[0]
+        value = change.get("value", {})
+        messages = value.get("messages", [])
+        if not messages:
+            raise ValueError("no_messages")
+        msg = messages[0]
+        wamid = msg.get("id") or msg.get("wamid") or ""
+        wa_id = msg.get("from") or ""
+        # Tipos posibles: text, button, interactive, etc.
+        text = ""
+        if msg.get("type") == "text":
+            text = (msg.get("text") or {}).get("body", "")
+        elif msg.get("type") == "button":
+            text = (msg.get("button") or {}).get("text", "")
+        elif msg.get("type") == "interactive":
+            interactive = msg.get("interactive") or {}
+            if "button_reply" in interactive:
+                text = (interactive["button_reply"] or {}).get("title", "")
+            elif "list_reply" in interactive:
+                text = (interactive["list_reply"] or {}).get("title", "")
+        if not text:
+            # Fallback generico
+            text = ""
+        if not wamid or not wa_id:
+            raise ValueError("missing_ids")
+        return wamid, wa_id, text.strip()
+    except Exception:
+        raise ValueError("bad_payload")
 
-        extracted = _extract_text_from_whatsapp_event(data)
-        if not extracted:
-            # nothing to do
-            logger.info("webhook_no_message")
-            return "", 200
+# -----------------------------------------------------------------------------
+# Flask app
+# -----------------------------------------------------------------------------
+app = Flask(__name__)
 
-        wamid, wa_id, text = extracted
+@app.get("/health")
+def health() -> t.Any:
+    return jsonify({"status": "ok", "message": "Vicky Bot funcionando", "deploy_sha": DEPLOY_SHA})
 
-        # idempotency
-        if idempotency.exists(wamid):
-            logger.info("duplicate_event_ignored", {"wamid": wamid})
-            return "", 200
-        idempotency.add(wamid)
+@app.get("/gpt_test")
+def gpt_test() -> t.Any:
+    try:
+        out = ask_gpt("Responde solo: OK")
+        return jsonify({"ok": True, "gpt": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-        # decide branch
-        branch = "GPT"
-        if FORCE_BRANCH == "GPT":
-            branch = "GPT"
-        elif FORCE_BRANCH == "ROUTER":
-            branch = "ROUTER"
-        else:
-            if is_menu_message(text):
-                branch = "ROUTER"
+@app.get("/webhook")
+def webhook_verify() -> t.Any:
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+        log_json("info", "webhook_verified")
+        return challenge, 200
+    log_json("warn", "webhook_verify_failed", mode=mode, token_ok=(token == VERIFY_TOKEN))
+    return "forbidden", 403
+
+@app.post("/webhook")
+def webhook_receive() -> t.Any:
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        log_json("info", "webhook_received", size=len(json.dumps(payload)))
+        try:
+            wamid, wa_id, text = extract_message(payload)
+        except ValueError as e:
+            log_json("warn", "no_message_extracted", reason=str(e))
+            return jsonify({"ok": True}), 200
+
+        # Idempotencia
+        if not seen_wamids.add(wamid):
+            log_json("info", "duplicate_wamid", wamid=wamid)
+            return jsonify({"ok": True}), 200
+
+        # Branching
+        decision = FORCE_BRANCH
+        if not decision:
+            decision = "ROUTER" if is_menu_message(text) else "GPT"
+
+        reply = ""
+        try:
+            if decision == "ROUTER":
+                # Si el usuario pide menu
+                if text.lower().strip() == "menu":
+                    reply = menu_text()
+                else:
+                    reply = route_message(text)
+                    # Opcion 8: notificar a asesor
+                    if text.strip() == "8":
+                        notify_advisor(wa_id, text)
             else:
-                branch = "GPT"
+                # GPT por defecto
+                reply = ask_gpt(text or "Hola")
 
-        counters[f"processed_{{branch}}"] += 1
+        except Exception as e:
+            log_json("error", "branch_exception", err=str(e))
+            reply = "Lo siento, tuve un problema procesando tu mensaje."
 
-        logger.info(
-            "route_message",
-            {
-                "branch": branch,
-                "wa_id": wa_id,
-                "wamid": wamid,
-                "text": text,
-                "counters": dict(counters),
-            },
-        )
+        # Enviar respuesta
+        ok = send_whatsapp_message(wa_id, reply)
+        log_json("info", "reply_sent", ok=ok, wa_id=wa_id, wamid=wamid, branch=decision)
+        return jsonify({"ok": True}), 200
 
-        reply_text = ""
-        if branch == "ROUTER":
-            # Determine numeric option: if text is "menu", return menu
-            normalized = text.strip().lower()
-            if normalized == "menu":
-                reply_text = menu_text()
-            elif normalized.isdigit() and normalized in [str(i) for i in range(1, 9)]:
-                reply_text = route_message(normalized)
-                # If option 8, notify advisor
-                if normalized == "8" and ADVISOR_NUMBER:
-                    advisor_msg = f"El usuario {{wa_id}} solicita atencion de un asesor. Mensaje original: {{text}}"
-                    # send notification in background-like manner (synchronous here)
-                    ok, err = send_whatsapp_message(ADVISOR_NUMBER, advisor_msg)
-                    if not ok:
-                        logger.error("advisor_notify_failed", {"error": err, "advisor": ADVISOR_NUMBER})
-                    else:
-                        logger.info("advisor_notified", {"advisor": ADVISOR_NUMBER})
-                elif normalized == "8" and not ADVISOR_NUMBER:
-                    logger.warning("advisor_number_not_configured", {"option": "8"})
-            else:
-                # fallback to menu
-                reply_text = menu_text()
-        else:
-            # GPT branch
-            try:
-                gpt_reply = ask_gpt(text)
-                reply_text = gpt_reply
-            except Exception as e:
-                logger.error("gpt_call_failed", {"error": str(e)})
-                reply_text = "Lo siento, tuve un problema procesando tu mensaje."
-
-        # Ensure reply is not empty
-        if not reply_text:
-            reply_text = "Lo siento, no tengo una respuesta en este momento."
-
-        # Send message back to user
-        ok, err = send_whatsapp_message(wa_id, reply_text)
-        if not ok:
-            logger.error("send_reply_failed", {"wa_id": wa_id, "error": err})
-            # Attempt fallback message text to user via logs only
-            # Do not crash, respond 200 to webhook
-        logger.info("message_processed", {"wamid": wamid, "wa_id": wa_id, "branch": branch})
-
-        return "", 200
-    except Exception as exc:
-        # Global fallback
-        logger.error("webhook_processing_exception", {"error": str(exc)})
-        return "", 200
+    except Exception as e:
+        log_json("error", "webhook_exception", err=str(e))
+        # Fallback generico
+        return jsonify({"ok": True}), 200
 
 
 if __name__ == "__main__":
-    # Only run when invoked directly for local debug
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    # Desarrollo local
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
