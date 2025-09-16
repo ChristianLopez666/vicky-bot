@@ -14,6 +14,13 @@ def get_deploy_sha() -> str:
     """
     return ""
 
+def get_graph_base_url() -> str:
+    """
+    Función dummy para compatibilidad con app.py.
+    Devuelve un string vacío porque no se usa en FASE 1.
+    """
+    return ""
+
 # Variables principales para FASE 1
 VERIFY_TOKEN = get_env_str("VERIFY_TOKEN")
 WHATSAPP_TOKEN = get_env_str("WHATSAPP_TOKEN")
