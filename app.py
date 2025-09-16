@@ -50,10 +50,11 @@ def webhook():
                     user_id = message["from"]
                     texto = message.get("text", {}).get("body", "").lower()
 
+                    # 🟢 Menú principal
                     if texto == "menu":
                         menu = (
                             "👋 Hola, soy Vicky, asistente de Christian López.\n\n"
-                            "Selecciona una opción:\n\n"
+                            "Selecciona una opción escribiendo el número correspondiente:\n\n"
                             "1️⃣ Asesoría en pensiones\n"
                             "2️⃣ Seguros de auto 🚗\n"
                             "3️⃣ Seguros de vida y salud ❤️\n"
@@ -61,9 +62,30 @@ def webhook():
                             "5️⃣ Préstamos a pensionados IMSS 💰\n"
                             "6️⃣ Financiamiento empresarial 💼\n"
                             "7️⃣ Nómina empresarial 🏦\n"
-                            "8️⃣ Contactar con Christian 📞"
+                            "8️⃣ Contactar con Christian 📞\n\n"
+                            "👉 También puedes escribir *menu* en cualquier momento para ver estas opciones."
                         )
                         enviar_mensaje_whatsapp(user_id, menu)
+
+                    # 🟢 Opciones del menú
+                    elif texto == "1":
+                        enviar_mensaje_whatsapp(user_id, "📘 Asesoría en pensiones.\nTe ayudo a entender tu situación y opciones.")
+                    elif texto == "2":
+                        enviar_mensaje_whatsapp(user_id, "🚗 Seguros de auto Inbursa.\n(Planes y requisitos para cotizar).")
+                    elif texto == "3":
+                        enviar_mensaje_whatsapp(user_id, "❤️ Seguros de vida y salud.\nProtege a tu familia con tranquilidad.")
+                    elif texto == "4":
+                        enviar_mensaje_whatsapp(user_id, "🏥 Tarjetas médicas VRIM.\nAcceso a servicios médicos privados.")
+                    elif texto == "5":
+                        enviar_mensaje_whatsapp(user_id, "💰 Préstamos a pensionados IMSS.\nMontos desde $10,000 hasta $650,000.")
+                    elif texto == "6":
+                        enviar_mensaje_whatsapp(user_id, "💼 Financiamiento empresarial.\nOpciones flexibles para tu negocio.")
+                    elif texto == "7":
+                        enviar_mensaje_whatsapp(user_id, "🏦 Nómina empresarial.\nOptimiza pagos y beneficios para tus empleados.")
+                    elif texto == "8":
+                        enviar_mensaje_whatsapp(user_id, "📞 Se notificará a Christian López para que te contacte directamente.")
+
+                    # 🟢 Fallback: cualquier otro texto → GPT
                     else:
                         respuesta = generar_respuesta_gpt(texto)
                         enviar_mensaje_whatsapp(user_id, respuesta)
