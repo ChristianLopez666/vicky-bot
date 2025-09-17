@@ -15,7 +15,7 @@ app = Flask(__name__)
 
 # Variables de entorno
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
 # Endpoint de verificación
@@ -48,7 +48,10 @@ def receive_message():
                             if message["type"] == "text":
                                 text = message["text"]["body"]
                                 logging.info(f"Mensaje de {sender}: {text}")
-                                send_message(sender, "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n👉 Elige una opción del menú:")
+                                send_message(
+                                    sender,
+                                    "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n👉 Elige una opción del menú:"
+                                )
     return jsonify({"status": "ok"}), 200
 
 # Función para enviar mensajes
@@ -76,4 +79,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
