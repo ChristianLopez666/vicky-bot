@@ -1,29 +1,21 @@
-import os
+from config_env import OPENAI_API_KEY, GPT_MODEL
+from utils_logger import get_logger
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+log = get_logger("gpt")
 
-def ask_gpt(user_text: str) -> str:
-    """
-    FASE 2 – Placeholder seguro.
-    Si no hay OPENAI_API_KEY, responde una guía amable sin romper el flujo.
-    """
+def ask_gpt(prompt: str, system: str = "Eres Vicky, asistente de Christian López.", max_tokens: int = 300) -> str:
     if not OPENAI_API_KEY:
-        return ("🤖 (GPT desactivado) Por ahora puedo ayudarte con el menú y opciones fijas. "
-                "Escribe *menu* para ver opciones o activa OPENAI_API_KEY para respuestas inteligentes.")
+        return "🤖 (GPT desactivado) Escribe *menu* para ver opciones."
     try:
-        # Implementación real (client v1) cuando activemos Fase 2:
-        # from openai import OpenAI
-        # client = OpenAI(api_key=OPENAI_API_KEY)
-        # resp = client.chat.completions.create(
-        #     model=os.getenv("GPT_MODEL", "gpt-4o-mini"),
-        #     messages=[
-        #         {"role": "system", "content": "Eres Vicky, asistente de Christian López."},
-        #         {"role": "user", "content": user_text}
-        #     ],
-        #     temperature=0.7,
-        #     max_tokens=300
-        # )
-        # return resp.choices[0].message.content.strip()
-        return "🤖 (GPT activo) Respuesta generada — (placeholder)."
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        resp = client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            temperature=0.6,
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        return f"⚠️ Error al generar respuesta: {e}"
+        log.exception("Error GPT: %s", e)
+        return "🤖 Tu consulta es compleja. Escribe *menu* para ver opciones."

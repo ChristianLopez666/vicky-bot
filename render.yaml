@@ -1,12 +1,10 @@
 services:
   - type: web
-    name: vicky-bot
+    name: vicky-fase1
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT"
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
     envVars:
-      - key: PORT
-        value: 5000
-      - key: PYTHON_VERSION
-        value: 3.11.9
+      - key: LOG_LEVEL
+        value: INFO
