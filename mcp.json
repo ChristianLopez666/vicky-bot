@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "render": {
+      "url": "https://api.render.com/v1",
+      "api_key": "${RENDER_API_KEY}"
+    }
+  }
+}
