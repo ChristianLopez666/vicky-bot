@@ -4,13 +4,11 @@ from flask import Flask, request
 from config_env import VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID
 
 app = Flask(__name__)
-
-# Configuración de logs
 logging.basicConfig(level=logging.INFO)
 
 # ====== FUNCIONES AUXILIARES ======
 def send_whatsapp_message(to: str, message: str):
-    url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
@@ -22,13 +20,12 @@ def send_whatsapp_message(to: str, message: str):
         "text": {"body": message}
     }
     response = requests.post(url, headers=headers, json=data)
-    logging.info(f"Enviado a {to}: {message} | Respuesta: {response.status_code} {response.text}")
+    logging.info(f"📤 Enviado a {to}: {message} | Respuesta: {response.status_code} {response.text}")
     return response.json()
 
 def get_menu_text():
     return (
-        "Vicky:\n"
-        "👋 Hola, soy *Vicky*, asistente de Christian López.\n"
+        "👋 Hola, soy *Vicky*, asistente de Christian López.\n\n"
         "Selecciona una opción escribiendo el número correspondiente:\n\n"
         "1️⃣ Asesoría en pensiones\n"
         "2️⃣ Seguros de auto 🚗\n"
@@ -43,7 +40,7 @@ def get_menu_text():
 
 def process_message(body: str):
     body_lower = body.strip().lower()
-    if body_lower in ["menu", "menú"]:
+    if body_lower in ["menu", "menú", "hola", "hi", "hello"]:
         return get_menu_text()
     elif body_lower == "1":
         return "📊 *Asesoría en pensiones.*\n(Modalidad 40, Ley 73, cálculo de pensión, etc.)"
@@ -62,7 +59,7 @@ def process_message(body: str):
     elif body_lower == "8":
         return "📞 Un asesor de Christian se pondrá en contacto contigo."
     else:
-        return get_menu_text()
+        return "❓ No entendí tu mensaje. Escribe *menu* para ver las opciones disponibles."
 
 # ====== RUTAS WEBHOOK ======
 @app.route("/webhook", methods=["GET"])
@@ -87,7 +84,7 @@ def webhook():
             number = message["from"]
             text = message.get("text", {}).get("body", "")
 
-            logging.info(f"Mensaje de {number}: {text}")
+            logging.info(f"📥 Mensaje de {number}: {text}")
             response_text = process_message(text)
             send_whatsapp_message(number, response_text)
     except Exception as e:
@@ -100,4 +97,6 @@ def health():
     return "Bot Vicky corriendo OK ✅", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    import os
+    port = int(os.getenv("PORT", 5000))  # Render usa $PORT, local usa 5000
+    app.run(host="0.0.0.0", port=port)
