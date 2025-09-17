@@ -1,10 +1,18 @@
+# core_whatsapp.py
 import time
 import requests
+import config_env as cfg
 from typing import Dict, Any, Optional
-from config_env import WHATSAPP_TOKEN, PHONE_NUMBER_ID, WA_API_VERSION
 from utils_logger import get_logger
 
 log = get_logger("whatsapp")
+
+# 👇 Importación a prueba de fallos (usa defaults si algo falta)
+WA_API_VERSION  = (getattr(cfg, "WA_API_VERSION", "v20.0") or "v20.0").lower().strip()
+WHATSAPP_TOKEN  = getattr(cfg, "WHATSAPP_TOKEN", "")
+PHONE_NUMBER_ID = (getattr(cfg, "PHONE_NUMBER_ID", "") 
+                   or getattr(cfg, "WA_PHONE_ID", "") 
+                   or getattr(cfg, "WA_PHONE_NUMBER_ID", ""))
 
 API_BASE = f"https://graph.facebook.com/{WA_API_VERSION}".rstrip("/")
 SEND_URL = f"{API_BASE}/{PHONE_NUMBER_ID}/messages"
