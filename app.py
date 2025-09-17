@@ -1,88 +1,103 @@
-import os
 import logging
 import requests
-from flask import Flask, request, jsonify
-
-# Configuración de logging
-logging.basicConfig(level=logging.INFO)
+from flask import Flask, request
+from config_env import VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID
 
 app = Flask(__name__)
 
-# Variables de entorno
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+# Configuración de logs
+logging.basicConfig(level=logging.INFO)
 
-# Función para enviar mensajes a WhatsApp
-def send_whatsapp_message(to, message):
+# ====== FUNCIONES AUXILIARES ======
+def send_whatsapp_message(to: str, message: str):
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
     }
-    payload = {
+    data = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
         "text": {"body": message}
     }
-    response = requests.post(url, headers=headers, json=payload)
-    logging.info(f"Enviado a {to}: {message}")
+    response = requests.post(url, headers=headers, json=data)
+    logging.info(f"Enviado a {to}: {message} | Respuesta: {response.status_code} {response.text}")
     return response.json()
 
-# Webhook de verificación
+def get_menu_text():
+    return (
+        "Vicky:\n"
+        "👋 Hola, soy *Vicky*, asistente de Christian López.\n"
+        "Selecciona una opción escribiendo el número correspondiente:\n\n"
+        "1️⃣ Asesoría en pensiones\n"
+        "2️⃣ Seguros de auto 🚗\n"
+        "3️⃣ Seguros de vida y salud ❤️\n"
+        "4️⃣ Tarjetas médicas VRIM 🏥\n"
+        "5️⃣ Préstamos a pensionados IMSS 💰\n"
+        "6️⃣ Financiamiento empresarial 💼\n"
+        "7️⃣ Nómina empresarial 🏦\n"
+        "8️⃣ Contactar con Christian 📞\n\n"
+        "👉 También puedes escribir *menu* en cualquier momento para ver estas opciones."
+    )
+
+def process_message(body: str):
+    body_lower = body.strip().lower()
+    if body_lower in ["menu", "menú"]:
+        return get_menu_text()
+    elif body_lower == "1":
+        return "📊 *Asesoría en pensiones.*\n(Modalidad 40, Ley 73, cálculo de pensión, etc.)"
+    elif body_lower == "2":
+        return "🚗 *Seguros de auto Inbursa.*\n(Planes y requisitos para cotizar)."
+    elif body_lower == "3":
+        return "❤️ *Seguros de vida y salud.*\n(Protección para ti y tu familia)."
+    elif body_lower == "4":
+        return "🏥 *Tarjetas médicas VRIM.*\n(Acceso a servicios médicos privados)."
+    elif body_lower == "5":
+        return "💰 *Préstamos a pensionados IMSS.*\n(Montos desde $10,000 hasta $650,000)."
+    elif body_lower == "6":
+        return "💼 *Financiamiento empresarial.*\n(Crédito, factoraje, arrendamiento)."
+    elif body_lower == "7":
+        return "🏦 *Nómina empresarial.*\n(Dispersión de nómina y beneficios adicionales)."
+    elif body_lower == "8":
+        return "📞 Un asesor de Christian se pondrá en contacto contigo."
+    else:
+        return get_menu_text()
+
+# ====== RUTAS WEBHOOK ======
 @app.route("/webhook", methods=["GET"])
 def verify():
+    mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-    if token == VERIFY_TOKEN:
-        return challenge
-    return "Error de verificación", 403
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        logging.info("✅ Webhook verificado correctamente")
+        return challenge, 200
+    logging.warning("❌ Verificación de webhook fallida")
+    return "Verification failed", 403
 
-# Webhook de mensajes entrantes
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
-    logging.info(f"Mensaje recibido: {data}")
+    logging.info(f"📩 Mensaje recibido: {data}")
 
-    if data and "entry" in data:
-        for entry in data["entry"]:
-            if "changes" in entry:
-                for change in entry["changes"]:
-                    value = change.get("value", {})
-                    messages = value.get("messages", [])
-                    for message in messages:
-                        from_number = message["from"]
-                        text = message.get("text", {}).get("body", "").lower()
+    try:
+        if "messages" in data["entry"][0]["changes"][0]["value"]:
+            message = data["entry"][0]["changes"][0]["value"]["messages"][0]
+            number = message["from"]
+            text = message.get("text", {}).get("body", "")
 
-                        if text in ["menu", "menú", "hola", "hi", "hello"]:
-                            menu = (
-                                "Vicky:\n👋 Hola, soy *Vicky*, asistente de Christian López.\n"
-                                "Selecciona una opción escribiendo el número correspondiente:\n\n"
-                                "1️⃣ Asesoría en pensiones\n"
-                                "2️⃣ Seguros de auto 🚗\n"
-                                "3️⃣ Seguros de vida y salud ❤️\n"
-                                "4️⃣ Tarjetas médicas VRIM 🏥\n"
-                                "5️⃣ Préstamos a pensionados IMSS 💰\n"
-                                "6️⃣ Financiamiento empresarial 💼\n"
-                                "7️⃣ Nómina empresarial 🏦\n"
-                                "8️⃣ Contactar con Christian 📞\n\n"
-                                "👉 También puedes escribir *menu* en cualquier momento para ver estas opciones."
-                            )
-                            send_whatsapp_message(from_number, menu)
+            logging.info(f"Mensaje de {number}: {text}")
+            response_text = process_message(text)
+            send_whatsapp_message(number, response_text)
+    except Exception as e:
+        logging.error(f"⚠️ Error procesando mensaje: {e}")
 
-                        elif text == "2":
-                            send_whatsapp_message(from_number, "🚗 *Seguros de auto Inbursa.*\n(Planes y requisitos para cotizar).")
+    return "EVENT_RECEIVED", 200
 
-                        else:
-                            send_whatsapp_message(from_number, "❓ No entendí tu mensaje. Escribe *menu* para ver las opciones disponibles.")
-
-    return jsonify({"status": "ok"}), 200
-
-# Health check
 @app.route("/health", methods=["GET"])
 def health():
-    return "OK", 200
+    return "Bot Vicky corriendo OK ✅", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=10000)
