@@ -1,3 +1,4 @@
+# config_env.py
 import os
 from dotenv import load_dotenv
 
@@ -22,4 +23,4 @@ GPT_MODEL        = _get("GPT_MODEL", "gpt-4o-mini")
 
 # Google Sheets (opcional)
 GOOGLE_SHEET_ID          = _get("GOOGLE_SHEET_ID") or _get("SHEET_ID_PROSPECTOS")
-GOOGLE_CREDENTIALS_JSON  = _get("GOOGLE_CREDENTIALS_JSON")  # JSON en una sola línea
+GOOGLE_CREDENTIALS_JSON  = _get("GOOGLE_CREDENTIALS_JSON")
