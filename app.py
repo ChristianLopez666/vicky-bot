@@ -46,12 +46,16 @@ def receive_message():
                         for message in change["value"]["messages"]:
                             sender = message["from"]
                             if message["type"] == "text":
-                                text = message["text"]["body"]
+                                text = message["text"]["body"].strip().lower()
                                 logging.info(f"Mensaje de {sender}: {text}")
-                                send_message(
-                                    sender,
-                                    "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n👉 Elige una opción del menú:"
-                                )
+
+                                if text in ["hola", "menu"]:
+                                    send_message(
+                                        sender,
+                                        "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n👉 Elige una opción del menú:"
+                                    )
+                                else:
+                                    logging.info("📌 Mensaje recibido, no es 'hola' ni 'menu'.")
     return jsonify({"status": "ok"}), 200
 
 # Función para enviar mensajes
