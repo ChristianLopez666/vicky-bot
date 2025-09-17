@@ -39,7 +39,8 @@ def verify():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
-    logging.info(f"📩 Mensaje recibido: {data}")
+    logging.info("📩 Payload recibido en webhook:")
+    logging.info(data)
 
     if data and "entry" in data:
         for entry in data["entry"]:
@@ -112,7 +113,7 @@ def enviar_mensaje_whatsapp(to, body):
     except Exception as e:
         logging.error(f"❌ Error enviando mensaje a {to}: {str(e)}")
 
-# 🟢 Generar respuesta con GPT
+# 🟢 Generar respuesta con GPT (con fallback seguro)
 def generar_respuesta_gpt(mensaje_usuario):
     try:
         response = openai.ChatCompletion.create(
@@ -126,7 +127,8 @@ def generar_respuesta_gpt(mensaje_usuario):
         )
         return response["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        return f"⚠️ Error con GPT: {str(e)}"
+        logging.error(f"❌ Error con GPT: {str(e)}")
+        return "⚠️ Hubo un problema al generar mi respuesta, pero estoy activa y lista para ayudarte."
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
