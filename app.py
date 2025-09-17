@@ -1,86 +1,22 @@
-import logging
 import os
-import requests
 from flask import Flask, request
-from config_env import (
-    VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID,
-    WA_API_VERSION, ADVISOR_NUMBER, LOG_LEVEL
-)
+from config_env import VERIFY_TOKEN, LOG_LEVEL, ADVISOR_NUMBER
+from utils_logger import get_logger
+from utils_validators import extract_messages, safe_text, safe_from
+from core_router import handle_incoming_message
+from core_whatsapp import send_text
 
 app = Flask(__name__)
-logging.basicConfig(level=getattr(logging, (LOG_LEVEL or "INFO").upper(), logging.INFO))
-log = app.logger
+log = get_logger("app", LOG_LEVEL)
 
-API_BASE = f"https://graph.facebook.com/{WA_API_VERSION}".rstrip("/")
-
-# ====== Helpers ======
-def send_whatsapp_text(to: str, message: str):
-    """Envía un mensaje de texto vía WhatsApp Cloud API."""
-    url = f"{API_BASE}/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": message}
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=15)
-        log.info("📤 Enviado a %s: %s | %s %s", to, (message[:120] + "…") if len(message) > 120 else message, resp.status_code, resp.text)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        log.exception("Error enviando mensaje a %s", to)
-        return {"error": str(e)}
-
-def get_menu_text():
-    return (
-        "👋 Hola, soy *Vicky*, asistente de Christian López.\n\n"
-        "Selecciona una opción escribiendo el número correspondiente:\n\n"
-        "1️⃣ Asesoría en pensiones\n"
-        "2️⃣ Seguros de auto 🚗\n"
-        "3️⃣ Seguros de vida y salud ❤️\n"
-        "4️⃣ Tarjetas médicas VRIM 🏥\n"
-        "5️⃣ Préstamos a pensionados IMSS 💰\n"
-        "6️⃣ Financiamiento empresarial 💼\n"
-        "7️⃣ Nómina empresarial 🏦\n"
-        "8️⃣ Contactar con Christian 📞\n\n"
-        "👉 También puedes escribir *menu* en cualquier momento para ver estas opciones."
-    )
-
-def process_message(body: str) -> str:
-    text = (body or "").strip().lower()
-    if text in {"menu", "menú", "hola", "hi", "hello"}:
-        return get_menu_text()
-    if text == "1":
-        return "📊 *Asesoría en pensiones.*\n(Modalidad 40, Ley 73, cálculo de pensión, etc.)"
-    if text == "2":
-        return "🚗 *Seguros de auto Inbursa.*\n(Planes y requisitos para cotizar)."
-    if text == "3":
-        return "❤️ *Seguros de vida y salud.*\n(Protección para ti y tu familia)."
-    if text == "4":
-        return "🏥 *Tarjetas médicas VRIM.*\n(Acceso a servicios médicos privados)."
-    if text == "5":
-        return "💰 *Préstamos a pensionados IMSS.*\n(Montos desde $10,000 hasta $650,000)."
-    if text == "6":
-        return "💼 *Financiamiento empresarial.*\n(Crédito, factoraje, arrendamiento)."
-    if text == "7":
-        return "🏦 *Nómina empresarial.*\n(Dispersión de nómina y beneficios)."
-    if text == "8":
-        return "📞 He notificado a Christian para que te contacte. ⏱️ *Notifiqué a Christian*."
-    return "❓ No entendí tu mensaje. Escribe *menu* para ver las opciones disponibles."
-
-# ====== Rutas ======
 @app.route("/", methods=["GET"])
 def index():
-    return "Vicky Bot – FASE 1 OK ✅", 200
+    return "Vicky FASE 1 – OK ✅", 200
 
 @app.route("/health", methods=["GET"])
 def health():
-    return "Bot Vicky corriendo OK ✅", 200
+    status = {"verify_token": bool(VERIFY_TOKEN), "advisor_number": bool(ADVISOR_NUMBER), "status": "ok"}
+    return status, 200
 
 @app.route("/webhook", methods=["GET"])
 def verify():
@@ -90,36 +26,32 @@ def verify():
     if mode == "subscribe" and token == VERIFY_TOKEN:
         log.info("✅ Webhook verificado correctamente")
         return challenge, 200
-    log.warning("❌ Verificación de webhook fallida")
+    log.warning("❌ Verificación fallida")
     return "Verification failed", 403
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
-    log.info("📩 Evento recibido")
-
     try:
-        # Estructura oficial de Meta
-        for entry in data.get("entry", []):
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
-                messages = value.get("messages", [])
-                for message in messages:
-                    wa_from = message.get("from")  # E.164 sin '+'
-                    text = (message.get("text", {}) or {}).get("body", "")
+        msgs = extract_messages(data)
+        if not msgs:
+            return "EVENT_RECEIVED", 200
 
-                    log.info("📥 Mensaje de %s: %s", wa_from, text)
-                    reply = process_message(text)
+        for m in msgs:
+            wa_from = safe_from(m)
+            text = safe_text(m)
+            log.info("📥 %s: %s", wa_from, text)
 
-                    # Enviar respuesta al usuario
-                    send_whatsapp_text(wa_from, reply)
+            reply = handle_incoming_message(wa_from, text)
+            send_text(wa_from, reply)
 
-                    # Si es la opción 8, notificar al asesor
-                    if reply.endswith("*Notifiqué a Christian*.") and ADVISOR_NUMBER:
-                        aviso = f"📞 Cliente solicita contacto.\nDe: {wa_from}\nMensaje: {text}"
-                        send_whatsapp_text(ADVISOR_NUMBER, aviso)
-    except Exception:
-        log.exception("⚠️ Error procesando webhook")
+            if reply.endswith("*Notifiqué a Christian*.") and ADVISOR_NUMBER:
+                aviso = f"📞 Cliente solicita contacto.\nDe: {wa_from}\nMensaje: {text}"
+                send_text(ADVISOR_NUMBER, aviso)
+
+    except Exception as e:
+        log.exception("⚠️ Error procesando webhook: %s", e)
+        return "EVENT_RECEIVED", 200
 
     return "EVENT_RECEIVED", 200
 
