@@ -2,14 +2,10 @@ Flask==2.2.5
 gunicorn==21.2.0
 requests==2.32.5
 python-dotenv==1.0.1
-# Opcionales (FASE 2)
 openai==1.30.1
-httpx==0.28.1
 gspread==6.0.2
 google-auth==2.29.0
 google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
-<<<<<<< HEAD
-=======
-gunicorn==21.2.0
->>>>>>> 65514338df9e2ce71ab1d251ea76ee0f79bb2b93
+httpx==0.28.1
+pydantic==2.11.9
