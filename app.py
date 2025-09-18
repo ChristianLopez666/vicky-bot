@@ -1,4 +1,4 @@
-import os
+import os 
 import logging
 import requests
 from flask import Flask, request, jsonify
@@ -42,42 +42,96 @@ def receive_message():
     data = request.get_json()
     logging.info(f"📩 Mensaje recibido: {data}")
 
-    if "entry" in data:
-        for entry in data["entry"]:
-            if "changes" in entry:
-                for change in entry["changes"]:
-                    if "value" in change and "messages" in change["value"]:
-                        for message in change["value"]["messages"]:
-                            # 🧠 CAMBIO MÍNIMO: evitar reprocesar el mismo mensaje
-                            msg_id = message.get("id")
-                            if msg_id in PROCESSED_MESSAGE_IDS:
-                                logging.info(f"🔁 Duplicado ignorado: {msg_id}")
-                                continue
-                            PROCESSED_MESSAGE_IDS.add(msg_id)
-                            if len(PROCESSED_MESSAGE_IDS) > 5000:
-                                PROCESSED_MESSAGE_IDS.clear()
+    # Ignorar payloads inesperados
+    if not data or "entry" not in data:
+        return jsonify({"status": "ignored"}), 200
 
-                            if message.get("type") == "text":
-                                sender = message["from"]
-                                text = message["text"]["body"].strip().lower()
-                                logging.info(f"Mensaje de {sender}: {text}")
+    # ---- Idempotencia y estado mínimo con TTL ----
+    from time import time
+    now = time()
 
-                                # 🧠 CAMBIO MÍNIMO: saludar solo la primera vez
-                                if sender not in GREETED_USERS:
-                                    send_message(
-                                        sender,
-                                        "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n👉 Elige una opción del menú:"
-                                    )
-                                    GREETED_USERS.add(sender)
-                                else:
-                                    # Si el usuario pide menú nuevamente, no repetir saludo
-                                    if text in ["menu", "menú", "hola"]:
-                                        send_message(
-                                            sender,
-                                            "👉 Elige una opción del menú:"
-                                        )
-                                    else:
-                                        logging.info("📌 Mensaje recibido (sin saludo repetido).")
+    global PROCESSED_MESSAGE_IDS, GREETED_USERS
+    # Compatibilidad: si quedaron como set, convertir a dict con timestamps
+    if isinstance(PROCESSED_MESSAGE_IDS, set):
+        PROCESSED_MESSAGE_IDS = {}
+    if isinstance(GREETED_USERS, set):
+        GREETED_USERS = {}
+
+    MSG_TTL = 600          # 10 minutos: ventana para deduplicar message.id
+    GREET_TTL = 24 * 3600  # 24 horas: ventana para no repetir saludo completo
+
+    # Limpieza simple cuando crece mucho
+    if len(PROCESSED_MESSAGE_IDS) > 5000:
+        PROCESSED_MESSAGE_IDS = {k: v for k, v in PROCESSED_MESSAGE_IDS.items() if now - v < MSG_TTL}
+    if len(GREETED_USERS) > 5000:
+        GREETED_USERS = {k: v for k, v in GREETED_USERS.items() if now - v < GREET_TTL}
+
+    # ---- Procesar SOLO el primer mensaje válido por payload ----
+    for entry in data.get("entry", []):
+        for change in entry.get("changes", []):
+            val = change.get("value", {})
+
+            # Ignorar callbacks de estado (entregas, leídos, etc.)
+            if "statuses" in val:
+                continue
+
+            messages = val.get("messages", [])
+            if not messages:
+                continue
+
+            # Tomamos solo el primer mensaje
+            message = messages[0]
+            msg_id = message.get("id")
+            msg_type = message.get("type")
+            sender = message.get("from")
+            business_phone = val.get("metadata", {}).get("display_phone_number")
+
+            logging.info(f"🧾 id={msg_id} type={msg_type} from={sender} business_phone={business_phone}")
+
+            # 1) Desduplicar por id con TTL
+            if msg_id:
+                last_seen = PROCESSED_MESSAGE_IDS.get(msg_id)
+                if last_seen and (now - last_seen) < MSG_TTL:
+                    logging.info(f"🔁 Duplicado ignorado: {msg_id}")
+                    continue
+                PROCESSED_MESSAGE_IDS[msg_id] = now
+
+            # 2) Ignorar posibles ecos desde el propio número (seguridad)
+            if business_phone and sender and sender.endswith(business_phone):
+                logging.info("🪞 Echo desde business_phone ignorado")
+                continue
+
+            # 3) Solo procesar texto por ahora
+            if msg_type != "text":
+                logging.info(f"ℹ️ Mensaje no-texto ignorado: {msg_type}")
+                continue
+
+            text = message.get("text", {}).get("body", "") or ""
+            text_norm = text.strip().lower()
+            logging.info(f"✉️ Texto normalizado: {text_norm}")
+
+            # 4) Saludo una vez por 24h; luego solo menú si lo piden
+            first_greet_ts = GREETED_USERS.get(sender)
+            if not first_greet_ts or (now - first_greet_ts) >= GREET_TTL:
+                if text_norm in ("hola", "menú", "menu"):
+                    send_message(
+                        sender,
+                        "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n👉 Elige una opción del menú:"
+                    )
+                else:
+                    # Cualquier texto previo al saludo → solo menú (sin repetir saludo)
+                    send_message(sender, "👉 Elige una opción del menú:")
+                GREETED_USERS[sender] = now
+                continue
+
+            # 5) Usuario ya saludado en ventana: si pide menú, muéstralo; si no, no repetir
+            if text_norm in ("hola", "menú", "menu"):
+                send_message(sender, "👉 Elige una opción del menú:")
+                continue
+
+            # 6) Aquí iría la lógica de opciones (1,2,...) sin repetir saludo/menú
+            logging.info("📌 Mensaje recibido (ya saludado). Sin respuesta automática.")
+
     return jsonify({"status": "ok"}), 200
 
 # Función para enviar mensajes
