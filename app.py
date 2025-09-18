@@ -17,12 +17,56 @@ app = Flask(__name__)
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-# ➕ NUEVO: número del asesor para notificaciones (default a tu línea)
-ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
+ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación al asesor
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ GPT (opcional)
 
-# 🧠 CAMBIO MÍNIMO: sets en memoria para controlar duplicados y saludo único
+# 🧠 Control simple en memoria
 PROCESSED_MESSAGE_IDS = set()
 GREETED_USERS = set()
+
+# --------- GPT fallback (opcional, sin dependencias nuevas) ----------
+def gpt_reply(user_text: str) -> str | None:
+    """
+    Devuelve una respuesta breve usando GPT si OPENAI_API_KEY existe.
+    Si no hay API key o falla la llamada, devuelve None (para no romper el flujo).
+    """
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "gpt-4o-mini",  # liviano y rápido; puedes cambiarlo por otro
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Eres Vicky, asistente de Christian López (asesor financiero de Inbursa). "
+                        "Responde en español, de forma breve, clara y orientada a conversión. "
+                        "Si la pregunta es sobre opciones del menú, sugiere escribir 'menu'. "
+                        "No inventes datos de pólizas ni montos; si faltan datos, pídelos de forma amable."
+                    )
+                },
+                {"role": "user", "content": user_text}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 220
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=12)
+        if resp.status_code == 200:
+            data = resp.json()
+            msg = data.get("choices", [{}])[0].get("message", {}).get("content")
+            return msg.strip() if msg else None
+        else:
+            logging.warning(f"GPT fallback no disponible: {resp.status_code} - {resp.text}")
+            return None
+    except Exception as e:
+        logging.error(f"Error en gpt_reply: {e}")
+        return None
+# ---------------------------------------------------------------------
 
 # Endpoint de verificación
 @app.route("/webhook", methods=["GET"])
@@ -53,7 +97,6 @@ def receive_message():
     now = time()
 
     global PROCESSED_MESSAGE_IDS, GREETED_USERS
-    # Compatibilidad: si quedaron como set, convertir a dict con timestamps
     if isinstance(PROCESSED_MESSAGE_IDS, set):
         PROCESSED_MESSAGE_IDS = {}
     if isinstance(GREETED_USERS, set):
@@ -62,13 +105,13 @@ def receive_message():
     MSG_TTL = 600          # 10 minutos
     GREET_TTL = 24 * 3600  # 24 horas
 
-    # Limpieza simple cuando crece mucho
+    # Limpieza simple
     if len(PROCESSED_MESSAGE_IDS) > 5000:
         PROCESSED_MESSAGE_IDS = {k: v for k, v in PROCESSED_MESSAGE_IDS.items() if now - v < MSG_TTL}
     if len(GREETED_USERS) > 5000:
         GREETED_USERS = {k: v for k, v in GREETED_USERS.items() if now - v < GREET_TTL}
 
-    # ---- Texto del menú (variable local) ----
+    # ---- Menú y respuestas ----
     MENU_TEXT = (
         "👉 Elige una opción del menú:\n"
         "1) Asesoría en pensiones IMSS (Ley 73 / Modalidad 40 / Modalidad 10)\n"
@@ -81,7 +124,6 @@ def receive_message():
         "\nEscribe el número de la opción o 'menu' para volver a ver el menú."
     )
 
-    # Respuestas mínimas por opción
     OPTION_RESPONSES = {
         "1": "🧓 Asesoría en pensiones IMSS. Cuéntame tu caso (Ley 73, M40, M10) y te guío paso a paso.",
         "2": "🚗 Seguro de auto. Envíame *foto de tu INE* y *tarjeta de circulación* o tu *número de placa* para cotizar.",
@@ -92,7 +134,6 @@ def receive_message():
         "7": "📞 ¡Listo! Notifiqué a Christian para que te contacte y te dé seguimiento."
     }
 
-    # 🔎 Mapeo simple de intención por palabras clave (NLP-lite, sin GPT)
     KEYWORD_INTENTS = [
         (("pension", "pensión", "imss", "modalidad 40", "modalidad 10", "ley 73"), "1"),
         (("auto", "seguro de auto", "placa", "tarjeta de circulación", "coche", "carro"), "2"),
@@ -114,7 +155,7 @@ def receive_message():
         for change in entry.get("changes", []):
             val = change.get("value", {})
 
-            # Ignorar callbacks de estado (entregas, leídos, etc.)
+            # Ignorar callbacks de estado
             if "statuses" in val:
                 continue
 
@@ -122,14 +163,14 @@ def receive_message():
             if not messages:
                 continue
 
-            # Tomamos solo el primer mensaje
+            # Primer mensaje del payload
             message = messages[0]
             msg_id = message.get("id")
             msg_type = message.get("type")
             sender = message.get("from")
             business_phone = val.get("metadata", {}).get("display_phone_number")
 
-            # Extraer nombre del perfil si viene en el payload
+            # Nombre del perfil si viene
             profile_name = None
             try:
                 profile_name = (val.get("contacts", [{}])[0].get("profile", {}) or {}).get("name")
@@ -138,7 +179,7 @@ def receive_message():
 
             logging.info(f"🧾 id={msg_id} type={msg_type} from={sender} business_phone={business_phone} profile={profile_name}")
 
-            # 1) Desduplicar por id con TTL
+            # Deduplicar por id con TTL
             if msg_id:
                 last_seen = PROCESSED_MESSAGE_IDS.get(msg_id)
                 if last_seen and (now - last_seen) < MSG_TTL:
@@ -146,12 +187,11 @@ def receive_message():
                     continue
                 PROCESSED_MESSAGE_IDS[msg_id] = now
 
-            # 2) Ignorar posibles ecos desde el propio número
+            # Ignorar posibles ecos
             if business_phone and sender and sender.endswith(business_phone):
                 logging.info("🪞 Echo desde business_phone ignorado")
                 continue
 
-            # 3) Solo procesar texto por ahora
             if msg_type != "text":
                 logging.info(f"ℹ️ Mensaje no-texto ignorado: {msg_type}")
                 continue
@@ -163,11 +203,9 @@ def receive_message():
             # ✅ PRIORIDAD 1: opción 1–7 o intención por palabras clave
             option = text_norm if text_norm in OPTION_RESPONSES else infer_option_from_text(text_norm)
             if option:
-                # Responder al usuario
                 send_message(sender, OPTION_RESPONSES[option])
-
-                # ➕ NUEVO: si es contacto (7), notificar al asesor
                 if option == "7":
+                    # Notificar al asesor
                     notify_text = (
                         "🔔 *Vicky Bot – Solicitud de contacto*\n"
                         f"- Nombre: {profile_name or 'No disponible'}\n"
@@ -181,10 +219,9 @@ def receive_message():
                         logging.error(f"❌ Error notificando al asesor: {e}")
                 continue
 
-            # PRIORIDAD 2: saludos/menú
+            # PRIORIDAD 2: saludo/menú
             first_greet_ts = GREETED_USERS.get(sender)
             if not first_greet_ts or (now - first_greet_ts) >= GREET_TTL:
-                # Primera interacción o expiró ventana
                 if text_norm in ("hola", "menú", "menu"):
                     send_message(
                         sender,
@@ -195,12 +232,19 @@ def receive_message():
                 GREETED_USERS[sender] = now
                 continue
 
-            # Usuario ya saludado → mostrar menú cuando lo pida
             if text_norm in ("hola", "menú", "menu"):
                 send_message(sender, MENU_TEXT)
                 continue
 
-            # Nada coincide → guía breve
+            # PRIORIDAD 3: GPT fallback (si hay API Key)
+            ai = gpt_reply(text)
+            if ai:
+                send_message(sender, ai)
+                # opcional: sugerir el menú
+                # send_message(sender, "Escribe 'menu' para ver opciones.")
+                continue
+
+            # Fallback final sin GPT
             logging.info("📌 Mensaje recibido (ya saludado). Respuesta guía.")
             send_message(sender, "No te entendí. Escribe un número del 1 al 7 o 'menu' para ver opciones.")
 
