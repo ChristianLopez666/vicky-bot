@@ -17,19 +17,17 @@ app = Flask(__name__)
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación al asesor
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ GPT (opcional)
+ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación privada al asesor
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ Fallback GPT (opcional)
 
 # 🧠 Control simple en memoria
 PROCESSED_MESSAGE_IDS = set()
 GREETED_USERS = set()
+LAST_INTENT = {}  # 🔹 Guarda última opción/intención por usuario para “motivo”
 
-# --------- GPT fallback (opcional, sin dependencias nuevas) ----------
+# --------- GPT fallback (opcional) ----------
 def gpt_reply(user_text: str) -> str | None:
-    """
-    Devuelve una respuesta breve usando GPT si OPENAI_API_KEY existe.
-    Si no hay API key o falla la llamada, devuelve None (para no romper el flujo).
-    """
+    """Devuelve una respuesta breve usando GPT si OPENAI_API_KEY existe."""
     if not OPENAI_API_KEY:
         return None
     try:
@@ -39,15 +37,15 @@ def gpt_reply(user_text: str) -> str | None:
             "Content-Type": "application/json"
         }
         payload = {
-            "model": "gpt-4o-mini",  # liviano y rápido; puedes cambiarlo por otro
+            "model": "gpt-4o-mini",
             "messages": [
                 {
                     "role": "system",
                     "content": (
                         "Eres Vicky, asistente de Christian López (asesor financiero de Inbursa). "
-                        "Responde en español, de forma breve, clara y orientada a conversión. "
-                        "Si la pregunta es sobre opciones del menú, sugiere escribir 'menu'. "
-                        "No inventes datos de pólizas ni montos; si faltan datos, pídelos de forma amable."
+                        "Responde en español, breve, claro y orientado a conversión. "
+                        "Si faltan datos para cotizar, pídelo de forma amable. "
+                        "Si preguntan por opciones, sugiere escribir 'menu'."
                     )
                 },
                 {"role": "user", "content": user_text}
@@ -66,7 +64,7 @@ def gpt_reply(user_text: str) -> str | None:
     except Exception as e:
         logging.error(f"Error en gpt_reply: {e}")
         return None
-# ---------------------------------------------------------------------
+# -------------------------------------------
 
 # Endpoint de verificación
 @app.route("/webhook", methods=["GET"])
@@ -96,7 +94,8 @@ def receive_message():
     from time import time
     now = time()
 
-    global PROCESSED_MESSAGE_IDS, GREETED_USERS
+    global PROCESSED_MESSAGE_IDS, GREETED_USERS, LAST_INTENT
+    # Compatibilidad: si quedaron como set, convertir a dict con timestamps
     if isinstance(PROCESSED_MESSAGE_IDS, set):
         PROCESSED_MESSAGE_IDS = {}
     if isinstance(GREETED_USERS, set):
@@ -110,6 +109,9 @@ def receive_message():
         PROCESSED_MESSAGE_IDS = {k: v for k, v in PROCESSED_MESSAGE_IDS.items() if now - v < MSG_TTL}
     if len(GREETED_USERS) > 5000:
         GREETED_USERS = {k: v for k, v in GREETED_USERS.items() if now - v < GREET_TTL}
+    if len(LAST_INTENT) > 5000:
+        # limpiar intents muy antiguos (misma ventana del saludo)
+        LAST_INTENT = {k: v for k, v in LAST_INTENT.items() if now - v.get("ts", now) < GREET_TTL}
 
     # ---- Menú y respuestas ----
     MENU_TEXT = (
@@ -131,13 +133,23 @@ def receive_message():
         "4": "🩺 Tarjetas médicas VRIM. Te comparto información y precios.",
         "5": "💳 Préstamos a pensionados IMSS. Monto *a partir de $40,000* y hasta $650,000. Dime tu pensión aproximada y el monto deseado.",
         "6": "🏢 Financiamiento empresarial y nómina. ¿Qué necesitas: crédito, factoraje o nómina?",
-        "7": "📞 ¡Listo! Notifiqué a Christian para que te contacte y te dé seguimiento."
+        "7": "📞 ¡Listo! He notificado a Christian para que te contacte y te dé seguimiento."
+    }
+
+    OPTION_TITLES = {
+        "1": "Asesoría en pensiones IMSS",
+        "2": "Seguros de auto",
+        "3": "Seguros de vida y salud",
+        "4": "Tarjetas médicas VRIM",
+        "5": "Préstamos a pensionados IMSS",
+        "6": "Financiamiento/nómina empresarial",
+        "7": "Contacto con Christian"
     }
 
     KEYWORD_INTENTS = [
         (("pension", "pensión", "imss", "modalidad 40", "modalidad 10", "ley 73"), "1"),
         (("auto", "seguro de auto", "placa", "tarjeta de circulación", "coche", "carro"), "2"),
-        (("vida", "seguro de vida", "salud", "gastos médicos", "asegurar vida", "planes de seguro"), "3"),
+        (("vida", "seguro de vida", "salud", "gastos médicos", "planes de seguro"), "3"),
         (("vrim", "tarjeta médica", "membresía médica"), "4"),
         (("préstamo", "prestamo", "pensionado", "crédito", "credito"), "5"),
         (("financiamiento", "factoraje", "nómina", "nomina", "empresarial"), "6"),
@@ -204,17 +216,26 @@ def receive_message():
             option = text_norm if text_norm in OPTION_RESPONSES else infer_option_from_text(text_norm)
             if option:
                 send_message(sender, OPTION_RESPONSES[option])
+                # Guardar motivo/intención (excepto 7, que es contacto)
+                LAST_INTENT[sender] = {"opt": option, "title": OPTION_TITLES.get(option), "ts": now}
+
+                # Si es contacto (7) → notificación PRIVADA al asesor, sin mostrar tu número al cliente
                 if option == "7":
-                    # Notificar al asesor
+                    motive = LAST_INTENT.get(sender, {}).get("title") or "No especificado"
                     notify_text = (
                         "🔔 *Vicky Bot – Solicitud de contacto*\n"
                         f"- Nombre: {profile_name or 'No disponible'}\n"
-                        f"- WhatsApp: {sender}\n"
+                        f"- WhatsApp del cliente: {sender}\n"
+                        f"- Motivo: {motive}\n"
                         f"- Mensaje original: \"{text.strip()}\""
                     )
                     try:
-                        send_message(ADVISOR_NUMBER, notify_text)
-                        logging.info(f"📨 Notificación enviada al asesor {ADVISOR_NUMBER}")
+                        # Evita enviarte el aviso al mismo chat del cliente por error
+                        if ADVISOR_NUMBER and ADVISOR_NUMBER != sender:
+                            send_message(ADVISOR_NUMBER, notify_text)
+                            logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_NUMBER}")
+                        else:
+                            logging.warning("ADVISOR_NUMBER no configurado o coincide con el cliente; no se envía notificación.")
                     except Exception as e:
                         logging.error(f"❌ Error notificando al asesor: {e}")
                 continue
@@ -240,8 +261,6 @@ def receive_message():
             ai = gpt_reply(text)
             if ai:
                 send_message(sender, ai)
-                # opcional: sugerir el menú
-                # send_message(sender, "Escribe 'menu' para ver opciones.")
                 continue
 
             # Fallback final sin GPT
