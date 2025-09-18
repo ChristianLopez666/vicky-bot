@@ -18,6 +18,9 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
+# 🔒 Desduplicador de mensajes (cambio mínimo)
+PROCESSED_MESSAGE_IDS = set()
+
 # Endpoint de verificación
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -44,8 +47,19 @@ def receive_message():
                 for change in entry["changes"]:
                     if "value" in change and "messages" in change["value"]:
                         for message in change["value"]["messages"]:
-                            sender = message["from"]
-                            if message["type"] == "text":
+
+                            # 🚫 Evitar reprocesar el mismo mensaje (cambio mínimo)
+                            msg_id = message.get("id")
+                            if msg_id in PROCESSED_MESSAGE_IDS:
+                                logging.info(f"🔁 Duplicado ignorado: {msg_id}")
+                                continue
+                            PROCESSED_MESSAGE_IDS.add(msg_id)
+                            # pequeña barrera de seguridad de memoria
+                            if len(PROCESSED_MESSAGE_IDS) > 5000:
+                                PROCESSED_MESSAGE_IDS.clear()
+
+                            if message.get("type") == "text":
+                                sender = message["from"]
                                 text = message["text"]["body"].strip().lower()
                                 logging.info(f"Mensaje de {sender}: {text}")
 
