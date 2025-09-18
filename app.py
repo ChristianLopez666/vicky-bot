@@ -57,14 +57,38 @@ def receive_message():
     if isinstance(GREETED_USERS, set):
         GREETED_USERS = {}
 
-    MSG_TTL = 600          # 10 minutos: ventana para deduplicar message.id
-    GREET_TTL = 24 * 3600  # 24 horas: ventana para no repetir saludo completo
+    MSG_TTL = 600          # 10 minutos
+    GREET_TTL = 24 * 3600  # 24 horas
 
     # Limpieza simple cuando crece mucho
     if len(PROCESSED_MESSAGE_IDS) > 5000:
         PROCESSED_MESSAGE_IDS = {k: v for k, v in PROCESSED_MESSAGE_IDS.items() if now - v < MSG_TTL}
     if len(GREETED_USERS) > 5000:
         GREETED_USERS = {k: v for k, v in GREETED_USERS.items() if now - v < GREET_TTL}
+
+    # ---- Texto del menú (variable local) ----
+    MENU_TEXT = (
+        "👉 Elige una opción del menú:\n"
+        "1) Asesoría en pensiones IMSS (Ley 73 / Modalidad 40 / Modalidad 10)\n"
+        "2) Seguros de auto (Amplia PLUS, Amplia, Limitada)\n"
+        "3) Seguros de vida y salud\n"
+        "4) Tarjetas médicas VRIM\n"
+        "5) Préstamos a pensionados IMSS ($10,000 a $650,000)\n"
+        "6) Financiamiento empresarial y nómina empresarial\n"
+        "7) Contactar con Christian\n"
+        "\nEscribe el número de la opción o 'menu' para volver a ver el menú."
+    )
+
+    # Respuestas mínimas por opción
+    OPTION_RESPONSES = {
+        "1": "🧓 Asesoría en pensiones IMSS. Cuéntame tu caso (Ley 73, M40, M10) y te guío paso a paso.",
+        "2": "🚗 Seguro de auto. Envíame *foto de tu INE* y *tarjeta de circulación* o tu *número de placa* para cotizar.",
+        "3": "🛡️ Seguros de vida y salud. Te preparo una cotización personalizada.",
+        "4": "🩺 Tarjetas médicas VRIM. Te comparto información y precios.",
+        "5": "💳 Préstamos a pensionados IMSS. Dime tu pensión aproximada y el monto deseado.",
+        "6": "🏢 Financiamiento empresarial y nómina. ¿Qué necesitas: crédito, factoraje o nómina?",
+        "7": "📞 ¡Listo! Notifiqué a Christian para que te contacte y te dé seguimiento."
+    }
 
     # ---- Procesar SOLO el primer mensaje válido por payload ----
     for entry in data.get("entry", []):
@@ -96,7 +120,7 @@ def receive_message():
                     continue
                 PROCESSED_MESSAGE_IDS[msg_id] = now
 
-            # 2) Ignorar posibles ecos desde el propio número (seguridad)
+            # 2) Ignorar posibles ecos desde el propio número
             if business_phone and sender and sender.endswith(business_phone):
                 logging.info("🪞 Echo desde business_phone ignorado")
                 continue
@@ -110,27 +134,35 @@ def receive_message():
             text_norm = text.strip().lower()
             logging.info(f"✉️ Texto normalizado: {text_norm}")
 
-            # 4) Saludo una vez por 24h; luego solo menú si lo piden
+            # 4) Saludo una vez por 24h; luego mostrar menú según se pida
             first_greet_ts = GREETED_USERS.get(sender)
             if not first_greet_ts or (now - first_greet_ts) >= GREET_TTL:
+                # En la primera interacción, mandamos saludo + menú completo
                 if text_norm in ("hola", "menú", "menu"):
                     send_message(
                         sender,
-                        "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n👉 Elige una opción del menú:"
+                        "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n" + MENU_TEXT
                     )
                 else:
-                    # Cualquier texto previo al saludo → solo menú (sin repetir saludo)
-                    send_message(sender, "👉 Elige una opción del menú:")
+                    send_message(sender, MENU_TEXT)
                 GREETED_USERS[sender] = now
                 continue
 
-            # 5) Usuario ya saludado en ventana: si pide menú, muéstralo; si no, no repetir
+            # 5) Usuario ya saludado: 'hola' o 'menu' vuelve a mostrar el menú completo
             if text_norm in ("hola", "menú", "menu"):
-                send_message(sender, "👉 Elige una opción del menú:")
+                send_message(sender, MENU_TEXT)
                 continue
 
-            # 6) Aquí iría la lógica de opciones (1,2,...) sin repetir saludo/menú
-            logging.info("📌 Mensaje recibido (ya saludado). Sin respuesta automática.")
+            # 6) Opción numérica 1–7
+            if text_norm in OPTION_RESPONSES:
+                send_message(sender, OPTION_RESPONSES[text_norm])
+                # Si quieres mostrar nuevamente el menú, descomenta la línea siguiente:
+                # send_message(sender, MENU_TEXT)
+                continue
+
+            # 7) No coincide con nada → mensaje guía breve
+            logging.info("📌 Mensaje recibido (ya saludado). Respuesta guía.")
+            send_message(sender, "No te entendí. Escribe un número del 1 al 7 o 'menu' para ver opciones.")
 
     return jsonify({"status": "ok"}), 200
 
