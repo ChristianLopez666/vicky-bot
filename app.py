@@ -18,8 +18,9 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
-# 🔒 Desduplicador de mensajes (cambio mínimo)
+# 🧠 CAMBIO MÍNIMO: sets en memoria para controlar duplicados y saludo único
 PROCESSED_MESSAGE_IDS = set()
+GREETED_USERS = set()
 
 # Endpoint de verificación
 @app.route("/webhook", methods=["GET"])
@@ -47,14 +48,12 @@ def receive_message():
                 for change in entry["changes"]:
                     if "value" in change and "messages" in change["value"]:
                         for message in change["value"]["messages"]:
-
-                            # 🚫 Evitar reprocesar el mismo mensaje (cambio mínimo)
+                            # 🧠 CAMBIO MÍNIMO: evitar reprocesar el mismo mensaje
                             msg_id = message.get("id")
                             if msg_id in PROCESSED_MESSAGE_IDS:
                                 logging.info(f"🔁 Duplicado ignorado: {msg_id}")
                                 continue
                             PROCESSED_MESSAGE_IDS.add(msg_id)
-                            # pequeña barrera de seguridad de memoria
                             if len(PROCESSED_MESSAGE_IDS) > 5000:
                                 PROCESSED_MESSAGE_IDS.clear()
 
@@ -63,13 +62,22 @@ def receive_message():
                                 text = message["text"]["body"].strip().lower()
                                 logging.info(f"Mensaje de {sender}: {text}")
 
-                                if text in ["hola", "menu"]:
+                                # 🧠 CAMBIO MÍNIMO: saludar solo la primera vez
+                                if sender not in GREETED_USERS:
                                     send_message(
                                         sender,
                                         "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n👉 Elige una opción del menú:"
                                     )
+                                    GREETED_USERS.add(sender)
                                 else:
-                                    logging.info("📌 Mensaje recibido, no es 'hola' ni 'menu'.")
+                                    # Si el usuario pide menú nuevamente, no repetir saludo
+                                    if text in ["menu", "menú", "hola"]:
+                                        send_message(
+                                            sender,
+                                            "👉 Elige una opción del menú:"
+                                        )
+                                    else:
+                                        logging.info("📌 Mensaje recibido (sin saludo repetido).")
     return jsonify({"status": "ok"}), 200
 
 # Función para enviar mensajes
