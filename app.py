@@ -18,52 +18,96 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación privada al asesor
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ Fallback GPT (opcional)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ GPT (opcional)
 
-# 🧠 Control simple en memoria
+# 🧠 Controles en memoria
 PROCESSED_MESSAGE_IDS = set()
 GREETED_USERS = set()
-LAST_INTENT = {}   # Motivo de último intent (para la notificación)
-USER_CONTEXT = {}  # ← NUEVO: estado por usuario {wa_id: {"ctx": str, "ts": float}}
+LAST_INTENT = {}   # último intent (para motivo de contacto)
+USER_CONTEXT = {}  # estado por usuario {wa_id: {"ctx": str, "ts": float}}
 
-# --------- GPT fallback (opcional) ----------
+# --------- GPT fallback robusto (opcional) ----------
 def gpt_reply(user_text: str) -> str | None:
+    """
+    Devuelve respuesta breve usando GPT si OPENAI_API_KEY existe.
+    1) Intenta /v1/responses (model gpt-4o-mini)
+    2) Si falla, intenta /v1/chat/completions
+    Timeout corto (6s) para no romper WhatsApp.
+    """
     if not OPENAI_API_KEY:
         return None
+
+    system_prompt = (
+        "Eres Vicky, asistente de Christian López (asesor financiero de Inbursa). "
+        "Responde en español, breve, clara y orientada a siguiente paso. "
+        "Si faltan datos para cotizar, pide solo lo necesario. "
+        "Evita dar cifras inventadas o promesas. "
+        "Si preguntan por opciones, sugiere escribir 'menu'."
+    )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # 1) /v1/responses
     try:
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Eres Vicky, asistente de Christian López (asesor financiero de Inbursa). "
-                        "Responde en español, breve y clara. Si faltan datos para cotizar, pídelos. "
-                        "Evita cifras inventadas; sugiere 'menu' si corresponde."
-                    )
-                },
-                {"role": "user", "content": user_text}
-            ],
-            "temperature": 0.3,
-            "max_tokens": 220
-        }
-        resp = requests.post(url, headers=headers, json=payload, timeout=12)
+        resp = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json={
+                "model": "gpt-4o-mini",
+                "input": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text}
+                ],
+                "max_output_tokens": 220,
+                "temperature": 0.3,
+            },
+            timeout=6,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            out = (data.get("output", [{}])[0].get("content", [{}])[0].get("text") 
+                   if "output" in data else None)
+            if out:
+                return out.strip()
+            # Algunas respuestas devuelven en 'choices' por compat
+            ch = data.get("choices", [{}])[0].get("message", {}).get("content")
+            if ch:
+                return ch.strip()
+        else:
+            logging.warning(f"[GPT responses] {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        logging.error(f"[GPT responses] error: {e}")
+
+    # 2) /v1/chat/completions (compat)
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                "max_tokens": 220,
+                "temperature": 0.3,
+            },
+            timeout=6,
+        )
         if resp.status_code == 200:
             data = resp.json()
             msg = data.get("choices", [{}])[0].get("message", {}).get("content")
             return msg.strip() if msg else None
         else:
-            logging.warning(f"GPT fallback no disponible: {resp.status_code} - {resp.text}")
-            return None
+            logging.warning(f"[GPT chat] {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        logging.error(f"Error en gpt_reply: {e}")
-        return None
-# -------------------------------------------
+        logging.error(f"[GPT chat] error: {e}")
+
+    return None
+# ----------------------------------------------------
 
 # Endpoint de verificación
 @app.route("/webhook", methods=["GET"])
@@ -99,7 +143,7 @@ def receive_message():
 
     MSG_TTL = 600
     GREET_TTL = 24 * 3600
-    CTX_TTL = 4 * 3600  # 4h de contexto de sesión
+    CTX_TTL = 4 * 3600
 
     if len(PROCESSED_MESSAGE_IDS) > 5000:
         PROCESSED_MESSAGE_IDS = {k: v for k, v in PROCESSED_MESSAGE_IDS.items() if now - v < MSG_TTL}
@@ -142,7 +186,7 @@ def receive_message():
         "7": "Contacto con Christian"
     }
 
-    # ❗ Quitamos “crédito/credito” del intent de préstamos (5) para no chocar con 6
+    # Quitamos 'crédito' del intent de opción 5 para evitar choques con 6
     KEYWORD_INTENTS = [
         (("pension", "pensión", "imss", "modalidad 40", "modalidad 10", "ley 73"), "1"),
         (("auto", "seguro de auto", "placa", "tarjeta de circulación", "coche", "carro"), "2"),
@@ -204,7 +248,8 @@ def receive_message():
             text_norm = text.strip().lower()
             logging.info(f"✉️ Texto normalizado: {text_norm}")
 
-            # -------- Contexto por usuario (prioridad sobre mapeo global) --------
+            # -------- Contexto por usuario (financiamiento) --------
+            from time import time as _t
             user_ctx = USER_CONTEXT.get(sender)
             if user_ctx and (now - user_ctx.get("ts", now) < CTX_TTL):
                 ctx = user_ctx.get("ctx")
@@ -212,42 +257,40 @@ def receive_message():
                     if any(k in text_norm for k in ("crédito", "credito")):
                         send_message(sender, "🏦 Crédito empresarial: monto y plazo a medida. Compárteme *antigüedad del negocio*, *ingresos aproximados* y *RFC* para iniciar.")
                         LAST_INTENT[sender] = {"opt": "6", "title": "Crédito empresarial", "ts": now}
-                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
+                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": _t()}
                         continue
                     if "factoraje" in text_norm:
                         send_message(sender, "📄 Factoraje: adelantamos el cobro de tus facturas. Dime *promedio mensual de facturación* y *RFC*.")
                         LAST_INTENT[sender] = {"opt": "6", "title": "Factoraje", "ts": now}
-                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
+                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": _t()}
                         continue
                     if any(k in text_norm for k in ("nómina", "nomina")):
                         send_message(sender, "👥 Nómina empresarial: dispersión de sueldos y beneficios. ¿Cuántos colaboradores tienes y periodicidad de pago?")
                         LAST_INTENT[sender] = {"opt": "6", "title": "Nómina empresarial", "ts": now}
-                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
+                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": _t()}
                         continue
-                # Puedes agregar más contextos aquí (p. ej., seguros de vida)
-            # ---------------------------------------------------------------------
+            # -------------------------------------------------------
 
-            # ---------- Detección de consulta natural para GPT ----------
+            # ---------- GPT primero para consultas naturales ----------
             is_numeric_option = text_norm in OPTION_RESPONSES
             is_menu = text_norm in ("hola", "menú", "menu")
             is_natural_query = (not is_numeric_option) and (not is_menu) and any(ch.isalpha() for ch in text_norm) and (len(text_norm.split()) >= 3)
+
             if is_natural_query:
                 ai = gpt_reply(text)
                 if ai:
                     send_message(sender, ai)
                     LAST_INTENT[sender] = {"opt": "gpt", "title": "Consulta abierta", "ts": now}
                     continue
-            # ---------------------------------------------------------------------
+            # ---------------------------------------------------------
 
-            # Opción 1–7 (o inferida por keywords si no hay contexto)
+            # Opción 1–7 (o inferida por keywords)
             option = text_norm if is_numeric_option else infer_option_from_text(text_norm)
             if option:
                 send_message(sender, OPTION_RESPONSES[option])
                 LAST_INTENT[sender] = {"opt": option, "title": OPTION_TITLES.get(option), "ts": now}
-                # Si entra a 6 → activar contexto de financiamiento
                 if option == "6":
                     USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
-                # Si solicita contacto (7) → notificación privada
                 if option == "7":
                     motive = LAST_INTENT.get(sender, {}).get("title") or "No especificado"
                     notify_text = (
