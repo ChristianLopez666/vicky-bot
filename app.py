@@ -43,9 +43,8 @@ def gpt_reply(user_text: str) -> str | None:
                     "role": "system",
                     "content": (
                         "Eres Vicky, asistente de Christian López (asesor financiero de Inbursa). "
-                        "Responde en español, breve, claro y orientado a conversión. "
-                        "Si faltan datos para cotizar, pídelo de forma amable. "
-                        "Si preguntan por opciones, sugiere escribir 'menu'."
+                        "Responde en español, breve y clara. Si faltan datos para cotizar, pídelos. "
+                        "Evita dar cifras inventadas; si no estás segura, pide datos o ofrece agendar con Christian."
                     )
                 },
                 {"role": "user", "content": user_text}
@@ -95,7 +94,6 @@ def receive_message():
     now = time()
 
     global PROCESSED_MESSAGE_IDS, GREETED_USERS, LAST_INTENT
-    # Compatibilidad: si quedaron como set, convertir a dict con timestamps
     if isinstance(PROCESSED_MESSAGE_IDS, set):
         PROCESSED_MESSAGE_IDS = {}
     if isinstance(GREETED_USERS, set):
@@ -110,7 +108,6 @@ def receive_message():
     if len(GREETED_USERS) > 5000:
         GREETED_USERS = {k: v for k, v in GREETED_USERS.items() if now - v < GREET_TTL}
     if len(LAST_INTENT) > 5000:
-        # limpiar intents muy antiguos (misma ventana del saludo)
         LAST_INTENT = {k: v for k, v in LAST_INTENT.items() if now - v.get("ts", now) < GREET_TTL}
 
     # ---- Menú y respuestas ----
@@ -212,14 +209,25 @@ def receive_message():
             text_norm = text.strip().lower()
             logging.info(f"✉️ Texto normalizado: {text_norm}")
 
-            # ✅ PRIORIDAD 1: opción 1–7 o intención por palabras clave
-            option = text_norm if text_norm in OPTION_RESPONSES else infer_option_from_text(text_norm)
+            # ---------- NUEVO: detección de consulta natural para priorizar GPT ----------
+            is_numeric_option = text_norm in OPTION_RESPONSES
+            is_menu = text_norm in ("hola", "menú", "menu")
+            is_natural_query = (not is_numeric_option) and (not is_menu) and any(ch.isalpha() for ch in text_norm) and (len(text_norm.split()) >= 3)
+
+            if is_natural_query:
+                ai = gpt_reply(text)
+                if ai:
+                    send_message(sender, ai)
+                    LAST_INTENT[sender] = {"opt": "gpt", "title": "Consulta abierta", "ts": now}
+                    continue
+            # ---------------------------------------------------------------------------
+
+            # PRIORIDAD: opción 1–7 o intención por palabras clave
+            option = text_norm if is_numeric_option else infer_option_from_text(text_norm)
             if option:
                 send_message(sender, OPTION_RESPONSES[option])
-                # Guardar motivo/intención (excepto 7, que es contacto)
                 LAST_INTENT[sender] = {"opt": option, "title": OPTION_TITLES.get(option), "ts": now}
 
-                # Si es contacto (7) → notificación PRIVADA al asesor, sin mostrar tu número al cliente
                 if option == "7":
                     motive = LAST_INTENT.get(sender, {}).get("title") or "No especificado"
                     notify_text = (
@@ -230,7 +238,6 @@ def receive_message():
                         f"- Mensaje original: \"{text.strip()}\""
                     )
                     try:
-                        # Evita enviarte el aviso al mismo chat del cliente por error
                         if ADVISOR_NUMBER and ADVISOR_NUMBER != sender:
                             send_message(ADVISOR_NUMBER, notify_text)
                             logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_NUMBER}")
@@ -240,10 +247,10 @@ def receive_message():
                         logging.error(f"❌ Error notificando al asesor: {e}")
                 continue
 
-            # PRIORIDAD 2: saludo/menú
+            # Saludos/menú
             first_greet_ts = GREETED_USERS.get(sender)
             if not first_greet_ts or (now - first_greet_ts) >= GREET_TTL:
-                if text_norm in ("hola", "menú", "menu"):
+                if is_menu:
                     send_message(
                         sender,
                         "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n" + MENU_TEXT
@@ -253,17 +260,11 @@ def receive_message():
                 GREETED_USERS[sender] = now
                 continue
 
-            if text_norm in ("hola", "menú", "menu"):
+            if is_menu:
                 send_message(sender, MENU_TEXT)
                 continue
 
-            # PRIORIDAD 3: GPT fallback (si hay API Key)
-            ai = gpt_reply(text)
-            if ai:
-                send_message(sender, ai)
-                continue
-
-            # Fallback final sin GPT
+            # Fallback final (sin GPT o GPT falló)
             logging.info("📌 Mensaje recibido (ya saludado). Respuesta guía.")
             send_message(sender, "No te entendí. Escribe un número del 1 al 7 o 'menu' para ver opciones.")
 
