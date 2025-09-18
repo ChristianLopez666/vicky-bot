@@ -73,7 +73,7 @@ def receive_message():
         "2) Seguros de auto (Amplia PLUS, Amplia, Limitada)\n"
         "3) Seguros de vida y salud\n"
         "4) Tarjetas médicas VRIM\n"
-        "5) Préstamos a pensionados IMSS ($40,000 a $650,000)\n"
+        "5) Préstamos a pensionados IMSS (a partir de $40,000 pesos hasta $650,000)\n"
         "6) Financiamiento empresarial y nómina empresarial\n"
         "7) Contactar con Christian\n"
         "\nEscribe el número de la opción o 'menu' para volver a ver el menú."
@@ -85,10 +85,27 @@ def receive_message():
         "2": "🚗 Seguro de auto. Envíame *foto de tu INE* y *tarjeta de circulación* o tu *número de placa* para cotizar.",
         "3": "🛡️ Seguros de vida y salud. Te preparo una cotización personalizada.",
         "4": "🩺 Tarjetas médicas VRIM. Te comparto información y precios.",
-        "5": "💳 Préstamos a pensionados IMSS. Dime tu pensión aproximada y el monto deseado (desde $40,000).",
+        "5": "💳 Préstamos a pensionados IMSS. Monto *a partir de $40,000* y hasta $650,000. Dime tu pensión aproximada y el monto deseado.",
         "6": "🏢 Financiamiento empresarial y nómina. ¿Qué necesitas: crédito, factoraje o nómina?",
         "7": "📞 ¡Listo! Notifiqué a Christian para que te contacte y te dé seguimiento."
     }
+
+    # 🔎 Mapeo simple de intención por palabras clave (NLP-lite, sin GPT)
+    KEYWORD_INTENTS = [
+        (("pension", "pensión", "imss", "modalidad 40", "modalidad 10", "ley 73"), "1"),
+        (("auto", "seguro de auto", "placa", "tarjeta de circulación", "coche", "carro"), "2"),
+        (("vida", "seguro de vida", "salud", "gastos médicos", "asegurar vida"), "3"),
+        (("vrim", "tarjeta médica", "membresía médica"), "4"),
+        (("préstamo", "prestamo", "pensionado", "crédito", "credito"), "5"),
+        (("financiamiento", "factoraje", "nómina", "nomina", "empresarial"), "6"),
+        (("contacto", "contactar", "asesor", "christian"), "7"),
+    ]
+
+    def infer_option_from_text(t: str) -> str | None:
+        for keywords, opt in KEYWORD_INTENTS:
+            if any(k in t for k in keywords):
+                return opt
+        return None
 
     # ---- Procesar SOLO el primer mensaje válido por payload ----
     for entry in data.get("entry", []):
@@ -134,10 +151,15 @@ def receive_message():
             text_norm = text.strip().lower()
             logging.info(f"✉️ Texto normalizado: {text_norm}")
 
-            # ✅ PRIORIDAD 1: si es opción 1–7, responder y salir (evita que se re-muestre el menú)
+            # ✅ PRIORIDAD 1: opción 1–7 o intención por palabras clave
+            option = None
             if text_norm in OPTION_RESPONSES:
-                send_message(sender, OPTION_RESPONSES[text_norm])
-                # Si deseas re-mostrar el menú tras responder, puedes añadir otra llamada aquí.
+                option = text_norm
+            else:
+                option = infer_option_from_text(text_norm)
+
+            if option:
+                send_message(sender, OPTION_RESPONSES[option])
                 continue
 
             # PRIORIDAD 2: saludos/menú
