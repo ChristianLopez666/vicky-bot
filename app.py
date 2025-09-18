@@ -23,11 +23,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ Fallback GPT (opcional)
 # 🧠 Control simple en memoria
 PROCESSED_MESSAGE_IDS = set()
 GREETED_USERS = set()
-LAST_INTENT = {}  # 🔹 Guarda última opción/intención por usuario para “motivo”
+LAST_INTENT = {}   # Motivo de último intent (para la notificación)
+USER_CONTEXT = {}  # ← NUEVO: estado por usuario {wa_id: {"ctx": str, "ts": float}}
 
 # --------- GPT fallback (opcional) ----------
 def gpt_reply(user_text: str) -> str | None:
-    """Devuelve una respuesta breve usando GPT si OPENAI_API_KEY existe."""
     if not OPENAI_API_KEY:
         return None
     try:
@@ -44,7 +44,7 @@ def gpt_reply(user_text: str) -> str | None:
                     "content": (
                         "Eres Vicky, asistente de Christian López (asesor financiero de Inbursa). "
                         "Responde en español, breve y clara. Si faltan datos para cotizar, pídelos. "
-                        "Evita dar cifras inventadas; si no estás segura, pide datos o ofrece agendar con Christian."
+                        "Evita cifras inventadas; sugiere 'menu' si corresponde."
                     )
                 },
                 {"role": "user", "content": user_text}
@@ -85,32 +85,31 @@ def receive_message():
     data = request.get_json()
     logging.info(f"📩 Mensaje recibido: {data}")
 
-    # Ignorar payloads inesperados
     if not data or "entry" not in data:
         return jsonify({"status": "ignored"}), 200
 
-    # ---- Idempotencia y estado mínimo con TTL ----
     from time import time
     now = time()
 
-    global PROCESSED_MESSAGE_IDS, GREETED_USERS, LAST_INTENT
+    global PROCESSED_MESSAGE_IDS, GREETED_USERS, LAST_INTENT, USER_CONTEXT
     if isinstance(PROCESSED_MESSAGE_IDS, set):
         PROCESSED_MESSAGE_IDS = {}
     if isinstance(GREETED_USERS, set):
         GREETED_USERS = {}
 
-    MSG_TTL = 600          # 10 minutos
-    GREET_TTL = 24 * 3600  # 24 horas
+    MSG_TTL = 600
+    GREET_TTL = 24 * 3600
+    CTX_TTL = 4 * 3600  # 4h de contexto de sesión
 
-    # Limpieza simple
     if len(PROCESSED_MESSAGE_IDS) > 5000:
         PROCESSED_MESSAGE_IDS = {k: v for k, v in PROCESSED_MESSAGE_IDS.items() if now - v < MSG_TTL}
     if len(GREETED_USERS) > 5000:
         GREETED_USERS = {k: v for k, v in GREETED_USERS.items() if now - v < GREET_TTL}
     if len(LAST_INTENT) > 5000:
         LAST_INTENT = {k: v for k, v in LAST_INTENT.items() if now - v.get("ts", now) < GREET_TTL}
+    if len(USER_CONTEXT) > 5000:
+        USER_CONTEXT = {k: v for k, v in USER_CONTEXT.items() if now - v.get("ts", now) < CTX_TTL}
 
-    # ---- Menú y respuestas ----
     MENU_TEXT = (
         "👉 Elige una opción del menú:\n"
         "1) Asesoría en pensiones IMSS (Ley 73 / Modalidad 40 / Modalidad 10)\n"
@@ -129,7 +128,7 @@ def receive_message():
         "3": "🛡️ Seguros de vida y salud. Te preparo una cotización personalizada.",
         "4": "🩺 Tarjetas médicas VRIM. Te comparto información y precios.",
         "5": "💳 Préstamos a pensionados IMSS. Monto *a partir de $40,000* y hasta $650,000. Dime tu pensión aproximada y el monto deseado.",
-        "6": "🏢 Financiamiento empresarial y nómina. ¿Qué necesitas: crédito, factoraje o nómina?",
+        "6": "🏢 Financiamiento empresarial y nómina. ¿Qué necesitas: *crédito*, *factoraje* o *nómina*?",
         "7": "📞 ¡Listo! He notificado a Christian para que te contacte y te dé seguimiento."
     }
 
@@ -143,13 +142,14 @@ def receive_message():
         "7": "Contacto con Christian"
     }
 
+    # ❗ Quitamos “crédito/credito” del intent de préstamos (5) para no chocar con 6
     KEYWORD_INTENTS = [
         (("pension", "pensión", "imss", "modalidad 40", "modalidad 10", "ley 73"), "1"),
         (("auto", "seguro de auto", "placa", "tarjeta de circulación", "coche", "carro"), "2"),
         (("vida", "seguro de vida", "salud", "gastos médicos", "planes de seguro"), "3"),
         (("vrim", "tarjeta médica", "membresía médica"), "4"),
-        (("préstamo", "prestamo", "pensionado", "crédito", "credito"), "5"),
-        (("financiamiento", "factoraje", "nómina", "nomina", "empresarial"), "6"),
+        (("préstamo", "prestamo", "pensionado", "préstamo imss", "prestamo imss"), "5"),
+        (("financiamiento", "factoraje", "nómina", "nomina", "empresarial", "crédito empresarial", "credito empresarial"), "6"),
         (("contacto", "contactar", "asesor", "christian", "llámame", "quiero hablar"), "7"),
     ]
 
@@ -164,7 +164,6 @@ def receive_message():
         for change in entry.get("changes", []):
             val = change.get("value", {})
 
-            # Ignorar callbacks de estado
             if "statuses" in val:
                 continue
 
@@ -172,23 +171,20 @@ def receive_message():
             if not messages:
                 continue
 
-            # Primer mensaje del payload
             message = messages[0]
             msg_id = message.get("id")
             msg_type = message.get("type")
             sender = message.get("from")
             business_phone = val.get("metadata", {}).get("display_phone_number")
 
-            # Nombre del perfil si viene
             profile_name = None
             try:
                 profile_name = (val.get("contacts", [{}])[0].get("profile", {}) or {}).get("name")
             except Exception:
                 profile_name = None
 
-            logging.info(f"🧾 id={msg_id} type={msg_type} from={sender} business_phone={business_phone} profile={profile_name}")
+            logging.info(f"🧾 id={msg_id} type={msg_type} from={sender} profile={profile_name}")
 
-            # Deduplicar por id con TTL
             if msg_id:
                 last_seen = PROCESSED_MESSAGE_IDS.get(msg_id)
                 if last_seen and (now - last_seen) < MSG_TTL:
@@ -196,7 +192,6 @@ def receive_message():
                     continue
                 PROCESSED_MESSAGE_IDS[msg_id] = now
 
-            # Ignorar posibles ecos
             if business_phone and sender and sender.endswith(business_phone):
                 logging.info("🪞 Echo desde business_phone ignorado")
                 continue
@@ -209,25 +204,50 @@ def receive_message():
             text_norm = text.strip().lower()
             logging.info(f"✉️ Texto normalizado: {text_norm}")
 
-            # ---------- NUEVO: detección de consulta natural para priorizar GPT ----------
+            # -------- Contexto por usuario (prioridad sobre mapeo global) --------
+            user_ctx = USER_CONTEXT.get(sender)
+            if user_ctx and (now - user_ctx.get("ts", now) < CTX_TTL):
+                ctx = user_ctx.get("ctx")
+                if ctx == "financiamiento":
+                    if any(k in text_norm for k in ("crédito", "credito")):
+                        send_message(sender, "🏦 Crédito empresarial: monto y plazo a medida. Compárteme *antigüedad del negocio*, *ingresos aproximados* y *RFC* para iniciar.")
+                        LAST_INTENT[sender] = {"opt": "6", "title": "Crédito empresarial", "ts": now}
+                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
+                        continue
+                    if "factoraje" in text_norm:
+                        send_message(sender, "📄 Factoraje: adelantamos el cobro de tus facturas. Dime *promedio mensual de facturación* y *RFC*.")
+                        LAST_INTENT[sender] = {"opt": "6", "title": "Factoraje", "ts": now}
+                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
+                        continue
+                    if any(k in text_norm for k in ("nómina", "nomina")):
+                        send_message(sender, "👥 Nómina empresarial: dispersión de sueldos y beneficios. ¿Cuántos colaboradores tienes y periodicidad de pago?")
+                        LAST_INTENT[sender] = {"opt": "6", "title": "Nómina empresarial", "ts": now}
+                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
+                        continue
+                # Puedes agregar más contextos aquí (p. ej., seguros de vida)
+            # ---------------------------------------------------------------------
+
+            # ---------- Detección de consulta natural para GPT ----------
             is_numeric_option = text_norm in OPTION_RESPONSES
             is_menu = text_norm in ("hola", "menú", "menu")
             is_natural_query = (not is_numeric_option) and (not is_menu) and any(ch.isalpha() for ch in text_norm) and (len(text_norm.split()) >= 3)
-
             if is_natural_query:
                 ai = gpt_reply(text)
                 if ai:
                     send_message(sender, ai)
                     LAST_INTENT[sender] = {"opt": "gpt", "title": "Consulta abierta", "ts": now}
                     continue
-            # ---------------------------------------------------------------------------
+            # ---------------------------------------------------------------------
 
-            # PRIORIDAD: opción 1–7 o intención por palabras clave
+            # Opción 1–7 (o inferida por keywords si no hay contexto)
             option = text_norm if is_numeric_option else infer_option_from_text(text_norm)
             if option:
                 send_message(sender, OPTION_RESPONSES[option])
                 LAST_INTENT[sender] = {"opt": option, "title": OPTION_TITLES.get(option), "ts": now}
-
+                # Si entra a 6 → activar contexto de financiamiento
+                if option == "6":
+                    USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
+                # Si solicita contacto (7) → notificación privada
                 if option == "7":
                     motive = LAST_INTENT.get(sender, {}).get("title") or "No especificado"
                     notify_text = (
@@ -241,8 +261,6 @@ def receive_message():
                         if ADVISOR_NUMBER and ADVISOR_NUMBER != sender:
                             send_message(ADVISOR_NUMBER, notify_text)
                             logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_NUMBER}")
-                        else:
-                            logging.warning("ADVISOR_NUMBER no configurado o coincide con el cliente; no se envía notificación.")
                     except Exception as e:
                         logging.error(f"❌ Error notificando al asesor: {e}")
                 continue
@@ -264,9 +282,9 @@ def receive_message():
                 send_message(sender, MENU_TEXT)
                 continue
 
-            # Fallback final (sin GPT o GPT falló)
+            # Fallback final
             logging.info("📌 Mensaje recibido (ya saludado). Respuesta guía.")
-            send_message(sender, "No te entendí. Escribe un número del 1 al 7 o 'menu' para ver opciones.")
+            send_message(sender, "No te entendí. Escribe 'menu' para ver opciones o elige un número del 1 al 7.")
 
     return jsonify({"status": "ok"}), 200
 
