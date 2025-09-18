@@ -17,6 +17,8 @@ app = Flask(__name__)
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+# ➕ NUEVO: número del asesor para notificaciones (default a tu línea)
+ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
 
 # 🧠 CAMBIO MÍNIMO: sets en memoria para controlar duplicados y saludo único
 PROCESSED_MESSAGE_IDS = set()
@@ -94,14 +96,14 @@ def receive_message():
     KEYWORD_INTENTS = [
         (("pension", "pensión", "imss", "modalidad 40", "modalidad 10", "ley 73"), "1"),
         (("auto", "seguro de auto", "placa", "tarjeta de circulación", "coche", "carro"), "2"),
-        (("vida", "seguro de vida", "salud", "gastos médicos", "asegurar vida"), "3"),
+        (("vida", "seguro de vida", "salud", "gastos médicos", "asegurar vida", "planes de seguro"), "3"),
         (("vrim", "tarjeta médica", "membresía médica"), "4"),
         (("préstamo", "prestamo", "pensionado", "crédito", "credito"), "5"),
         (("financiamiento", "factoraje", "nómina", "nomina", "empresarial"), "6"),
-        (("contacto", "contactar", "asesor", "christian"), "7"),
+        (("contacto", "contactar", "asesor", "christian", "llámame", "quiero hablar"), "7"),
     ]
 
-    def infer_option_from_text(t: str) -> str | None:
+    def infer_option_from_text(t: str):
         for keywords, opt in KEYWORD_INTENTS:
             if any(k in t for k in keywords):
                 return opt
@@ -127,7 +129,14 @@ def receive_message():
             sender = message.get("from")
             business_phone = val.get("metadata", {}).get("display_phone_number")
 
-            logging.info(f"🧾 id={msg_id} type={msg_type} from={sender} business_phone={business_phone}")
+            # Extraer nombre del perfil si viene en el payload
+            profile_name = None
+            try:
+                profile_name = (val.get("contacts", [{}])[0].get("profile", {}) or {}).get("name")
+            except Exception:
+                profile_name = None
+
+            logging.info(f"🧾 id={msg_id} type={msg_type} from={sender} business_phone={business_phone} profile={profile_name}")
 
             # 1) Desduplicar por id con TTL
             if msg_id:
@@ -152,14 +161,24 @@ def receive_message():
             logging.info(f"✉️ Texto normalizado: {text_norm}")
 
             # ✅ PRIORIDAD 1: opción 1–7 o intención por palabras clave
-            option = None
-            if text_norm in OPTION_RESPONSES:
-                option = text_norm
-            else:
-                option = infer_option_from_text(text_norm)
-
+            option = text_norm if text_norm in OPTION_RESPONSES else infer_option_from_text(text_norm)
             if option:
+                # Responder al usuario
                 send_message(sender, OPTION_RESPONSES[option])
+
+                # ➕ NUEVO: si es contacto (7), notificar al asesor
+                if option == "7":
+                    notify_text = (
+                        "🔔 *Vicky Bot – Solicitud de contacto*\n"
+                        f"- Nombre: {profile_name or 'No disponible'}\n"
+                        f"- WhatsApp: {sender}\n"
+                        f"- Mensaje original: \"{text.strip()}\""
+                    )
+                    try:
+                        send_message(ADVISOR_NUMBER, notify_text)
+                        logging.info(f"📨 Notificación enviada al asesor {ADVISOR_NUMBER}")
+                    except Exception as e:
+                        logging.error(f"❌ Error notificando al asesor: {e}")
                 continue
 
             # PRIORIDAD 2: saludos/menú
