@@ -32,25 +32,32 @@ def gpt_reply(user_text: str) -> str | None:
     Devuelve respuesta breve usando GPT si OPENAI_API_KEY existe.
     1) Intenta /v1/responses (model gpt-4o-mini)
     2) Si falla, intenta /v1/chat/completions
-    Timeout corto (6s) para no romper WhatsApp.
+    Timeout a 9s para reducir timeouts.
+    Si hay 429 (cuota), devuelve mensaje amable.
     """
     if not OPENAI_API_KEY:
         return None
 
     system_prompt = (
         "Eres Vicky, asistente de Christian López (asesor financiero de Inbursa). "
-        "Responde en español, breve, clara y orientada a siguiente paso. "
+        "Responde en español, breve, clara y orientada al siguiente paso. "
         "Si faltan datos para cotizar, pide solo lo necesario. "
-        "Evita dar cifras inventadas o promesas. "
-        "Si preguntan por opciones, sugiere escribir 'menu'."
+        "Evita cifras inventadas. Si preguntan por opciones, sugiere escribir 'menu'."
     )
 
+    # Header base + (opcional) proyecto si está definido en env
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json"
     }
+    try:
+        project_id = os.getenv("OPENAI_PROJECT_ID")
+        if project_id:
+            headers["OpenAI-Project"] = project_id
+    except Exception:
+        pass
 
-    # 1) /v1/responses
+    # 1) /v1/responses (recomendado)
     try:
         resp = requests.post(
             "https://api.openai.com/v1/responses",
@@ -64,24 +71,30 @@ def gpt_reply(user_text: str) -> str | None:
                 "max_output_tokens": 220,
                 "temperature": 0.3,
             },
-            timeout=6,
+            timeout=9,
         )
         if resp.status_code == 200:
             data = resp.json()
-            out = (data.get("output", [{}])[0].get("content", [{}])[0].get("text") 
+            out = (data.get("output", [{}])[0].get("content", [{}])[0].get("text")
                    if "output" in data else None)
             if out:
                 return out.strip()
-            # Algunas respuestas devuelven en 'choices' por compat
+            # Compatibilidad por si viniera en 'choices'
             ch = data.get("choices", [{}])[0].get("message", {}).get("content")
             if ch:
                 return ch.strip()
+        elif resp.status_code == 429:
+            logging.warning(f"[GPT responses] 429: {resp.text[:200]}")
+            return ("Estoy recibiendo muchas consultas ahora mismo. "
+                    "Puedo avanzar con una orientación breve: si deseas **seguro de vida y salud**, "
+                    "te preparo una cotización personalizada; compárteme *edad*, *ciudad* y si buscas "
+                    "*temporal* o *vitalicio*. Escribe 'menu' para ver más opciones.")
         else:
             logging.warning(f"[GPT responses] {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         logging.error(f"[GPT responses] error: {e}")
 
-    # 2) /v1/chat/completions (compat)
+    # 2) /v1/chat/completions (compatibilidad)
     try:
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -95,12 +108,17 @@ def gpt_reply(user_text: str) -> str | None:
                 "max_tokens": 220,
                 "temperature": 0.3,
             },
-            timeout=6,
+            timeout=9,
         )
         if resp.status_code == 200:
             data = resp.json()
             msg = data.get("choices", [{}])[0].get("message", {}).get("content")
             return msg.strip() if msg else None
+        elif resp.status_code == 429:
+            logging.warning(f"[GPT chat] 429: {resp.text[:200]}")
+            return ("En este momento el servicio de IA alcanzó su límite de uso. "
+                    "Mientras tanto: para **seguro de vida**, dime *edad*, *ciudad* y si te interesa "
+                    "*temporal* o *vitalicio*, y te guío. Escribe 'menu' para ver opciones.")
         else:
             logging.warning(f"[GPT chat] {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
@@ -186,7 +204,6 @@ def receive_message():
         "7": "Contacto con Christian"
     }
 
-    # Quitamos 'crédito' del intent de opción 5 para evitar choques con 6
     KEYWORD_INTENTS = [
         (("pension", "pensión", "imss", "modalidad 40", "modalidad 10", "ley 73"), "1"),
         (("auto", "seguro de auto", "placa", "tarjeta de circulación", "coche", "carro"), "2"),
@@ -251,7 +268,7 @@ def receive_message():
             # -------- Contexto por usuario (financiamiento) --------
             from time import time as _t
             user_ctx = USER_CONTEXT.get(sender)
-            if user_ctx and (now - user_ctx.get("ts", now) < CTX_TTL):
+            if user_ctx and (now - user_ctx.get("ts", now) < 4 * 3600):
                 ctx = user_ctx.get("ctx")
                 if ctx == "financiamiento":
                     if any(k in text_norm for k in ("crédito", "credito")):
