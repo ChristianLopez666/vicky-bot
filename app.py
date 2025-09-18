@@ -73,7 +73,7 @@ def receive_message():
         "2) Seguros de auto (Amplia PLUS, Amplia, Limitada)\n"
         "3) Seguros de vida y salud\n"
         "4) Tarjetas médicas VRIM\n"
-        "5) Préstamos a pensionados IMSS ($10,000 a $650,000)\n"
+        "5) Préstamos a pensionados IMSS ($40,000 a $650,000)\n"
         "6) Financiamiento empresarial y nómina empresarial\n"
         "7) Contactar con Christian\n"
         "\nEscribe el número de la opción o 'menu' para volver a ver el menú."
@@ -85,7 +85,7 @@ def receive_message():
         "2": "🚗 Seguro de auto. Envíame *foto de tu INE* y *tarjeta de circulación* o tu *número de placa* para cotizar.",
         "3": "🛡️ Seguros de vida y salud. Te preparo una cotización personalizada.",
         "4": "🩺 Tarjetas médicas VRIM. Te comparto información y precios.",
-        "5": "💳 Préstamos a pensionados IMSS. Dime tu pensión aproximada y el monto deseado.",
+        "5": "💳 Préstamos a pensionados IMSS. Dime tu pensión aproximada y el monto deseado (desde $40,000).",
         "6": "🏢 Financiamiento empresarial y nómina. ¿Qué necesitas: crédito, factoraje o nómina?",
         "7": "📞 ¡Listo! Notifiqué a Christian para que te contacte y te dé seguimiento."
     }
@@ -134,10 +134,16 @@ def receive_message():
             text_norm = text.strip().lower()
             logging.info(f"✉️ Texto normalizado: {text_norm}")
 
-            # 4) Saludo una vez por 24h; luego mostrar menú según se pida
+            # ✅ PRIORIDAD 1: si es opción 1–7, responder y salir (evita que se re-muestre el menú)
+            if text_norm in OPTION_RESPONSES:
+                send_message(sender, OPTION_RESPONSES[text_norm])
+                # Si deseas re-mostrar el menú tras responder, puedes añadir otra llamada aquí.
+                continue
+
+            # PRIORIDAD 2: saludos/menú
             first_greet_ts = GREETED_USERS.get(sender)
             if not first_greet_ts or (now - first_greet_ts) >= GREET_TTL:
-                # En la primera interacción, mandamos saludo + menú completo
+                # Primera interacción o expiró ventana
                 if text_norm in ("hola", "menú", "menu"):
                     send_message(
                         sender,
@@ -148,19 +154,12 @@ def receive_message():
                 GREETED_USERS[sender] = now
                 continue
 
-            # 5) Usuario ya saludado: 'hola' o 'menu' vuelve a mostrar el menú completo
+            # Usuario ya saludado → mostrar menú cuando lo pida
             if text_norm in ("hola", "menú", "menu"):
                 send_message(sender, MENU_TEXT)
                 continue
 
-            # 6) Opción numérica 1–7
-            if text_norm in OPTION_RESPONSES:
-                send_message(sender, OPTION_RESPONSES[text_norm])
-                # Si quieres mostrar nuevamente el menú, descomenta la línea siguiente:
-                # send_message(sender, MENU_TEXT)
-                continue
-
-            # 7) No coincide con nada → mensaje guía breve
+            # Nada coincide → guía breve
             logging.info("📌 Mensaje recibido (ya saludado). Respuesta guía.")
             send_message(sender, "No te entendí. Escribe un número del 1 al 7 o 'menu' para ver opciones.")
 
