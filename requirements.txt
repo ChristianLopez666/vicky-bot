@@ -9,3 +9,4 @@ google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
 httpx==0.28.1
 pydantic==2.11.9
+redis==4.6.0
