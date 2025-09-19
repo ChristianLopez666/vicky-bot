@@ -127,90 +127,6 @@ def gpt_reply(user_text: str) -> str | None:
     return None
 # ----------------------------------------------------
 
-# === 🆕 BLOQUE 1: utilidades de medios (reenviar fotos/documentos y transcribir audios) ===
-def _get_media_url(media_id: str) -> str | None:
-    try:
-        resp = requests.get(
-            f"https://graph.facebook.com/v21.0/{media_id}",
-            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            return resp.json().get("url")
-        logging.warning(f"[WA media url] {resp.status_code}: {resp.text[:180]}")
-    except Exception as e:
-        logging.error(f"[WA media url] error: {e}")
-    return None
-
-def _download_media_bytes(url: str) -> bytes | None:
-    try:
-        r = requests.get(url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=12)
-        if r.status_code == 200:
-            return r.content
-        logging.warning(f"[WA media dl] {r.status_code}: {r.text[:180]}")
-    except Exception as e:
-        logging.error(f"[WA media dl] error: {e}")
-    return None
-
-def send_media_image(to: str, media_id: str, caption: str = ""):
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "image",
-        "image": {"id": media_id, **({"caption": caption} if caption else {})}
-    }
-    resp = requests.post(url, headers=headers, json=payload)
-    logging.info(f"[WA send image] {resp.status_code} - {resp.text[:180]}")
-
-def send_media_document(to: str, media_id: str, caption: str = ""):
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "document",
-        "document": {"id": media_id, **({"caption": caption} if caption else {})}
-    }
-    resp = requests.post(url, headers=headers, json=payload)
-    logging.info(f"[WA send doc] {resp.status_code} - {resp.text[:180]}")
-
-def transcribe_audio_media(media_id: str) -> str | None:
-    """
-    Descarga el audio de WhatsApp y lo transcribe con Whisper si hay OPENAI_API_KEY.
-    """
-    if not OPENAI_API_KEY:
-        return None
-    url = _get_media_url(media_id)
-    if not url:
-        return None
-    blob = _download_media_bytes(url)
-    if not blob:
-        return None
-
-    files = {
-        "file": ("audio.ogg", blob, "audio/ogg"),
-    }
-    data = {"model": "whisper-1", "response_format": "text", "language": "es"}
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    try:
-        r = requests.post("https://api.openai.com/v1/audio/transcriptions",
-                          headers=headers, data=data, files=files, timeout=30)
-        if r.status_code == 200:
-            return r.text.strip()
-        logging.warning(f"[Whisper] {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        logging.error(f"[Whisper] error: {e}")
-    return None
-# === FIN BLOQUE 1 ===
-
 # Endpoint de verificación
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -341,49 +257,6 @@ def receive_message():
                 logging.info("🪞 Echo desde business_phone ignorado")
                 continue
 
-            # === 🆕 BLOQUE 2: manejo de medios antes de filtrar por 'text' ===
-            if msg_type == "image":
-                media_id = (message.get("image") or {}).get("id")
-                caption = (message.get("image") or {}).get("caption", "") or ""
-                try:
-                    if ADVISOR_NUMBER and ADVISOR_NUMBER != sender and media_id:
-                        send_media_image(
-                            ADVISOR_NUMBER,
-                            media_id,
-                            caption=f"📎 Imagen recibida de {profile_name or sender}. {('Nota: ' + caption) if caption else ''}"
-                        )
-                except Exception as e:
-                    logging.error(f"❌ Error reenviando imagen: {e}")
-
-                send_message(sender, "✅ ¡Gracias! Recibí la imagen. Si es para **seguro de auto**, con INE y tarjeta de circulación (o placa) ya puedo cotizar. ¿Deseas que avance?")
-                continue
-
-            if msg_type == "document":
-                media_id = (message.get("document") or {}).get("id")
-                filename = (message.get("document") or {}).get("filename", "")
-                try:
-                    if ADVISOR_NUMBER and ADVISOR_NUMBER != sender and media_id:
-                        send_media_document(
-                            ADVISOR_NUMBER,
-                            media_id,
-                            caption=f"📄 Documento recibido de {profile_name or sender} {f'({filename})' if filename else ''}"
-                        )
-                except Exception as e:
-                    logging.error(f"❌ Error reenviando documento: {e}")
-
-                send_message(sender, "✅ ¡Gracias! Recibí tu documento. En breve lo reviso.")
-                continue
-
-            if msg_type == "audio" or (msg_type == "voice"):
-                media_id = (message.get("audio") or {}).get("id")
-                transcript = transcribe_audio_media(media_id) if media_id else None
-                if transcript:
-                    send_message(sender, f"🗣️ Transcripción: {transcript}")
-                else:
-                    send_message(sender, "No pude transcribir tu nota de voz. ¿Podrías intentar de nuevo o escribir el mensaje?")
-                continue
-            # === FIN BLOQUE 2 ===
-
             if msg_type != "text":
                 logging.info(f"ℹ️ Mensaje no-texto ignorado: {msg_type}")
                 continue
@@ -500,3 +373,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
