@@ -418,7 +418,7 @@ def receive_message():
             # ---------- GPT primero para consultas naturales ----------
             is_numeric_option = text_norm in OPTION_RESPONSES
             is_menu = text_norm in ("hola", "menú", "menu")
-            is_natural_query = (not is_numeric_option) and (not is_menu) and any(ch.isalpha() for ch in text_norm) and (len(text_norm.split()) >= 3)
+            is_natural_query = (not is_numeric_option) and (not is_menu)
 
             if is_natural_query:
                 ai = gpt_reply(text)
