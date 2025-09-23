@@ -170,7 +170,7 @@ def send_media_image(to: str, media_id: str, caption: str = ""):
 def send_media_document(to: str, media_id: str, caption: str = ""):
     url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
     headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}"},
         "Content-Type": "application/json"
     }
     payload = {
@@ -238,9 +238,10 @@ def receive_message():
     now = time()
 
     global PROCESSED_MESSAGE_IDS, GREETED_USERS, LAST_INTENT, USER_CONTEXT
-    if isinstance(PROCESSED_MESSAGE_IDS, set):
+    # 🔧 ÚNICO CAMBIO: asegurar diccionarios (coherentes con el resto del archivo)
+    if not isinstance(PROCESSED_MESSAGE_IDS, dict):
         PROCESSED_MESSAGE_IDS = {}
-    if isinstance(GREETED_USERS, set):
+    if not isinstance(GREETED_USERS, dict):
         GREETED_USERS = {}
 
     MSG_TTL = 600
@@ -499,4 +500,4 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host("0.0.0.0", port=port))
