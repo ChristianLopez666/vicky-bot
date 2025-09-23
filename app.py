@@ -21,8 +21,8 @@ ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación p
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ GPT (opcional)
 
 # 🧠 Controles en memoria
-PROCESSED_MESSAGE_IDS = set()
-GREETED_USERS = set()
+PROCESSED_MESSAGE_IDS = {}
+GREETED_USERS = {}
 LAST_INTENT = {}   # último intent (para motivo de contacto)
 USER_CONTEXT = {}  # estado por usuario {wa_id: {"ctx": str, "ts": float}}
 
@@ -170,7 +170,7 @@ def send_media_image(to: str, media_id: str, caption: str = ""):
 def send_media_document(to: str, media_id: str, caption: str = ""):
     url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
     headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
     }
     payload = {
@@ -238,7 +238,6 @@ def receive_message():
     now = time()
 
     global PROCESSED_MESSAGE_IDS, GREETED_USERS, LAST_INTENT, USER_CONTEXT
-    # 🔧 ÚNICO CAMBIO: asegurar diccionarios (coherentes con el resto del archivo)
     if not isinstance(PROCESSED_MESSAGE_IDS, dict):
         PROCESSED_MESSAGE_IDS = {}
     if not isinstance(GREETED_USERS, dict):
@@ -500,4 +499,4 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    app.run(host("0.0.0.0", port=port))
+    app.run(host="0.0.0.0", port=port)
