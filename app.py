@@ -500,3 +500,276 @@ def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+# >>> VX: CONFIG & UTILS (NO TOCAR)
+try:
+    vx_get_env
+except NameError:
+    def vx_get_env(name, default=None):
+        import os
+        return os.getenv(name, default)
+
+try:
+    vx_normalize_phone
+except NameError:
+    def vx_normalize_phone(raw):
+        import re
+        if not raw:
+            return ""
+        phone = re.sub(r"[^\d]", "", str(raw))
+        phone = re.sub(r"^(52|521)", "", phone)
+        return phone[-10:] if len(phone) >= 10 else phone
+
+try:
+    vx_last10
+except NameError:
+    def vx_last10(phone):
+        return vx_normalize_phone(phone)
+
+try:
+    vx_Settings
+except NameError:
+    class vx_Settings:
+        def __init__(self):
+            self.META_TOKEN = vx_get_env("META_TOKEN")
+            self.WABA_PHONE_ID = vx_get_env("WABA_PHONE_ID")
+            self.VERIFY_TOKEN = vx_get_env("VERIFY_TOKEN")
+            self.OPENAI_API_KEY = vx_get_env("OPENAI_API_KEY")
+            self.REDIS_URL = vx_get_env("REDIS_URL")
+            self.GOOGLE_CREDENTIALS_JSON = vx_get_env("GOOGLE_CREDENTIALS_JSON")
+            self.SHEETS_ID_LEADS = vx_get_env("SHEETS_ID_LEADS")
+            self.SHEETS_TITLE_LEADS = vx_get_env("SHEETS_TITLE_LEADS")
+            self.ADVISOR_WHATSAPP = vx_get_env("ADVISOR_WHATSAPP")
+
+# >>> VX: LOGGING (NO TOCAR)
+try:
+    vx_setup_logging
+except NameError:
+    def vx_setup_logging():
+        import logging
+        logger = logging.getLogger()
+        if not logger.hasHandlers():
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        return logging.getLogger("vx")
+
+# >>> VX: REDIS (NO TOCAR, OPCIONAL)
+try:
+    vx_get_redis
+except NameError:
+    def vx_get_redis():
+        try:
+            url = vx_get_env("REDIS_URL")
+            if not url:
+                return None
+            import redis
+            return redis.from_url(url)
+        except Exception:
+            return None
+
+# >>> VX: WHATSAPP CLIENT (NO TOCAR)
+try:
+    vx_wa_send_text
+except NameError:
+    def vx_wa_send_text(to_e164: str, body: str):
+        import requests, logging
+        token = vx_get_env("META_TOKEN")
+        phone_id = vx_get_env("WABA_PHONE_ID")
+        if not token or not phone_id or not to_e164:
+            logging.getLogger("vx").warning("vx_wa_send_text: falta config")
+            return False
+        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_e164,
+            "type": "text",
+            "text": {"body": body}
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=9)
+            logging.getLogger("vx").info(f"vx_wa_send_text: {resp.status_code} {resp.text[:160]}")
+            return resp.status_code == 200
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_wa_send_text error: {e}")
+            return False
+
+try:
+    vx_wa_mark_read
+except NameError:
+    def vx_wa_mark_read(message_id: str):
+        import requests, logging
+        token = vx_get_env("META_TOKEN")
+        phone_id = vx_get_env("WABA_PHONE_ID")
+        if not token or not phone_id or not message_id:
+            logging.getLogger("vx").warning("vx_wa_mark_read: falta config")
+            return False
+        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "messaging_product": "whatsapp",
+            "status": "read",
+            "message_id": message_id
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=9)
+            logging.getLogger("vx").info(f"vx_wa_mark_read: {resp.status_code} {resp.text[:120]}")
+            return resp.status_code == 200
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_wa_mark_read error: {e}")
+            return False
+
+# >>> VX: GPT (NO TOCAR)
+try:
+    vx_gpt_reply
+except NameError:
+    def vx_gpt_reply(user_text: str, system_text: str = None) -> str:
+        import logging
+        api_key = vx_get_env("OPENAI_API_KEY")
+        if not api_key:
+            return "No tengo IA disponible en este momento. Por favor elige una opción del menú."
+        try:
+            import openai
+            client = openai.OpenAI(api_key=api_key)
+            system = system_text or (
+                "Eres Vicky, asistente de Christian López. Responde en español, breve, clara y orientada al siguiente paso."
+            )
+            completion = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_text},
+                ],
+                max_tokens=120,
+                temperature=0.2,
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_gpt_reply error: {e}")
+            return "No tengo IA disponible en este momento. Por favor elige una opción del menú."
+
+# >>> VX: SHEETS (NO TOCAR)
+try:
+    vx_sheet_find_by_phone
+except NameError:
+    def vx_sheet_find_by_phone(last10: str):
+        import logging
+        import json
+        try:
+            creds_json = vx_get_env("GOOGLE_CREDENTIALS_JSON")
+            sheets_id = vx_get_env("SHEETS_ID_LEADS")
+            sheets_title = vx_get_env("SHEETS_TITLE_LEADS")
+            if not creds_json or not sheets_id or not sheets_title or not last10:
+                return None
+            import gspread
+            from gspread import service_account_from_dict
+            creds_dict = json.loads(creds_json)
+            client = service_account_from_dict(creds_dict)
+            sheet = client.open_by_key(sheets_id)
+            ws = sheet.worksheet(sheets_title)
+            rows = ws.get_all_records()
+            for row in rows:
+                wa = str(row.get("WhatsApp", ""))
+                if vx_last10(wa) == last10:
+                    return row
+            return None
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_sheet_find_by_phone error: {e}")
+            return None
+
+# >>> VX: MENU BUILDER (NO TOCAR)
+try:
+    vx_menu_text
+except NameError:
+    def vx_menu_text(customer_name: str = None) -> str:
+        base = (
+            "Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n"
+            "1) Asesoría en pensiones IMSS\n"
+            "2) Seguro de auto (Amplia PLUS, Amplia, Limitada) — solicita INE y tarjeta de circulación o número de placa\n"
+            "3) Seguros de vida y salud\n"
+            "4) Tarjetas médicas VRIM\n"
+            "5) Préstamos a pensionados IMSS ($10,000 a $650,000)\n"
+            "6) Financiamiento empresarial (incluye financiamiento para tus clientes)\n"
+            "7) Nómina empresarial\n"
+            "8) Contactar con Christian (te notifico para que te atienda)\n\n"
+            "¿En qué te ayudo?"
+        )
+        if customer_name:
+            return f"Hola {customer_name}, " + base[5:]
+        return base
+
+# >>> VX: ROUTES /ext (NO TOCAR)
+try:
+    vx_ext_routes_registered
+except NameError:
+    vx_ext_routes_registered = True
+    from flask import request, jsonify
+
+    @app.get("/ext/health")
+    def vx_ext_health():
+        return jsonify({"status": "ok"})
+
+    @app.get("/ext/webhook")
+    def vx_ext_webhook_get():
+        import logging
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        verify_token = vx_get_env("VERIFY_TOKEN")
+        if mode == "subscribe" and token == verify_token:
+            logging.getLogger("vx").info("vx_ext_webhook: verificado OK")
+            return challenge or "OK", 200
+        else:
+            logging.getLogger("vx").warning("vx_ext_webhook: verificación fallida")
+            return "Verification failed", 403
+
+    @app.post("/ext/webhook")
+    def vx_ext_webhook_post():
+        import logging, json
+        try:
+            payload = request.get_json(force=True, silent=True)
+            if not payload:
+                return jsonify({"status": "ignored"}), 200
+            entry = payload.get("entry", [{}])[0]
+            changes = entry.get("changes", [{}])
+            if not changes or "value" not in changes[0]:
+                return jsonify({"status": "ignored"}), 200
+            value = changes[0]["value"]
+            msgs = value.get("messages", [])
+            if not msgs:
+                return jsonify({"status": "ignored"}), 200
+            msg = msgs[0]
+            from_number = msg.get("from")
+            message_id = msg.get("id")
+            body = ""
+            if msg.get("type") == "text":
+                body = msg.get("text", {}).get("body", "") or ""
+            else:
+                body = ""
+            last10 = vx_last10(from_number)
+            customer = None
+            sheet_row = None
+            if last10:
+                sheet_row = vx_sheet_find_by_phone(last10)
+                if sheet_row and "Nombre" in sheet_row:
+                    customer = str(sheet_row["Nombre"])
+            menu_text = vx_menu_text(customer)
+            vx_wa_send_text(from_number, menu_text)
+            if message_id:
+                vx_wa_mark_read(message_id)
+            return jsonify({"status": "ok"}), 200
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_ext_webhook_post error: {e}")
+            return jsonify({"status": "ok"}), 200
+
+    @app.post("/ext/test-send")
+    def vx_ext_test_send():
+        import logging
+        try:
+            data = request.get_json(force=True, silent=True)
+            to = data.get("to")
+            text = data.get("text")
+            ok = vx_wa_send_text(to, text)
+            return jsonify({"ok": ok}), 200
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 200
