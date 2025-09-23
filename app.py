@@ -21,8 +21,8 @@ ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación p
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ GPT (opcional)
 
 # 🧠 Controles en memoria
-PROCESSED_MESSAGE_IDS = {}
-GREETED_USERS = {}
+PROCESSED_MESSAGE_IDS = set()
+GREETED_USERS = set()
 LAST_INTENT = {}   # último intent (para motivo de contacto)
 USER_CONTEXT = {}  # estado por usuario {wa_id: {"ctx": str, "ts": float}}
 
@@ -238,9 +238,9 @@ def receive_message():
     now = time()
 
     global PROCESSED_MESSAGE_IDS, GREETED_USERS, LAST_INTENT, USER_CONTEXT
-    if not isinstance(PROCESSED_MESSAGE_IDS, dict):
+    if isinstance(PROCESSED_MESSAGE_IDS, set):
         PROCESSED_MESSAGE_IDS = {}
-    if not isinstance(GREETED_USERS, dict):
+    if isinstance(GREETED_USERS, set):
         GREETED_USERS = {}
 
     MSG_TTL = 600
@@ -418,7 +418,7 @@ def receive_message():
             # ---------- GPT primero para consultas naturales ----------
             is_numeric_option = text_norm in OPTION_RESPONSES
             is_menu = text_norm in ("hola", "menú", "menu")
-            is_natural_query = (not is_numeric_option) and (not is_menu)
+            is_natural_query = (not is_numeric_option) and (not is_menu) and any(ch.isalpha() for ch in text_norm) and (len(text_norm.split()) >= 3)
 
             if is_natural_query:
                 ai = gpt_reply(text)
