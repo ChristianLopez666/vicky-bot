@@ -391,79 +391,6 @@ def receive_message():
             text = message.get("text", {}).get("body", "") or ""
             text_norm = text.strip().lower()
             logging.info(f"✉️ Texto normalizado: {text_norm}")
-            # >>> VX-SECOM (interceptor + follow-up)
-            # 1) Intercepta "PRUEBA SECOM": busca por últimos 10 dígitos en la hoja y envía beneficio.
-            if text_norm.strip() == "prueba secom":
-                try:
-                    import re, json, os, gspread
-                    from gspread import service_account_from_dict
-
-                    def _last10(num: str) -> str:
-                        d = re.sub(r"\D", "", str(num or ""))
-                        return d[-10:] if len(d) >= 10 else d
-
-                    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
-                    sheets_id  = os.getenv("SHEETS_ID_LEADS", "").strip()
-                    sheet_tab  = os.getenv("SHEETS_TITLE_LEADS", "").strip()  # ej. Hoja1
-
-                    name_txt = None
-                    if creds_json and sheets_id and sheet_tab:
-                        client = service_account_from_dict(json.loads(creds_json))
-                        sh = client.open_by_key(sheets_id)
-                        ws = sh.worksheet(sheet_tab)
-                        rows = ws.get_all_records() or []
-
-                        # detectar columnas de forma flexible
-                        k_phone = k_name = None
-                        if rows:
-                            keys = list(rows[0].keys())
-                            for k in keys:
-                                lk = k.lower()
-                                if (not k_phone) and any(x in lk for x in ["whats", "tel", "téle", "telefono", "teléfono", "cel", "phone"]):
-                                    k_phone = k
-                                if (not k_name) and any(x in lk for x in ["nombre", "name"]):
-                                    k_name = k
-
-                            me10 = _last10(sender)
-                            for r in rows:
-                                if _last10(r.get(k_phone, "")) == me10:
-                                    name_txt = (str(r.get(k_name, "")).strip() if k_name else "").strip() or None
-                                    break
-
-                    benefit_msg = (
-                        "Beneficio SECOM para *Seguro de Auto*:\n"
-                        "• Hasta *60% de descuento* en tu póliza.\n"
-                        "• *Transferible* a familiares que vivan en tu mismo domicilio.\n\n"
-                        "¿Te cotizo ahora con tu *placa* o *tarjeta de circulación*?"
-                    )
-                    if name_txt:
-                        benefit_msg = f"¡Hola {name_txt}! ✔️\n" + benefit_msg
-
-                    send_message(sender, benefit_msg)
-
-                    # marca intención para follow-up por 1 hora
-                    LAST_INTENT[sender] = {"opt": "secom", "title": "SECOM Auto", "ts": now}
-                except Exception as _vx_e:
-                    logging.error(f"[VX-SECOM] error: {_vx_e}")
-                    send_message(
-                        sender,
-                        "Beneficio SECOM: hasta *60% de descuento* y *transferible* a familiares del mismo domicilio.\n"
-                        "¿Te cotizo ahora con tu placa o tarjeta de circulación?"
-                    )
-                # cortar aquí para no caer al menú
-                continue
-
-            # 2) Follow-up: si la última intención fue SECOM hace ≤ 1h, captura “si/sí/ok/va/sale”.
-            if text_norm.strip() in ("si", "sí", "ok", "va", "sale"):
-                li = LAST_INTENT.get(sender)
-                if li and li.get("opt") == "secom" and (now - li.get("ts", now)) <= 3600:
-                    send_message(
-                        sender,
-                        "Perfecto ✅\nEnvíame tu *número de placa* o una *foto clara* de tu *tarjeta de circulación* para cotizarte ahora."
-                    )
-                    # no caigas al menú
-                    continue
-            # <<< VX-SECOM
 
             # -------- Contexto por usuario (financiamiento) --------
             from time import time as _t
@@ -846,4 +773,3 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 200
-
