@@ -746,6 +746,39 @@ except NameError:
             else:
                 body = ""
             last10 = vx_last10(from_number)
+                        # >>> VX-SECOM: interceptar "PRUEBA SECOM" y responder beneficio
+            if (body or "").strip().upper() == "PRUEBA SECOM":
+                benefit_msg = (
+                    "Beneficio SECOM para *Seguro de Auto*:\n"
+                    "• Hasta *60% de descuento* en tu póliza.\n"
+                    "• *Transferible* a familiares que vivan en tu mismo domicilio.\n\n"
+                    "¿Te cotizo ahora con tu *placa* o *tarjeta de circulación*?"
+                )
+                try:
+                    name_txt = None
+                    if last10:
+                        row = vx_sheet_find_by_phone(last10)
+                        if row:
+                            # intenta 'Nombre' primero; si no existe, usa el primer campo no vacío
+                            if "Nombre" in row and str(row["Nombre"]).strip():
+                                name_txt = str(row["Nombre"]).strip()
+                            else:
+                                # fallback: primer valor tipo texto no vacío
+                                for v in row.values():
+                                    if isinstance(v, str) and v.strip():
+                                        name_txt = v.strip()
+                                        break
+                    if name_txt:
+                        benefit_msg = f"¡Hola {name_txt}! ✔️\n" + benefit_msg
+                    vx_wa_send_text(from_number, benefit_msg)
+                    if message_id:
+                        vx_wa_mark_read(message_id)
+                except Exception as _vx_e:
+                    # si algo falla, responde menú como siempre
+                    logging.getLogger("vx").error(f"vx_secom_intercept error: {_vx_e}")
+                return jsonify({"status": "ok", "handled": "vx-secom"}), 200
+            # <<< VX-SECOM
+
             customer = None
             sheet_row = None
             if last10:
@@ -773,3 +806,4 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 200
+
