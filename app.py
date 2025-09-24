@@ -777,6 +777,17 @@ except NameError:
 
                 except Exception as _vx_e:
                     logging.getLogger("vx").error(f"vx_secom_intercept error: {_vx_e}")
+            # >>> VX-SECOM-FOLLOWUP: capturar confirmación "SI" y pedir datos de cotización
+            _t = (body or "").strip().upper()
+            if _t in ("SI", "SÍ", "OK", "VA", "SALE"):
+                vx_wa_send_text(
+                    from_number,
+                    "Perfecto ✅\nEnvíame tu *número de placa* o una *foto clara* de tu *tarjeta de circulación* para cotizarte ahora."
+                )
+                if message_id:
+                    vx_wa_mark_read(message_id)
+                return jsonify({"status": "ok", "handled": "vx-secom-followup"}), 200
+            # <<< VX-SECOM-FOLLOWUP                  
 
                 # Importante: terminar aquí para NO mandar el menú
                 return jsonify({"status": "ok", "handled": "vx-secom"}), 200
@@ -808,4 +819,5 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 200
+
 
