@@ -751,6 +751,18 @@ except NameError:
             if (body or "").strip().upper() == "PRUEBA SECOM":
                 benefit_msg = (
                     "Beneficio SECOM para *Seguro de Auto*:\n"
+            # >>> VX-SECOM-FOLLOWUP: capturar confirmación "SI" y pedir datos de cotización
+            _t = (body or "").strip().upper()
+            if _t in ("SI", "SÍ", "OK", "VA", "SALE"):
+                vx_wa_send_text(
+                    from_number,
+                    "Perfecto ✅\nEnvíame tu *número de placa* o una *foto clara* de tu *tarjeta de circulación* para cotizarte ahora."
+                )
+                if message_id:
+                    vx_wa_mark_read(message_id)
+                return jsonify({"status": "ok", "handled": "vx-secom-followup"}), 200
+            # <<< VX-SECOM-FOLLOWUP
+                    
                     "• Hasta *60% de descuento* en tu póliza.\n"
                     "• *Transferible* a familiares que vivan en tu mismo domicilio.\n\n"
                     "¿Te cotizo ahora con tu *placa* o *tarjeta de circulación*?"
@@ -819,5 +831,6 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 200
+
 
 
