@@ -288,6 +288,60 @@ def receive_message():
         "7": "Contacto con Christian"
     }
 
+# >>> SECOM en /webhook (interceptor + follow-up)
+t = (text or "").strip()
+U = t.upper()
+
+# 1) Interceptor "PRUEBA SECOM": saluda por nombre (si está en la hoja) y muestra beneficio.
+if U == "PRUEBA SECOM":
+    benefit_msg = (
+        "Beneficio SECOM para *Seguro de Auto*:\n"
+        "• Hasta *60% de descuento* en tu póliza.\n"
+        "• *Transferible* a familiares que vivan en tu mismo domicilio.\n\n"
+        "¿Te cotizo ahora con tu *placa* o *tarjeta de circulación*?"
+    )
+    # Buscar nombre por últimos 10 dígitos del WA en la hoja (si está configurada)
+    name_txt = None
+    try:
+        import re
+        def _last10(s: str) -> str:
+            d = re.sub(r"\D", "", str(s or ""))
+            return d[-10:] if len(d) >= 10 else d
+        me10 = _last10(sender)
+        if me10:
+            row = vx_sheet_find_by_phone(me10)
+            if row:
+                nm = str(row.get("Nombre", "")).strip()
+                if nm:
+                    name_txt = nm
+                else:
+                    for v in row.values():
+                        if isinstance(v, str) and v.strip():
+                            name_txt = v.strip()
+                            break
+    except Exception as _e:
+        logging.error(f"[SECOM] lookup nombre error: {_e}")
+
+    if name_txt:
+        benefit_msg = f"¡Hola {name_txt}! ✔️\n" + benefit_msg
+
+    send_message(sender, benefit_msg)
+    # Guardar intención para follow-up por 1 hora
+    LAST_INTENT[sender] = {"opt": "secom", "title": "SECOM Auto", "ts": now}
+    # No caigas a GPT/menú aquí
+    continue
+
+# 2) Follow-up: si responde afirmativo dentro de 1 hora, pedir placa o tarjeta.
+if text_norm in ("si", "sí", "ok", "va", "sale"):
+    li = LAST_INTENT.get(sender)
+    if li and li.get("opt") == "secom" and (now - li.get("ts", now)) <= 3600:
+        send_message(
+            sender,
+            "Perfecto ✅\nEnvíame tu *número de placa* o una *foto clara* de tu *tarjeta de circulación* para cotizarte ahora."
+        )
+        continue
+# <<< SECOM
+        
     KEYWORD_INTENTS = [
         (("pension", "pensión", "imss", "modalidad 40", "modalidad 10", "ley 73"), "1"),
         (("auto", "seguro de auto", "placa", "tarjeta de circulación", "coche", "carro"), "2"),
@@ -858,5 +912,6 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 200
+
 
 
