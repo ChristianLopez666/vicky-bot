@@ -503,7 +503,7 @@ def receive_message():
             if kb and kb.get("text"):
                 base = kb["text"]
                 fuentes = kb.get("sources") or []
-                tail = "\n\n— Fuente: " + " • ".join(fuentes)
+                tail = "\n\n-- Fuente: " + " • ".join(fuentes)
 
 — Fuente: " + " • ".join(fuentes)
                 send_message(sender, (base + tail)[:1900])
