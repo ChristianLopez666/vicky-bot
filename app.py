@@ -288,60 +288,6 @@ def receive_message():
         "7": "Contacto con Christian"
     }
 
-# >>> SECOM en /webhook (interceptor + follow-up)
-t = (text or "").strip()
-U = t.upper()
-
-# 1) Interceptor "PRUEBA SECOM": saluda por nombre (si está en la hoja) y muestra beneficio.
-if U == "PRUEBA SECOM":
-    benefit_msg = (
-        "Beneficio SECOM para *Seguro de Auto*:\n"
-        "• Hasta *60% de descuento* en tu póliza.\n"
-        "• *Transferible* a familiares que vivan en tu mismo domicilio.\n\n"
-        "¿Te cotizo ahora con tu *placa* o *tarjeta de circulación*?"
-    )
-    # Buscar nombre por últimos 10 dígitos del WA en la hoja (si está configurada)
-    name_txt = None
-    try:
-        import re
-        def _last10(s: str) -> str:
-            d = re.sub(r"\D", "", str(s or ""))
-            return d[-10:] if len(d) >= 10 else d
-        me10 = _last10(sender)
-        if me10:
-            row = vx_sheet_find_by_phone(me10)
-            if row:
-                nm = str(row.get("Nombre", "")).strip()
-                if nm:
-                    name_txt = nm
-                else:
-                    for v in row.values():
-                        if isinstance(v, str) and v.strip():
-                            name_txt = v.strip()
-                            break
-    except Exception as _e:
-        logging.error(f"[SECOM] lookup nombre error: {_e}")
-
-    if name_txt:
-        benefit_msg = f"¡Hola {name_txt}! ✔️\n" + benefit_msg
-
-    send_message(sender, benefit_msg)
-    # Guardar intención para follow-up por 1 hora
-    LAST_INTENT[sender] = {"opt": "secom", "title": "SECOM Auto", "ts": now}
-    # No caigas a GPT/menú aquí
-    continue
-
-# 2) Follow-up: si responde afirmativo dentro de 1 hora, pedir placa o tarjeta.
-if text_norm in ("si", "sí", "ok", "va", "sale"):
-    li = LAST_INTENT.get(sender)
-    if li and li.get("opt") == "secom" and (now - li.get("ts", now)) <= 3600:
-        send_message(
-            sender,
-            "Perfecto ✅\nEnvíame tu *número de placa* o una *foto clara* de tu *tarjeta de circulación* para cotizarte ahora."
-        )
-        continue
-# <<< SECOM
-        
     KEYWORD_INTENTS = [
         (("pension", "pensión", "imss", "modalidad 40", "modalidad 10", "ley 73"), "1"),
         (("auto", "seguro de auto", "placa", "tarjeta de circulación", "coche", "carro"), "2"),
@@ -800,46 +746,10 @@ except NameError:
             else:
                 body = ""
             last10 = vx_last10(from_number)
-            customer = None
-                        # >>> VX-MEDIA-ACK: evita menú si mandan medios
-            msg_type = msg.get("type")
-
-            if msg_type == "image":
-                vx_wa_send_text(
-                    from_number,
-                    "✅ ¡Gracias! Recibí la imagen. Si es para *seguro de auto*, con INE y tarjeta de circulación (o tu número de placa) ya puedo cotizar."
-                )
-                if message_id:
-                    vx_wa_mark_read(message_id)
-                return jsonify({"status": "ok", "handled": "vx-media-image"}), 200
-
-            if msg_type == "document":
-                vx_wa_send_text(
-                    from_number,
-                    "✅ ¡Gracias! Recibí tu documento. En breve lo reviso para tu cotización."
-                )
-                if message_id:
-                    vx_wa_mark_read(message_id)
-                return jsonify({"status": "ok", "handled": "vx-media-doc"}), 200
-
-            if msg_type in ("audio", "voice"):
-                vx_wa_send_text(
-                    from_number,
-                    "🗣️ Recibí tu nota de voz. Si prefieres, compárteme tu *placa* o *foto de la tarjeta de circulación* para avanzar con la cotización."
-                )
-                if message_id:
-                    vx_wa_mark_read(message_id)
-                return jsonify({"status": "ok", "handled": "vx-media-audio"}), 200
-            # <<< VX-MEDIA-ACK
-
-            last10 = vx_last10(from_number)
-            customer = None
 
             # >>> VX-SECOM (interceptor + follow-up)
-            t = (body or "").strip()
-            U = t.upper()
+            U = (body or "").strip().upper()
 
-            # 1) Interceptor "PRUEBA SECOM": saluda por nombre (si está en la hoja) y muestra beneficio.
             if U == "PRUEBA SECOM":
                 benefit_msg = (
                     "Beneficio SECOM para *Seguro de Auto*:\n"
@@ -861,17 +771,13 @@ except NameError:
                                         break
                     if name_txt:
                         benefit_msg = f"¡Hola {name_txt}! ✔️\n" + benefit_msg
-
                     vx_wa_send_text(from_number, benefit_msg)
                     if message_id:
                         vx_wa_mark_read(message_id)
                 except Exception as _vx_e:
                     logging.getLogger("vx").error(f"vx_secom_intercept error: {_vx_e}")
-
-                # Evitar que caiga al menú
                 return jsonify({"status": "ok", "handled": "vx-secom"}), 200
 
-            # 2) Follow-up: si responde afirmativo, pedir placa o tarjeta.
             if U in ("SI", "SÍ", "OK", "VA", "SALE"):
                 vx_wa_send_text(
                     from_number,
@@ -882,10 +788,7 @@ except NameError:
                 return jsonify({"status": "ok", "handled": "vx-secom-followup"}), 200
             # <<< VX-SECOM
 
-            sheet_row = None
-            if last10:
-                sheet_row = vx_sheet_find_by_phone(last10)
-
+            customer = None
             sheet_row = None
             if last10:
                 sheet_row = vx_sheet_find_by_phone(last10)
@@ -913,5 +816,155 @@ except NameError:
             logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 200
 
+# ===== VX: SECOM BROADCAST ====================================================
+try:
+    vx_wa_send_template
+except NameError:
+    def vx_wa_send_template(to_e164: str, template_name: str, variables: list[str] = None, lang: str = "es_MX"):
+        """Envía una plantilla de WhatsApp (si tienes plantilla aprobada)."""
+        import requests, logging
+        token = vx_get_env("META_TOKEN")
+        phone_id = vx_get_env("WABA_PHONE_ID")
+        if not token or not phone_id or not to_e164 or not template_name:
+            logging.getLogger("vx").warning("vx_wa_send_template: falta config")
+            return {"ok": False, "error": "missing_config"}
 
+        components = []
+        if variables:
+            components.append({
+                "type": "body",
+                "parameters": [{"type": "text", "text": str(v)} for v in variables]
+            })
 
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_e164,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": lang},
+                **({"components": components} if components else {})
+            }
+        }
+        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=12)
+            logging.getLogger("vx").info(f"vx_wa_send_template: {resp.status_code} {resp.text[:180]}")
+            ok = resp.status_code == 200
+            msg_id = ""
+            try:
+                msg_id = resp.json().get("messages", [{}])[0].get("id", "")
+            except Exception:
+                pass
+            return {"ok": ok, "status_code": resp.status_code, "id": msg_id, "raw": resp.text[:240]}
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_wa_send_template error: {e}")
+            return {"ok": False, "error": str(e)}
+
+@app.get("/ext/secom/broadcast")
+def vx_ext_secom_broadcast():
+    """Recorre la hoja SECOM y envía mensaje por fila (plantilla o texto)."""
+    import json, re, time, logging
+    try:
+        creds_json = vx_get_env("GOOGLE_CREDENTIALS_JSON")
+        sheets_id = vx_get_env("SHEETS_ID_LEADS")
+        default_title = vx_get_env("SHEETS_TITLE_LEADS") or "Prospectos SECOM Auto"
+        if not creds_json or not sheets_id:
+            return jsonify({"ok": False, "error": "missing_sheets_env"}), 400
+
+        template = request.args.get("template")
+        title = request.args.get("sheet", default_title)
+        limit = int(request.args.get("limit", "0") or "0")
+        dry = request.args.get("dry", "0") == "1"
+
+        def last10(num):
+            d = re.sub(r"\D", "", str(num or ""))
+            d = re.sub(r"^(52|521)", "", d)
+            return d[-10:] if len(d) >= 10 else d
+
+        def to_e164_mx(num):
+            d10 = last10(num)
+            return f"521{d10}" if len(d10) == 10 else ""
+
+        import gspread
+        from gspread import service_account_from_dict
+        creds_dict = json.loads(creds_json)
+        client = service_account_from_dict(creds_dict)
+        sheet = client.open_by_key(sheets_id)
+        ws = sheet.worksheet(title)
+
+        rows = ws.get_all_records()
+        if not rows:
+            return jsonify({"ok": True, "processed": 0, "dry_run": dry, "results": []})
+
+        header = ws.row_values(1)
+        ctrl_cols = ["LAST_MESSAGE_AT", "LAST_TEMPLATE", "MESSAGE_STATUS", "MESSAGE_ID", "NEXT_ACTION"]
+        modified_header = False
+        for col in ctrl_cols:
+            if col not in header:
+                header.append(col)
+                modified_header = True
+        if modified_header:
+            ws.update(f"A1:{gspread.utils.rowcol_to_a1(1, len(header))}", [header])
+
+        col_index = {name: i+1 for i, name in enumerate(header)}
+        processed = 0
+        results = []
+
+        for idx, row in enumerate(rows, start=2):
+            name = (row.get("Nombre") or "").strip()
+            wa = row.get("WhatsApp") or ""
+            to = to_e164_mx(wa)
+            if not name or not to:
+                continue
+
+            sent_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            msg_id = ""
+            status = "SIMULATED" if dry else "SENT"
+
+            if not dry:
+                if template:
+                    resp = vx_wa_send_template(to, template, [name])
+                    status = "SENT" if resp.get("ok") else "ERROR"
+                    msg_id = resp.get("id", "")
+                else:
+                    body = (f"¡Hola {name}! 👋 Soy Vicky, asistente de Christian López.\n\n"
+                            "Te comparto tu beneficio de *SECOM Auto*: hasta *60% de descuento* en tu seguro.\n"
+                            "Es *transferible* a familiares en tu mismo domicilio.\n\n"
+                            "¿Deseas que te cotice ahora con tu *placa* o *tarjeta de circulación*?")
+                    ok = vx_wa_send_text(to, body)
+                    status = "SENT" if ok else "ERROR"
+                time.sleep(0.2)
+
+            updates = []
+            if "LAST_MESSAGE_AT" in col_index:
+                updates.append({"range": gspread.utils.rowcol_to_a1(idx, col_index["LAST_MESSAGE_AT"]),
+                                "values": [[sent_at]]})
+            if "LAST_TEMPLATE" in col_index:
+                updates.append({"range": gspread.utils.rowcol_to_a1(idx, col_index["LAST_TEMPLATE"]),
+                                "values": [[template or "TEXT"]]})
+            if "MESSAGE_STATUS" in col_index:
+                updates.append({"range": gspread.utils.rowcol_to_a1(idx, col_index["MESSAGE_STATUS"]),
+                                "values": [[status]]})
+            if "MESSAGE_ID" in col_index:
+                updates.append({"range": gspread.utils.rowcol_to_a1(idx, col_index["MESSAGE_ID"]),
+                                "values": [[msg_id]]})
+            if "NEXT_ACTION" in col_index:
+                updates.append({"range": gspread.utils.rowcol_to_a1(idx, col_index["NEXT_ACTION"]),
+                                "values": [["WAIT_REPLY"]]})
+
+            if updates:
+                ws.batch_update(updates)
+
+            results.append({"row": idx, "to": to, "name": name, "status": status, "message_id": msg_id})
+            processed += 1
+            if limit and processed >= limit:
+                break
+
+        return jsonify({"ok": True, "sheet": title, "processed": processed, "dry_run": dry, "results": results}), 200
+    except Exception as e:
+        logging.getLogger("vx").error(f"vx_ext_secom_broadcast error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+# ==============================================================================
