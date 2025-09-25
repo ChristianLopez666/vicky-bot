@@ -411,15 +411,11 @@ def receive_message():
 
 
             # --- OPT-OUT robusto ---
-            OPTOUT_WORDS = ("BAJA","STOP","CANCELA","CANCELAR","ALTO","NO QUIERO","NUNCA","UNSUBSCRIBE")
-            if any(w in text.upper() for w in OPTOUT_WORDS):
                 try:
                     me10 = vx_last10(sender)
-                    vx_sheet_mark_optout(me10, "user_request")
                 except Exception:
                     pass
                 send_message(sender, "Hecho ✅ No volverás a recibir mensajes. Si te arrepientes, escríbeme 'ALTA'.")
-                return jsonify({"status":"ok","handled":"optout"}), 200
             # ------------------------
 
             # >>> VX-SECOM (interceptor + follow-up para /webhook)
@@ -503,7 +499,9 @@ def receive_message():
             if kb and kb.get("text"):
                 base = kb["text"]
                 fuentes = kb.get("sources") or []
-                tail = "\n\n-- Fuente: " + " • ".join(fuentes)
+                tail = "
+
+— Fuente: " + " • ".join(fuentes)
                 send_message(sender, (base + tail)[:1900])
                 LAST_INTENT[sender] = {"opt": "kb", "title": "Respuesta Manuales", "ts": now}
                 continue
@@ -744,33 +742,19 @@ try:
     vx_sheet_find_by_phone
 except NameError:
     def vx_sheet_find_by_phone(last10: str):
-        import json, logging
+        import logging
+        import json
         try:
             creds_json = vx_get_env("GOOGLE_CREDENTIALS_JSON")
             sheets_id = vx_get_env("SHEETS_ID_LEADS")
             sheets_title = vx_get_env("SHEETS_TITLE_LEADS")
             if not creds_json or not sheets_id or not sheets_title or not last10:
                 return None
-            from gspread import service_account_from_dict
-            import gspread
-            creds = json.loads(creds_json)
-            client = service_account_from_dict(creds)
-            ws = client.open_by_key(sheets_id).worksheet(sheets_title)
-            rows = ws.get_all_records()
-            for row in rows:
-                wa = str(row.get("WhatsApp", "") or row.get("TELEFONO/WHATSAPP", ""))
-                if vx_last10(wa) == last10:
-                    return row
-            return None
-        except Exception as e:
-            logging.getLogger("vx").error(f"vx_sheet_find_by_phone error: {e}")
-            return None
+
 
 # >>> VX: SHEETS opt-out helper
 try:
-    vx_sheet_mark_optout
 except NameError:
-    def vx_sheet_mark_optout(last10: str, reason: str = "opt_out"):
         import json, logging, datetime
         creds_json = vx_get_env("GOOGLE_CREDENTIALS_JSON")
         sheets_id = vx_get_env("SHEETS_ID_LEADS")
@@ -789,17 +773,15 @@ except NameError:
                 ws.update(f"A1:{gspread.utils.rowcol_to_a1(1, len(header))}", [header])
             rows = ws.get_all_records()
             for idx, row in enumerate(rows, start=2):
-                wa = str(row.get("WhatsApp", "") or row.get("TELEFONO/WHATSAPP", ""))
+                wa = str(row.get("WhatsApp", "")) or str(row.get("TELEFONO/WHATSAPP", ""))
                 if vx_last10(wa) == last10:
                     ts = datetime.datetime.utcnow().isoformat() + "Z"
                     ws.update_cell(idx, header.index("OPT_OUT")+1, f"{reason}|{ts}")
                     return True
             return False
         except Exception as e:
-            logging.getLogger("vx").error(f"vx_sheet_mark_optout error: {e}")
             return False
-# <<< VX: SHEETS
-
+# <<< VX: SHEETS opt-out helper
 
             import gspread
             from gspread import service_account_from_dict
@@ -1162,14 +1144,13 @@ def vx_ext_secom_broadcast():
         return jsonify({"ok": False, "error": str(e)}), 500
 # ==============================================================================
 
-                      if any(w in (body or "").upper() for w in OPTOUT_WORDS):
+
+            # --- OPT-OUT robusto (ext) ---
                 try:
-                    vx_sheet_mark_optout(vx_last10(from_number), "user_request")
                 except Exception:
                     pass
                 vx_wa_send_text(from_number, "Hecho ✅ No volverás a recibir mensajes. Si te arrepientes, escribe 'ALTA'.")
                 if message_id: vx_wa_mark_read(message_id)
-                return jsonify({"status":"ok","handled":"optout"}), 200
             # -----------------------------
 
 # ===== VX: SECOM BROADCAST A/B (no toca el endpoint original) ==================
