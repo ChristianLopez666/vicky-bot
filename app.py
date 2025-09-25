@@ -1162,10 +1162,7 @@ def vx_ext_secom_broadcast():
         return jsonify({"ok": False, "error": str(e)}), 500
 # ==============================================================================
 
-
-            # --- OPT-OUT robusto (ext) ---
-            OPTOUT_WORDS = ("BAJA","STOP","CANCELA","CANCELAR","ALTO","NO QUIERO","NUNCA","UNSUBSCRIBE")
-            if any(w in (body or "").upper() for w in OPTOUT_WORDS):
+                      if any(w in (body or "").upper() for w in OPTOUT_WORDS):
                 try:
                     vx_sheet_mark_optout(vx_last10(from_number), "user_request")
                 except Exception:
