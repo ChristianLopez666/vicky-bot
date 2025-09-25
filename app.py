@@ -503,7 +503,7 @@ def receive_message():
             if kb and kb.get("text"):
                 base = kb["text"]
                 fuentes = kb.get("sources") or []
-                tail = "
+                tail = "\n\n-- Fuente: " + " • ".join(fuentes)
                 send_message(sender, (base + tail)[:1900])
                 LAST_INTENT[sender] = {"opt": "kb", "title": "Respuesta Manuales", "ts": now}
                 continue
