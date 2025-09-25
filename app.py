@@ -747,6 +747,37 @@ except NameError:
                 body = ""
             last10 = vx_last10(from_number)
             customer = None
+                        # >>> VX-MEDIA-ACK: evita menú si mandan medios
+            msg_type = msg.get("type")
+
+            if msg_type == "image":
+                vx_wa_send_text(
+                    from_number,
+                    "✅ ¡Gracias! Recibí la imagen. Si es para *seguro de auto*, con INE y tarjeta de circulación (o tu número de placa) ya puedo cotizar."
+                )
+                if message_id:
+                    vx_wa_mark_read(message_id)
+                return jsonify({"status": "ok", "handled": "vx-media-image"}), 200
+
+            if msg_type == "document":
+                vx_wa_send_text(
+                    from_number,
+                    "✅ ¡Gracias! Recibí tu documento. En breve lo reviso para tu cotización."
+                )
+                if message_id:
+                    vx_wa_mark_read(message_id)
+                return jsonify({"status": "ok", "handled": "vx-media-doc"}), 200
+
+            if msg_type in ("audio", "voice"):
+                vx_wa_send_text(
+                    from_number,
+                    "🗣️ Recibí tu nota de voz. Si prefieres, compárteme tu *placa* o *foto de la tarjeta de circulación* para avanzar con la cotización."
+                )
+                if message_id:
+                    vx_wa_mark_read(message_id)
+                return jsonify({"status": "ok", "handled": "vx-media-audio"}), 200
+            # <<< VX-MEDIA-ACK
+
             last10 = vx_last10(from_number)
             customer = None
 
@@ -827,4 +858,5 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 200
+
 
