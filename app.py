@@ -25,6 +25,17 @@ PROCESSED_MESSAGE_IDS = set()
 GREETED_USERS = set()
 LAST_INTENT = {}   # último intent (para motivo de contacto)
 USER_CONTEXT = {}  # estado por usuario {wa_id: {"ctx": str, "ts": float}}
+# === Debounce para medios (evitar múltiples acks seguidos) ===
+MEDIA_ACK_TS = {}  # {wa_id: epoch_seconds}
+
+def _should_ack_media(wa_id: str, now_ts: float, debounce_sec: int = 20) -> bool:
+    last = MEDIA_ACK_TS.get(wa_id, 0)
+    if (now_ts - last) >= debounce_sec:
+        MEDIA_ACK_TS[wa_id] = now_ts
+        return True
+    return False
+# === FIN debounce ===
+
 
 # --------- GPT fallback robusto (opcional) ----------
 def gpt_reply(user_text: str) -> str | None:
@@ -343,6 +354,8 @@ def receive_message():
 
             # === 🆕 BLOQUE 2: manejo de medios antes de filtrar por 'text' ===
             if msg_type == "image":
+                if not _should_ack_media(sender, now):
+                    return jsonify({"status": "ok", "handled": "media-image-debounced"}), 200
                 media_id = (message.get("image") or {}).get("id")
                 caption = (message.get("image") or {}).get("caption", "") or ""
                 try:
@@ -356,9 +369,11 @@ def receive_message():
                     logging.error(f"❌ Error reenviando imagen: {e}")
 
                 send_message(sender, "✅ ¡Gracias! Recibí la imagen. Si es para **seguro de auto**, con INE y tarjeta de circulación (o placa) ya puedo cotizar. ¿Deseas que avance?")
-                continue
+                return jsonify({"status": "ok", "handled": "media-image"}), 200
 
             if msg_type == "document":
+                if not _should_ack_media(sender, now):
+                    return jsonify({"status": "ok", "handled": "media-doc-debounced"}), 200
                 media_id = (message.get("document") or {}).get("id")
                 filename = (message.get("document") or {}).get("filename", "")
                 try:
@@ -372,16 +387,18 @@ def receive_message():
                     logging.error(f"❌ Error reenviando documento: {e}")
 
                 send_message(sender, "✅ ¡Gracias! Recibí tu documento. En breve lo reviso.")
-                continue
+                return jsonify({"status": "ok", "handled": "media-doc"}), 200
 
             if msg_type == "audio" or (msg_type == "voice"):
+                if not _should_ack_media(sender, now):
+                    return jsonify({"status": "ok", "handled": "media-audio-debounced"}), 200
                 media_id = (message.get("audio") or {}).get("id")
                 transcript = transcribe_audio_media(media_id) if media_id else None
                 if transcript:
                     send_message(sender, f"🗣️ Transcripción: {transcript}")
                 else:
                     send_message(sender, "No pude transcribir tu nota de voz. ¿Podrías intentar de nuevo o escribir el mensaje?")
-                continue
+                return jsonify({"status": "ok", "handled": "media-audio"}), 200
             # === FIN BLOQUE 2 ===
 
             if msg_type != "text":
@@ -390,6 +407,21 @@ def receive_message():
 
             text = message.get("text", {}).get("body", "") or ""
             text_norm = text.strip().lower()
+
+
+
+            # --- OPT-OUT robusto ---
+            OPTOUT_WORDS = ("BAJA","STOP","CANCELA","CANCELAR","ALTO","NO QUIERO","NUNCA","UNSUBSCRIBE")
+            if any(w in text.upper() for w in OPTOUT_WORDS):
+                try:
+                    me10 = vx_last10(sender)
+                    vx_sheet_mark_optout(me10, "user_request")
+                except Exception:
+                    pass
+                send_message(sender, "Hecho ✅ No volverás a recibir mensajes. Si te arrepientes, escríbeme 'ALTA'.")
+                return jsonify({"status":"ok","handled":"optout"}), 200
+            # ------------------------
+
             # >>> VX-SECOM (interceptor + follow-up para /webhook)
             t = (text or "").strip()
             U = t.upper()
@@ -462,6 +494,21 @@ def receive_message():
                         continue
             # -------------------------------------------------------
 
+            # ---- KB (Manuales) antes de GPT ----
+            kb = None
+            try:
+                kb = vx_kb_answer(text_norm)
+            except Exception as _kb_e:
+                logging.error(f"[KB] error: {_kb_e}")
+            if kb and kb.get("text"):
+                base = kb["text"]
+                fuentes = kb.get("sources") or []
+                tail = "
+
+— Fuente: " + " • ".join(fuentes)
+                send_message(sender, (base + tail)[:1900])
+                LAST_INTENT[sender] = {"opt": "kb", "title": "Respuesta Manuales", "ts": now}
+                continue
             # ---------- GPT primero para consultas naturales ----------
             is_numeric_option = text_norm in OPTION_RESPONSES
             is_menu = text_norm in ("hola", "menú", "menu")
@@ -707,6 +754,42 @@ except NameError:
             sheets_title = vx_get_env("SHEETS_TITLE_LEADS")
             if not creds_json or not sheets_id or not sheets_title or not last10:
                 return None
+
+
+# >>> VX: SHEETS opt-out helper
+try:
+    vx_sheet_mark_optout
+except NameError:
+    def vx_sheet_mark_optout(last10: str, reason: str = "opt_out"):
+        import json, logging, datetime
+        creds_json = vx_get_env("GOOGLE_CREDENTIALS_JSON")
+        sheets_id = vx_get_env("SHEETS_ID_LEADS")
+        sheets_title = vx_get_env("SHEETS_TITLE_LEADS")
+        if not creds_json or not sheets_id or not sheets_title or not last10:
+            return False
+        try:
+            from gspread import service_account_from_dict
+            import gspread
+            creds = json.loads(creds_json)
+            client = service_account_from_dict(creds)
+            ws = client.open_by_key(sheets_id).worksheet(sheets_title)
+            header = ws.row_values(1)
+            if "OPT_OUT" not in header:
+                header.append("OPT_OUT")
+                ws.update(f"A1:{gspread.utils.rowcol_to_a1(1, len(header))}", [header])
+            rows = ws.get_all_records()
+            for idx, row in enumerate(rows, start=2):
+                wa = str(row.get("WhatsApp", "")) or str(row.get("TELEFONO/WHATSAPP", ""))
+                if vx_last10(wa) == last10:
+                    ts = datetime.datetime.utcnow().isoformat() + "Z"
+                    ws.update_cell(idx, header.index("OPT_OUT")+1, f"{reason}|{ts}")
+                    return True
+            return False
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_sheet_mark_optout error: {e}")
+            return False
+# <<< VX: SHEETS opt-out helper
+
             import gspread
             from gspread import service_account_from_dict
             creds_dict = json.loads(creds_json)
@@ -724,6 +807,58 @@ except NameError:
             return None
 
 # >>> VX: MENU BUILDER (NO TOCAR)
+
+# >>> VX: KB desde Google Sheets (búsqueda simple)
+try:
+    vx_kb_answer
+except NameError:
+    def vx_kb_answer(query: str, min_hits: int = 1):
+        import json, re, logging
+        sheets_id = vx_get_env("SHEETS_ID_KB")
+        sheets_title = vx_get_env("SHEETS_TITLE_KB")
+        creds_json = vx_get_env("GOOGLE_CREDENTIALS_JSON")
+        if not sheets_id or not sheets_title or not creds_json or not query:
+            return None
+        try:
+            from gspread import service_account_from_dict
+            creds = json.loads(creds_json)
+            client = service_account_from_dict(creds)
+            ws = client.open_by_key(sheets_id).worksheet(sheets_title)
+            rows = ws.get_all_records()
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_kb_answer sheets error: {e}")
+            return None
+        q = query.lower()
+        tokens = re.findall(r"[a-záéíóúñ0-9]{3,}", q)
+        if not tokens:
+            return None
+        scored = []
+        for r in rows:
+            title = str(r.get("TITULO", "")).strip()
+            tags = str(r.get("TAGS", "")).lower()
+            content = str(r.get("CONTENIDO", "")).strip()
+            if not content:
+                continue
+            score = 0
+            low = content.lower()
+            for t in tokens:
+                if t in low: score += 2
+                if t in tags: score += 3
+            if score > 0:
+                idx = low.find(tokens[0])
+                start = max(0, idx - 250)
+                end = min(len(content), start + 800)
+                snippet = content[start:end].strip()
+                scored.append((score, title, snippet))
+        if not scored:
+            return None
+        scored.sort(reverse=True, key=lambda x: x[0])
+        tops = scored[:max(min_hits,1)]
+        answer = tops[0][2]
+        sources = [t for _, t, _ in tops if t]
+        return {"text": answer, "sources": sources}
+# <<< VX: KB
+
 try:
     vx_menu_text
 except NameError:
@@ -1015,3 +1150,239 @@ def vx_ext_secom_broadcast():
         logging.getLogger("vx").error(f"vx_ext_secom_broadcast error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 # ==============================================================================
+
+
+            # --- OPT-OUT robusto (ext) ---
+            OPTOUT_WORDS = ("BAJA","STOP","CANCELA","CANCELAR","ALTO","NO QUIERO","NUNCA","UNSUBSCRIBE")
+            if any(w in (body or "").upper() for w in OPTOUT_WORDS):
+                try:
+                    vx_sheet_mark_optout(vx_last10(from_number), "user_request")
+                except Exception:
+                    pass
+                vx_wa_send_text(from_number, "Hecho ✅ No volverás a recibir mensajes. Si te arrepientes, escribe 'ALTA'.")
+                if message_id: vx_wa_mark_read(message_id)
+                return jsonify({"status":"ok","handled":"optout"}), 200
+            # -----------------------------
+
+# ===== VX: SECOM BROADCAST A/B (no toca el endpoint original) ==================
+@app.get("/ext/secom/broadcast_ab")
+def vx_ext_secom_broadcast_ab():
+    # Broadcast con A/B testing y opt-out.
+    # Params: templateA, templateB (o template), variant=A/B, split=even|odd, limit, dry, sheet
+    # Usa {{1}} = Nombre. Salta filas con OPT_OUT. Escribe TEMPLATE_VARIANT, LAST_TEMPLATE, MESSAGE_STATUS, MESSAGE_ID, LAST_MESSAGE_AT
+    import json, re, time, logging, gspread
+    try:
+        creds_json = vx_get_env("GOOGLE_CREDENTIALS_JSON")
+        sheets_id = vx_get_env("SHEETS_ID_LEADS")
+        title = request.args.get("sheet", vx_get_env("SHEETS_TITLE_LEADS") or "Prospectos SECOM Auto")
+        if not creds_json or not sheets_id:
+            return jsonify({"ok": False, "error": "missing_sheets_env"}), 400
+
+        templateA = request.args.get("templateA")
+        templateB = request.args.get("templateB")
+        template = request.args.get("template")
+        dry = request.args.get("dry","0") == "1"
+        limit = int(request.args.get("limit","0") or "0")
+        variant_force = request.args.get("variant")
+        split = (request.args.get("split") or "").lower()
+
+        def last10(num):
+            d = re.sub(r"\D","",str(num or "")); d = re.sub(r"^(52|521)","",d)
+            return d[-10:] if len(d)>=10 else d
+        def to_e164(num):
+            d10 = last10(num); return f"521{d10}" if len(d10)==10 else ""
+
+        from gspread import service_account_from_dict
+        creds = json.loads(creds_json)
+        client = service_account_from_dict(creds)
+        ws = client.open_by_key(sheets_id).worksheet(title)
+
+        header = ws.row_values(1)
+        need_cols = ["LAST_MESSAGE_AT","LAST_TEMPLATE","MESSAGE_STATUS","MESSAGE_ID","NEXT_ACTION","TEMPLATE_VARIANT","OPT_OUT"]
+        changed = False
+        for c in need_cols:
+            if c not in header:
+                header.append(c); changed = True
+        if changed:
+            ws.update(f"A1:{gspread.utils.rowcol_to_a1(1,len(header))}", [header])
+
+        rows = ws.get_all_records()
+        idxcol = {name:i+1 for i,name in enumerate(header)}
+
+        processed = 0
+        results = []
+        for idx, row in enumerate(rows, start=2):
+            if str(row.get("OPT_OUT","")).strip():
+                continue
+            name = (row.get("Nombre") or "").strip()
+            to = to_e164(row.get("WhatsApp") or row.get("TELEFONO/WHATSAPP") or "")
+            if not name or not to:
+                continue
+
+            # decidir variante
+            if variant_force in ("A","B"):
+                variant_used = variant_force
+            elif split in ("even","par","pares"):
+                variant_used = "A" if (idx % 2 == 0) else "B"
+            elif split in ("odd","impar","nones","non"):
+                variant_used = "A" if (idx % 2 == 1) else "B"
+            else:
+                variant_used = "A"
+
+            chosen = template
+            if templateA or templateB:
+                if variant_used == "A" and templateA:
+                    chosen = templateA
+                elif variant_used == "B" and templateB:
+                    chosen = templateB
+
+            sent_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            msg_id = ""
+            status = "SIMULATED" if dry else "SENT"
+
+            if not dry:
+                if chosen:
+                    resp = vx_wa_send_template(to, chosen, [name])
+                    status = "SENT" if resp.get("ok") else "ERROR"
+                    msg_id = resp.get("id","")
+                else:
+                    body = (f"¡Hola {name}! 👋 Soy Vicky, asistente de Christian López.\n\n"
+                            "Te comparto tu beneficio de *SECOM Auto*: hasta *60% de descuento* en tu seguro.\n"
+                            "Es *transferible* a familiares en tu mismo domicilio.\n\n"
+                            "¿Deseas que te cotice ahora con tu *placa* o *tarjeta de circulación*?")
+                    ok = vx_wa_send_text(to, body)
+                    status = "SENT" if ok else "ERROR"
+                time.sleep(0.2)
+
+            updates = []
+            updates.append({"range": gspread.utils.rowcol_to_a1(idx, idxcol["LAST_MESSAGE_AT"]), "values": [[sent_at]]})
+            updates.append({"range": gspread.utils.rowcol_to_a1(idx, idxcol["LAST_TEMPLATE"]), "values": [[chosen or "TEXT"]]})
+            updates.append({"range": gspread.utils.rowcol_to_a1(idx, idxcol["MESSAGE_STATUS"]), "values": [[status]]})
+            updates.append({"range": gspread.utils.rowcol_to_a1(idx, idxcol["MESSAGE_ID"]), "values": [[msg_id]]})
+            updates.append({"range": gspread.utils.rowcol_to_a1(idx, idxcol["NEXT_ACTION"]), "values": [["WAIT_REPLY"]]})
+            if "TEMPLATE_VARIANT" in idxcol:
+                updates.append({"range": gspread.utils.rowcol_to_a1(idx, idxcol["TEMPLATE_VARIANT"]), "values": [[variant_used]]})
+            ws.batch_update(updates)
+
+            results.append({"row": idx, "to": to, "name": name, "status": status, "template": chosen, "variant": variant_used, "message_id": msg_id})
+            processed += 1
+            if limit and processed >= limit:
+                break
+
+        return jsonify({"ok": True, "sheet": title, "processed": processed, "dry_run": dry, "results": results}), 200
+    except Exception as e:
+        logging.getLogger("vx").error(f"vx_ext_secom_broadcast_ab error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+# =============================================================================
+
+# ===== VX: SECOM SCHEDULER (D+2/D+5/D+10) =====================================
+@app.get("/ext/secom/scheduler")
+def vx_ext_secom_scheduler():
+    # Secuencia de follow-ups D+2/D+5/D+10 con plantillas.
+    import json, time, datetime, re, logging, gspread
+    try:
+        creds_json = vx_get_env("GOOGLE_CREDENTIALS_JSON")
+        sheets_id = vx_get_env("SHEETS_ID_LEADS")
+        title = request.args.get("sheet", vx_get_env("SHEETS_TITLE_LEADS") or "Prospectos SECOM Auto")
+        if not creds_json or not sheets_id: 
+            return jsonify({"ok": False, "error": "missing_sheets_env"}), 400
+
+        dry = request.args.get("dry","0") == "1"
+        t1 = request.args.get("template1")  # D+2
+        t2 = request.args.get("template2")  # D+5
+        t3 = request.args.get("template3")  # D+10
+        variant = request.args.get("variant")  # opcional
+
+        def last10(s):
+            d = re.sub(r"\D","",str(s or "")); d = re.sub(r"^(52|521)","",d)
+            return d[-10:] if len(d)>=10 else d
+        def to_e164(num):
+            d10 = last10(num); return f"521{d10}" if len(d10)==10 else ""
+
+        from gspread import service_account_from_dict
+        creds = json.loads(creds_json)
+        client = service_account_from_dict(creds)
+        ws = client.open_by_key(sheets_id).worksheet(title)
+
+        header = ws.row_values(1)
+        need_cols = ["SEQUENCE_STEP","NEXT_OUTREACH_AT","LAST_OUTREACH_AT","OPT_OUT","TEMPLATE_VARIANT","LAST_TEMPLATE","MESSAGE_STATUS","MESSAGE_ID"]
+        changed = False
+        for c in need_cols:
+            if c not in header:
+                header.append(c); changed = True
+        if changed:
+            ws.update(f"A1:{gspread.utils.rowcol_to_a1(1,len(header))}", [header])
+
+        rows = ws.get_all_records()
+        idxcol = {name:i+1 for i,name in enumerate(header)}
+        now = datetime.datetime.utcnow()
+
+        processed = 0
+        results = []
+        for idx, row in enumerate(rows, start=2):
+            if str(row.get("OPT_OUT","")):
+                continue
+            name = (row.get("Nombre") or "").strip()
+            to = to_e164(row.get("WhatsApp") or row.get("TELEFONO/WHATSAPP") or "")
+            if not name or not to:
+                continue
+
+            step = int(row.get("SEQUENCE_STEP") or 0)
+            next_at = str(row.get("NEXT_OUTREACH_AT") or "").strip()
+
+            if not next_at:
+                base = now
+                if row.get("LAST_OUTREACH_AT"):
+                    try:
+                        base = datetime.datetime.fromisoformat(str(row["LAST_OUTREACH_AT"]).replace("Z",""))
+                    except Exception:
+                        base = now
+                na = (base + datetime.timedelta(days=2)).isoformat()+"Z"
+                ws.update_cell(idx, idxcol["NEXT_OUTREACH_AT"], na)
+                continue
+
+            try:
+                due = datetime.datetime.fromisoformat(next_at.replace("Z",""))
+            except Exception:
+                continue
+            if now < due:
+                continue
+
+            chosen = None; new_step = step; delay = None
+            if step == 0 and t1: chosen, new_step, delay = t1, 1, 3
+            elif step == 1 and t2: chosen, new_step, delay = t2, 2, 5
+            elif step == 2 and t3: chosen, new_step, delay = t3, 3, 3650
+            else:
+                continue
+
+            variant_used = variant if variant in ("A","B") else ("A" if (idx % 2 == 0) else "B")
+
+            status = "SIMULATED" if dry else "SENT"
+            msg_id = ""
+            if not dry:
+                resp = vx_wa_send_template(to, chosen, [name])
+                status = "SENT" if resp.get("ok") else "ERROR"
+                msg_id = resp.get("id","")
+                time.sleep(0.2)
+
+            now_iso = now.isoformat()+"Z"
+            updates = [
+                {"range": gspread.utils.rowcol_to_a1(idx, idxcol["LAST_OUTREACH_AT"]), "values": [[now_iso]]},
+                {"range": gspread.utils.rowcol_to_a1(idx, idxcol["SEQUENCE_STEP"]), "values": [[new_step]]},
+                {"range": gspread.utils.rowcol_to_a1(idx, idxcol["LAST_TEMPLATE"]), "values": [[chosen]]},
+                {"range": gspread.utils.rowcol_to_a1(idx, idxcol["NEXT_OUTREACH_AT"]), "values": [[(now + datetime.timedelta(days=delay)).isoformat()+"Z"]]},
+                {"range": gspread.utils.rowcol_to_a1(idx, idxcol["MESSAGE_STATUS"]), "values": [[status]]},
+                {"range": gspread.utils.rowcol_to_a1(idx, idxcol["MESSAGE_ID"]), "values": [[msg_id]]},
+            ]
+            if "TEMPLATE_VARIANT" in idxcol:
+                updates.append({"range": gspread.utils.rowcol_to_a1(idx, idxcol["TEMPLATE_VARIANT"]), "values": [[variant_used]]})
+            ws.batch_update(updates)
+
+            results.append({"row": idx, "name": name, "to": to, "template": chosen, "variant": variant_used, "status": status})
+            processed += 1
+
+        return jsonify({"ok": True, "processed": processed, "results": results, "dry_run": dry}), 200
+    except Exception as e:
+        logging.getLogger("vx").error(f"vx_ext_secom_scheduler error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+# =============================================================================
