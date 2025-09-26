@@ -469,7 +469,38 @@ def receive_message():
                 send_message(sender, MENU_TEXT)
                 continue
 
-            # Fallback final
+            
+        # --- VX-GPT: interpretación libre o respuesta rápida ---
+        RESPUESTAS_COMUNES = {
+            "gracias": "¡Con gusto! Estoy para ayudarte 😊",
+            "ok": "¡Perfecto! Si necesitas algo más, aquí estaré.",
+            "listo": "¡Excelente! En breve te atiendo.",
+            "muy amable": "¡Con gusto! Un placer ayudarte.",
+            "te agradezco": "Estoy aquí para servirte.",
+            "gracias vicky": "¡De nada! 😉",
+            "thanks": "You’re welcome!",
+            "thank you": "My pleasure!"
+        }
+
+        mensaje_clean = text_norm
+
+        for frase, respuesta in RESPUESTAS_COMUNES.items():
+            if frase in mensaje_clean:
+                send_message(sender, respuesta)
+                continue
+
+        try:
+            respuesta_gpt = interpretar_con_gpt(text_norm, profile_name or None)
+            if respuesta_gpt:
+                send_message(sender, respuesta_gpt)
+                continue
+        except Exception as e:
+            logging.error(f"[VX-GPT] Error: {e}")
+            send_message(sender, "Estoy para ayudarte 😊")
+            continue
+
+
+        # Fallback final
             logging.info("📌 Mensaje recibido (ya saludado). Respuesta guía.")
             send_message(sender, "No te entendí. Escribe 'menu' para ver opciones o elige un número del 1 al 7.")
 
@@ -675,6 +706,29 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_sheet_find_by_phone error: {e}")
             return None
+
+
+# === Función auxiliar para interpretación GPT personalizada ===
+def interpretar_con_gpt(texto: str, nombre: str = None) -> str:
+    """
+    Usa GPT para interpretar frases naturales como 'gracias', 'te aviso', etc.
+    Devuelve una respuesta breve y amigable. Usa el nombre si está disponible.
+    """
+    prompt = (
+        f"Eres Vicky, asistente virtual financiera. Responde brevemente, con amabilidad y profesionalismo.\n"
+        f"- Si el mensaje es de cortesía como 'gracias', responde también con cortesía.\n"
+        f"- Si el mensaje parece informal u opcional, responde amigablemente.\n"
+        f"- Usa el nombre del cliente si lo conoces.\n"
+        f"Cliente: '{texto}'\n"
+        f"Vicky:"
+    )
+    try:
+        respuesta = vx_gpt_reply(texto, prompt)
+        return respuesta or "Estoy para ayudarte 😊"
+    except Exception as e:
+        logging.getLogger("vx").error(f"interpretar_con_gpt error: {e}")
+        return "Estoy para ayudarte 😊"
+
 
 # >>> VX: MENU BUILDER (NO TOCAR)
 try:
