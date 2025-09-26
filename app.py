@@ -773,3 +773,127 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 200
+
+
+# >>> VX: WA TEMPLATE + SEND PROMO (NO TOCAR)
+try:
+    vx_wa_send_template
+except NameError:
+    def vx_wa_send_template(to_e164: str, template_name: str, lang: str = "es_MX", components: list | None = None):
+        import requests, logging, json
+        token = vx_get_env("META_TOKEN")
+        phone_id = vx_get_env("WABA_PHONE_ID")
+        if not token or not phone_id or not to_e164 or not template_name:
+            logging.getLogger("vx").warning("vx_wa_send_template: falta config o parámetros")
+            return False, "missing_config"
+        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_e164,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": lang},
+            }
+        }
+        if components:
+            payload["template"]["components"] = components
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=12)
+            ok = resp.status_code in (200, 201)
+            if not ok:
+                logging.getLogger("vx").warning(f"vx_wa_send_template: {resp.status_code} {resp.text[:200]}")
+            else:
+                logging.getLogger("vx").info(f"vx_wa_send_template OK: {resp.text[:120]}")
+            return ok, resp.text
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_wa_send_template error: {e}")
+            return False, str(e)
+
+try:
+    vx_sheet_get_all_rows
+except NameError:
+    def vx_sheet_get_all_rows():
+        import json, logging
+        try:
+            creds_json = vx_get_env("GOOGLE_CREDENTIALS_JSON")
+            sheets_id = vx_get_env("SHEETS_ID_LEADS")
+            sheets_title = vx_get_env("SHEETS_TITLE_LEADS")
+            if not creds_json or not sheets_id or not sheets_title:
+                return []
+            import gspread
+            from gspread import service_account_from_dict
+            creds_dict = json.loads(creds_json)
+            client = service_account_from_dict(creds_dict)
+            sheet = client.open_by_key(sheets_id)
+            ws = sheet.worksheet(sheets_title)
+            return ws.get_all_records()
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_sheet_get_all_rows error: {e}")
+            return []
+
+# Ruta para enviar campaña bajo demanda
+try:
+    _vx_ext_send_promo_registered
+except NameError:
+    _vx_ext_send_promo_registered = True
+    @app.post("/ext/send-promo")
+    def vx_ext_send_promo():
+        import logging
+        payload = request.get_json(silent=True) or {}
+        template_name = payload.get("template_name") or "promo_auto_v1"
+        lang = payload.get("lang") or "es_MX"
+        limit = int(payload.get("limit") or 0)  # 0 = sin límite
+        dry = bool(payload.get("dry_run") or False)
+
+        rows = vx_sheet_get_all_rows() or []
+        sent = 0
+        skipped = 0
+        errors = []
+        seen = set()
+
+        for row in rows:
+            try:
+                wa = str(row.get("WhatsApp", ""))
+                name = str(row.get("Nombre", "")).strip() or "amigo(a)"
+                last10 = vx_last10(wa)
+                if not last10 or len(last10) != 10:
+                    skipped += 1
+                    continue
+                e164 = f"521{last10}"
+                if e164 in seen:
+                    skipped += 1
+                    continue
+                seen.add(e164)
+
+                # Plantilla con un solo parámetro {{1}} = Nombre
+                components = [{
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": name}]
+                }]
+
+                if dry:
+                    sent += 1
+                    if limit and sent >= limit:
+                        break
+                    continue
+
+                ok, resp = vx_wa_send_template(e164, template_name, lang, components)
+                if ok:
+                    sent += 1
+                else:
+                    errors.append({"to": e164, "error": resp[:180]})
+                if limit and sent >= limit:
+                    break
+            except Exception as e:
+                errors.append({"to": row.get("WhatsApp", ""), "error": str(e)[:180]})
+        return jsonify({
+            "template": template_name,
+            "lang": lang,
+            "dry_run": dry,
+            "sent": sent,
+            "skipped": skipped,
+            "errors": errors[:50]  # limitar salida
+        }), 200
+
