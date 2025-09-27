@@ -456,7 +456,7 @@ def receive_message():
                         f"- Mensaje original: \"{text.strip()}\""
                     )
                     try:
-                        if ADVISOR_NUMBER and ADVISOR_NUMBER != sender:
+                        if ADVISOR_NUMBER:
                             send_message(ADVISOR_NUMBER, notify_text)
                             logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_NUMBER}")
                     except Exception as e:
