@@ -389,10 +389,7 @@ def receive_message():
                 continue
 
             text = message.get("text", {}).get("body", "") or ""
-            text_norm = text.strip().lower() if text else ""
-            if not text_norm:
-                send_message(sender, "¿Podrías escribir tu mensaje de nuevo?")
-                continue
+            text_norm = text.strip().lower()
             logging.info(f"✉️ Texto normalizado: {text_norm}")
 
             # -------- Contexto por usuario (financiamiento) --------
@@ -418,10 +415,20 @@ def receive_message():
                         continue
             # -------------------------------------------------------
 
+            
             # ---------- GPT primero para consultas naturales ----------
             is_numeric_option = text_norm in OPTION_RESPONSES
             is_menu = text_norm in ("hola", "menú", "menu")
-            is_natural_query = (not is_numeric_option) and (not is_menu) and any(ch.isalpha() for ch in text_norm) and (len(text_norm.split()) >= 3)
+
+            # ⚠️ Nuevo: si cliente ya seleccionó opción y ahora dice "gracias" o algo breve, se responderá con GPT si hay contexto
+            has_last_intent = sender in LAST_INTENT and LAST_INTENT[sender].get("opt") != "gpt"
+            is_short_phrase = any(ch.isalpha() for ch in text_norm) and len(text_norm.split()) <= 3
+            is_natural_query = (
+                (not is_numeric_option)
+                and (not is_menu)
+                and any(ch.isalpha() for ch in text_norm)
+                and (len(text_norm.split()) >= 3 or has_last_intent)
+            )
 
             if is_natural_query:
                 ai = gpt_reply(text)
@@ -429,6 +436,7 @@ def receive_message():
                     send_message(sender, ai)
                     LAST_INTENT[sender] = {"opt": "gpt", "title": "Consulta abierta", "ts": now}
                     continue
+
             # ---------------------------------------------------------
 
             # Opción 1–7 (o inferida por keywords)
