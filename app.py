@@ -415,20 +415,10 @@ def receive_message():
                         continue
             # -------------------------------------------------------
 
-            
             # ---------- GPT primero para consultas naturales ----------
             is_numeric_option = text_norm in OPTION_RESPONSES
             is_menu = text_norm in ("hola", "menú", "menu")
-
-            # ⚠️ Nuevo: si cliente ya seleccionó opción y ahora dice "gracias" o algo breve, se responderá con GPT si hay contexto
-            has_last_intent = sender in LAST_INTENT and LAST_INTENT[sender].get("opt") != "gpt"
-            is_short_phrase = any(ch.isalpha() for ch in text_norm) and len(text_norm.split()) <= 3
-            is_natural_query = (
-                (not is_numeric_option)
-                and (not is_menu)
-                and any(ch.isalpha() for ch in text_norm)
-                and (len(text_norm.split()) >= 3 or has_last_intent)
-            )
+            is_natural_query = (not is_numeric_option) and (not is_menu) and any(ch.isalpha() for ch in text_norm) and (len(text_norm.split()) >= 3)
 
             if is_natural_query:
                 ai = gpt_reply(text)
@@ -436,7 +426,6 @@ def receive_message():
                     send_message(sender, ai)
                     LAST_INTENT[sender] = {"opt": "gpt", "title": "Consulta abierta", "ts": now}
                     continue
-
             # ---------------------------------------------------------
 
             # Opción 1–7 (o inferida por keywords)
@@ -456,28 +445,49 @@ def receive_message():
                         f"- Mensaje original: \"{text.strip()}\""
                     )
                     try:
-                        if ADVISOR_NUMBER:
+                        if ADVISOR_NUMBER and ADVISOR_NUMBER != sender:
                             send_message(ADVISOR_NUMBER, notify_text)
                             logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_NUMBER}")
                     except Exception as e:
                         logging.error(f"❌ Error notificando al asesor: {e}")
                 continue
 
-            # Saludos/menú
+            
+# Saludos/menú
+            # === SECOM: personalización por coincidencia en Google Sheets ===
+            try:
+                last10 = vx_last10(sender) if 'vx_last10' in globals() else (sender[-10:] if sender else "")
+                sheet_row = vx_sheet_find_by_phone(last10) if last10 else None
+            except Exception as _secom_err:
+                logging.warning(f"[SECOM] lookup falló: {str(_secom_err)[:120]}")
+                sheet_row = None
+
+            personalized_menu = MENU_TEXT
+            if sheet_row:
+                try:
+                    _name = str(sheet_row.get("Nombre", "") or "").strip()
+                    _benefit = str(sheet_row.get("Beneficio", "") or "").strip() or "Hasta 60% de descuento en seguro de auto 🚗"
+                    secom_line = (f"👋 Hola {_name}, " if _name else "👋 Hola, ") + f"te tengo un beneficio activo: {_benefit}\n\n"
+                    personalized_menu = secom_line + MENU_TEXT
+                except Exception as _e:
+                    logging.warning(f"[SECOM] formato de fila inesperado: {str(_e)[:120]}")
+                    personalized_menu = MENU_TEXT
+            # === FIN SECOM ===
+
             first_greet_ts = GREETED_USERS.get(sender)
             if not first_greet_ts or (now - first_greet_ts) >= GREET_TTL:
                 if is_menu:
                     send_message(
                         sender,
-                        "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n" + MENU_TEXT
+                        "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n" + personalized_menu
                     )
                 else:
-                    send_message(sender, MENU_TEXT)
+                    send_message(sender, personalized_menu)
                 GREETED_USERS[sender] = now
                 continue
 
             if is_menu:
-                send_message(sender, MENU_TEXT)
+                send_message(sender, personalized_menu)
                 continue
 
             # Fallback final
@@ -784,33 +794,3 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 200
-
-
-    @app.post("/ext/send-promo")
-    def vx_ext_send_promo():
-        import logging
-        try:
-            data = request.get_json(force=True, silent=True) or {}
-            to = data.get("to")
-            text = data.get("text")
-
-            if not to or not text:
-                return jsonify({"ok": False, "error": "Faltan parámetros"}), 400
-
-            # Permitir lista o string único
-            if isinstance(to, str):
-                targets = [to]
-            elif isinstance(to, list):
-                targets = to
-            else:
-                return jsonify({"ok": False, "error": "Formato inválido en 'to'"}), 400
-
-            results = {}
-            for phone in targets:
-                ok = vx_wa_send_text(str(phone), text)
-                results[str(phone)] = "ok" if ok else "fail"
-
-            return jsonify({"ok": True, "msg": "Envío en proceso", "results": results}), 200
-        except Exception as e:
-            logging.getLogger("vx").error(f"vx_ext_send_promo error: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 500
