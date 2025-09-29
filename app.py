@@ -1,4 +1,4 @@
-import os 
+      import os 
 import logging
 import requests
 from flask import Flask, request, jsonify
@@ -814,3 +814,71 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_ext_send_promo error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 500
+
+# ============================================================
+# 📌 Endpoint auxiliar para probar conexión con SECOM (Google Sheets)
+# ============================================================
+
+@app.route("/ext/test-secom", methods=["GET"])
+def test_secom():
+    """
+    Endpoint de prueba para validar conexión con Google Sheets y matching de número.
+    Uso: https://vicky-bot-x6wt.onrender.com/ext/test-secom?phone=5216681234567
+    """
+    try:
+        from google.oauth2.service_account import Credentials
+        import gspread
+        import json  # ✅ agregado dentro del bloque para evitar error
+
+        # Cargar credenciales de Google desde variable de entorno
+        google_creds = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        if not google_creds:
+            return jsonify({"error": "GOOGLE_CREDENTIALS_JSON no configurado"}), 500
+
+        creds = Credentials.from_service_account_info(json.loads(google_creds))
+        client = gspread.authorize(creds)
+
+        # Abrir hoja
+        sheet_id = os.getenv("SHEETS_ID_LEADS")
+        sheet_title = os.getenv("SHEETS_TITLE_LEADS")
+        if not sheet_id or not sheet_title:
+            return jsonify({"error": "Variables de entorno SECOM faltantes"}), 500
+
+        sheet = client.open_by_key(sheet_id).worksheet(sheet_title)
+
+        # Obtener número de la query
+        phone = request.args.get("phone")
+        if not phone:
+            return jsonify({"error": "Debes enviar ?phone=NUMERO"}), 400
+
+        phone_last10 = str(phone)[-10:]
+
+        # Buscar coincidencia en hoja
+        records = sheet.get_all_records()
+        for row in records:
+            wa = str(row.get("WhatsApp", ""))
+            if wa and wa[-10:] == phone_last10:
+                return jsonify({
+                    "ok": True,
+                    "match": {
+                        "nombre": row.get("Nombre", ""),
+                        "whatsapp": row.get("WhatsApp", ""),
+                        "rfc": row.get("RFC", ""),
+                        "beneficio": "Hasta 60% de descuento en seguro de auto 🚗"
+                    }
+                })
+
+        return jsonify({"ok": False, "message": "No se encontró coincidencia"})
+
+    except Exception as e:
+        logging.error(f"❌ Error en /ext/test-secom: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/ext/routes")
+def _vx_list_routes():
+    try:
+        routes = sorted([f"{r.methods} {r.rule}" for r in app.url_map.iter_rules()])
+        return jsonify({"routes": routes})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
