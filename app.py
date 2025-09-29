@@ -452,42 +452,21 @@ def receive_message():
                         logging.error(f"❌ Error notificando al asesor: {e}")
                 continue
 
-            
-# Saludos/menú
-            # === SECOM: personalización por coincidencia en Google Sheets ===
-            try:
-                last10 = vx_last10(sender) if 'vx_last10' in globals() else (sender[-10:] if sender else "")
-                sheet_row = vx_sheet_find_by_phone(last10) if last10 else None
-            except Exception as _secom_err:
-                logging.warning(f"[SECOM] lookup falló: {str(_secom_err)[:120]}")
-                sheet_row = None
-
-            personalized_menu = MENU_TEXT
-            if sheet_row:
-                try:
-                    _name = str(sheet_row.get("Nombre", "") or "").strip()
-                    _benefit = str(sheet_row.get("Beneficio", "") or "").strip() or "Hasta 60% de descuento en seguro de auto 🚗"
-                    secom_line = (f"👋 Hola {_name}, " if _name else "👋 Hola, ") + f"te tengo un beneficio activo: {_benefit}\n\n"
-                    personalized_menu = secom_line + MENU_TEXT
-                except Exception as _e:
-                    logging.warning(f"[SECOM] formato de fila inesperado: {str(_e)[:120]}")
-                    personalized_menu = MENU_TEXT
-            # === FIN SECOM ===
-
+            # Saludos/menú
             first_greet_ts = GREETED_USERS.get(sender)
             if not first_greet_ts or (now - first_greet_ts) >= GREET_TTL:
                 if is_menu:
                     send_message(
                         sender,
-                        "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n" + personalized_menu
+                        "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n" + MENU_TEXT
                     )
                 else:
-                    send_message(sender, personalized_menu)
+                    send_message(sender, MENU_TEXT)
                 GREETED_USERS[sender] = now
                 continue
 
             if is_menu:
-                send_message(sender, personalized_menu)
+                send_message(sender, MENU_TEXT)
                 continue
 
             # Fallback final
@@ -794,3 +773,77 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 200
+
+
+# ========= SECOM minimal integration (non-invasive) =========
+try:
+    from flask import Blueprint, request, jsonify
+except Exception:
+    from flask import Blueprint, request, jsonify  # type: ignore
+
+def _vx_last10(phone: str) -> str:
+    try:
+        import re as _re
+        if not phone:
+            return ""
+        p = _re.sub(r"[^\d]", "", str(phone))
+        p = _re.sub(r"^(52|521)", "", p)
+        return p[-10:] if len(p) >= 10 else p
+    except Exception:
+        return str(phone)[-10:] if phone else ""
+
+def _vx_sheet_find_by_phone(last10: str):
+    import os, json, logging
+    try:
+        gj = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        sid = os.getenv("SHEETS_ID_LEADS")
+        title = os.getenv("SHEETS_TITLE_LEADS")
+        if not (gj and sid and title and last10):
+            return None, "Missing env vars or phone"
+        from google.oauth2.service_account import Credentials
+        import gspread
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
+        info = json.loads(gj)
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        client = gspread.authorize(creds)
+        ws = client.open_by_key(sid).worksheet(title)
+        rows = ws.get_all_records()
+        for row in rows:
+            wa = str(row.get("WhatsApp", ""))
+            if _vx_last10(wa) == last10:
+                return row, None
+        return None, None
+    except Exception as e:
+        logging.error(f"SECOM lookup error: {e}")
+        return None, str(e)
+
+_ext_bp = Blueprint("vx_ext", __name__)
+
+@_ext_bp.get("/test-secom")
+def vx_test_secom():
+    phone = request.args.get("phone", "").strip()
+    if not phone:
+        return jsonify({"ok": False, "error": "Debes enviar ?phone=NUMERO"}), 400
+    row, err = _vx_sheet_find_by_phone(_vx_last10(phone))
+    if err:
+        return jsonify({"ok": False, "error": err}), 500
+    if row:
+        return jsonify({
+            "ok": True,
+            "match": {
+                "nombre": row.get("Nombre", ""),
+                "whatsapp": row.get("WhatsApp", ""),
+                "rfc": row.get("RFC", ""),
+                "beneficio": "Hasta 60% de descuento en seguro de auto 🚗"
+            }
+        }), 200
+    return jsonify({"ok": False, "message": "No se encontró coincidencia"}), 200
+
+try:
+    app.register_blueprint(_ext_bp, url_prefix="/ext")  # type: ignore
+except Exception:
+    pass
+# ====== End SECOM minimal integration ======
