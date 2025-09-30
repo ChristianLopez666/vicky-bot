@@ -837,58 +837,60 @@ except NameError:
 
 
     @app.route("/ext/send-promo", methods=["POST"])
-    def vx_ext_send_promo():
-        """
-        Envía PROMO por WhatsApp.
-        Body JSON:
-        {
-          "to": "5216682478005" | ["5216...","5218..."],
-          "text": "mensaje libre",                  # opcional
-          "template": "promo_auto_v1",              # opcional (string)
-          "params": { "nombre": "X", "oferta": "Y"} # opcional (dict)
-        }
-        """
-        import threading, logging
+def vx_ext_send_promo():
+    """
+    Envía PROMO por WhatsApp.
+    Body JSON:
+    {
+      "to": "5216682478005" | ["5216...","5218..."],
+      "text": "mensaje libre",                  # opcional
+      "template": "promo_auto_v1",              # opcional (string)
+      "params": { "nombre": "X", "oferta": "Y"} # opcional (dict)
+    }
+    """
+    import threading, logging
 
-        data = request.get_json(force=True, silent=True) or {}
-        to = data.get("to")
-        text = data.get("text")
-        template = data.get("template")
-        params = data.get("params", {})
+    data = request.get_json(force=True, silent=True) or {}
+    to = data.get("to")
+    text = data.get("text")
+    template = data.get("template")
+    params = data.get("params", {})
 
-        if isinstance(to, str):
-            targets = [to]
-        elif isinstance(to, list):
-            targets = [str(x) for x in to if str(x).strip()]
-        else:
-            return jsonify({"ok": False, "error": "Falta 'to' (string o lista)"}), 400
+    if isinstance(to, str):
+        targets = [to]
+    elif isinstance(to, list):
+        targets = [str(x) for x in to if str(x).strip()]
+    else:
+        return jsonify({"ok": False, "error": "Falta 'to' (string o lista)"}), 400
 
-        def _worker(targets, text, template, params):
-            results = []
-            for num in targets:
-                ok = False
-                try:
-                    if template:
-                        comps = []
-                        if params:
-                            comps = [{
-                                "type": "body",
-                                "parameters": [
-                                    {"type": "text", "text": str(v)}
-                                    for v in params.values()
-                                ]
-                            }]
-                        ok = vx_wa_send_template(num, template, "es_MX", comps)
-                    elif text:
-                        ok = vx_wa_send_text(num, text)
-                    results.append({"to": num, "sent": ok})
-                except Exception as e:
-                    logging.getLogger("vx").error(f"send_promo worker error: {e}")
-                    results.append({"to": num, "sent": False, "error": str(e)})
-            logging.getLogger("vx").info(f"send_promo done: {results}")
+    def _worker(targets, text, template, params):
+        results = []
+        for num in targets:
+            ok = False
+            try:
+                if template:
+                    comps = []
+                    if params:
+                        comps = [{
+                            "type": "body",
+                            "parameters": [
+                                {"type": "text", "text": str(v)}
+                                for v in params.values()
+                            ]
+                        }]
+                    # Ajuste idioma: es para promo_auto_v1 y promo_credito_v1
+                    lang = "es" if template in ["promo_auto_v1", "promo_credito_v1"] else "es_MX"
+                    ok = vx_wa_send_template(num, template, lang, comps)
+                elif text:
+                    ok = vx_wa_send_text(num, text)
+                results.append({"to": num, "sent": ok})
+            except Exception as e:
+                logging.getLogger("vx").error(f"send_promo worker error: {e}")
+                results.append({"to": num, "sent": False, "error": str(e)})
+        logging.getLogger("vx").info(f"send_promo done: {results}")
 
-        threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
-        return jsonify({"accepted": True, "count": len(targets)}), 202
+    threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
+    return jsonify({"accepted": True, "count": len(targets)}), 202
 
 
 # ========= SECOM minimal integration (non-invasive) =========
