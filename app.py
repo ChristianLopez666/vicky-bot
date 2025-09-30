@@ -843,14 +843,10 @@ except NameError:
         Body JSON:
         {
           "to": "5216682478005" | ["5216...","5218..."],
-          "text": "mensaje libre",                # opcional
-          "template": {                           # opcional
-             "name": "mi_template",
-             "lang": "es_MX",
-             "components": [ ]                    # formato de Meta
-          }
+          "text": "mensaje libre",                  # opcional
+          "template": "promo_auto_v1",              # opcional (string)
+          "params": { "nombre": "X", "oferta": "Y"} # opcional (dict)
         }
-        Responde 202 y procesa en segundo plano para evitar 502.
         """
         import threading, logging
 
@@ -858,6 +854,7 @@ except NameError:
         to = data.get("to")
         text = data.get("text")
         template = data.get("template")
+        params = data.get("params", {})
 
         if isinstance(to, str):
             targets = [to]
@@ -866,16 +863,22 @@ except NameError:
         else:
             return jsonify({"ok": False, "error": "Falta 'to' (string o lista)"}), 400
 
-        def _worker(targets, text, template):
+        def _worker(targets, text, template, params):
             results = []
             for num in targets:
                 ok = False
                 try:
-                    if template and isinstance(template, dict) and template.get("name"):
-                        name = template.get("name")
-                        lang = template.get("lang") or "es_MX"
-                        comps = template.get("components")
-                        ok = vx_wa_send_template(num, name, lang, comps)
+                    if template:
+                        comps = []
+                        if params:
+                            comps = [{
+                                "type": "body",
+                                "parameters": [
+                                    {"type": "text", "text": str(v)}
+                                    for v in params.values()
+                                ]
+                            }]
+                        ok = vx_wa_send_template(num, template, "es_MX", comps)
                     elif text:
                         ok = vx_wa_send_text(num, text)
                     results.append({"to": num, "sent": ok})
@@ -884,7 +887,7 @@ except NameError:
                     results.append({"to": num, "sent": False, "error": str(e)})
             logging.getLogger("vx").info(f"send_promo done: {results}")
 
-        threading.Thread(target=_worker, args=(targets, text, template), daemon=True).start()
+        threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
         return jsonify({"accepted": True, "count": len(targets)}), 202
 
 
