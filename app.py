@@ -761,11 +761,20 @@ except NameError:
             logging.getLogger("vx").error(f"vx_ext_webhook_post error: {e}")
             return jsonify({"status": "ok"}), 200
 
-    @app.post("/ext/test-send")
+    @app.route("/ext/test-send", methods=["GET", "POST"])
     def vx_ext_test_send():
         import logging
         try:
+            if request.method == "GET":
+                return jsonify({
+                    "status": "ready",
+                    "note": "Usa POST con {to, text} en JSON para enviar mensaje de prueba"
+                }), 200
+
             data = request.get_json(force=True, silent=True)
+            if not data:
+                return jsonify({"ok": False, "error": "Falta JSON con 'to' y 'text'"}), 400
+
             to = data.get("to")
             text = data.get("text")
             ok = vx_wa_send_text(to, text)
@@ -773,6 +782,26 @@ except NameError:
         except Exception as e:
             logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
             return jsonify({"ok": False, "error": str(e)}), 200
+
+    @app.route("/ext/test-send-form", methods=["GET", "POST"])
+    def vx_ext_test_send_form():
+        from flask import render_template_string, request
+        if request.method == "POST":
+            to = request.form.get("to")
+            text = request.form.get("text")
+            ok = vx_wa_send_text(to, text)
+            return f"<p>Mensaje enviado a {to}: {ok}</p><a href='/ext/test-send-form'>Volver</a>"
+        html = """
+        <h2>Prueba de envío WhatsApp</h2>
+        <form method='post'>
+            <label>Número (E.164, ej. 5216682478005):</label><br>
+            <input type='text' name='to' style='width:300px'><br><br>
+            <label>Mensaje:</label><br>
+            <textarea name='text' rows='4' cols='40'></textarea><br><br>
+            <button type='submit'>Enviar</button>
+        </form>
+        """
+        return render_template_string(html)
 
 
 # ========= SECOM minimal integration (non-invasive) =========
