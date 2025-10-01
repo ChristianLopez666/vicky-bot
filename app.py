@@ -496,8 +496,6 @@ def receive_message():
                     logging.error(f"❌ Error registrando en Sheets: {e}")
             continue
 
-                continue
-
             if msg_type == "audio" or (msg_type == "voice"):
                 media_id = (message.get("audio") or {}).get("id")
                 transcript = transcribe_audio_media(media_id) if media_id else None
