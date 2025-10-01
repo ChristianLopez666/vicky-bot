@@ -724,7 +724,7 @@ except NameError:
 
 
 
-@_ext_bp.route("/send-promo", methods=["POST"])
+@app.route("/ext/send-promo", methods=["POST"])
 def vx_ext_send_promo():
     import threading, logging
     data = request.get_json(force=True, silent=True) or {}
