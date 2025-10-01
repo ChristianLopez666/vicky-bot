@@ -878,7 +878,6 @@ def vx_ext_send_promo():
                                 for v in params.values()
                             ]
                         }]
-                    # Ajuste idioma: es para promo_auto_v1 y promo_credito_v1
                     lang = "es" if template in ["promo_auto_v1", "promo_credito_v1"] else "es_MX"
                     ok = vx_wa_send_template(num, template, lang, comps)
                 elif text:
