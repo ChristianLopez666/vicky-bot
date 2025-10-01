@@ -596,28 +596,7 @@ except NameError:
 try:
     vx_wa_mark_read
 except NameError:
-    def vx_wa_mark_read(message_id: str):
-        import requests, logging
-        token = vx_get_env("META_TOKEN")
-        phone_id = vx_get_env("WABA_PHONE_ID")
-        if not token or not phone_id or not message_id:
-            logging.getLogger("vx").warning("vx_wa_mark_read: falta config")
-            return False
-        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        payload = {
-            "messaging_product": "whatsapp",
-            "status": "read",
-            "message_id": message_id
-        }
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=9)
-            logging.getLogger("vx").info(f"vx_wa_mark_read: {resp.status_code} {resp.text[:120]}")
-            return resp.status_code == 200
-        except Exception as e:
-            logging.getLogger("vx").error(f"vx_wa_mark_read error: {e}")
-            return False
-
+    
 
 try:
     vx_wa_send_template
@@ -648,6 +627,27 @@ except NameError:
             return resp.status_code == 200
         except Exception as e:
             logging.getLogger("vx").error(f"vx_wa_send_template error: {e}")
+            return False
+def vx_wa_mark_read(message_id: str):
+        import requests, logging
+        token = vx_get_env("META_TOKEN")
+        phone_id = vx_get_env("WABA_PHONE_ID")
+        if not token or not phone_id or not message_id:
+            logging.getLogger("vx").warning("vx_wa_mark_read: falta config")
+            return False
+        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "messaging_product": "whatsapp",
+            "status": "read",
+            "message_id": message_id
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=9)
+            logging.getLogger("vx").info(f"vx_wa_mark_read: {resp.status_code} {resp.text[:120]}")
+            return resp.status_code == 200
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_wa_mark_read error: {e}")
             return False
 
 # >>> VX: GPT (NO TOCAR)
@@ -793,50 +793,9 @@ except NameError:
             logging.getLogger("vx").error(f"vx_ext_webhook_post error: {e}")
             return jsonify({"status": "ok"}), 200
 
-    @app.route("/ext/test-send", methods=["GET", "POST"])
-    def vx_ext_test_send():
-        import logging
-        try:
-            if request.method == "GET":
-                return jsonify({
-                    "status": "ready",
-                    "note": "Usa POST con {to, text} en JSON para enviar mensaje de prueba"
-                }), 200
+    
 
-            data = request.get_json(force=True, silent=True)
-            if not data:
-                return jsonify({"ok": False, "error": "Falta JSON con 'to' y 'text'"}), 400
-
-            to = data.get("to")
-            text = data.get("text")
-            ok = vx_wa_send_text(to, text)
-            return jsonify({"ok": ok}), 200
-        except Exception as e:
-            logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 200
-
-    @app.route("/ext/test-send-form", methods=["GET", "POST"])
-    def vx_ext_test_send_form():
-        from flask import render_template_string, request
-        if request.method == "POST":
-            to = request.form.get("to")
-            text = request.form.get("text")
-            ok = vx_wa_send_text(to, text)
-            return f"<p>Mensaje enviado a {to}: {ok}</p><a href='/ext/test-send-form'>Volver</a>"
-        html = """
-        <h2>Prueba de envío WhatsApp</h2>
-        <form method='post'>
-            <label>Número (E.164, ej. 5216682478005):</label><br>
-            <input type='text' name='to' style='width:300px'><br><br>
-            <label>Mensaje:</label><br>
-            <textarea name='text' rows='4' cols='40'></textarea><br><br>
-            <button type='submit'>Enviar</button>
-        </form>
-        """
-        return render_template_string(html)
-
-
-    @app.route("/ext/send-promo", methods=["POST"])
+@app.route("/ext/send-promo", methods=["POST"])
 def vx_ext_send_promo():
     """
     Envía PROMO por WhatsApp.
@@ -886,10 +845,22 @@ def vx_ext_send_promo():
             except Exception as e:
                 logging.getLogger("vx").error(f"send_promo worker error: {e}")
                 results.append({"to": num, "sent": False, "error": str(e)})
-        logging.getLogger("vx").info(f"send_promo done: {results}")
+        logging.getLogger("vx").info(f"vx:send_promo done: {results}")
 
     threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
     return jsonify({"accepted": True, "count": len(targets)}), 202
+@app.post("/ext/test-send")
+    def vx_ext_test_send():
+        import logging
+        try:
+            data = request.get_json(force=True, silent=True)
+            to = data.get("to")
+            text = data.get("text")
+            ok = vx_wa_send_text(to, text)
+            return jsonify({"ok": ok}), 200
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 200
 
 
 # ========= SECOM minimal integration (non-invasive) =========
