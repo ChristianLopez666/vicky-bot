@@ -1,14 +1,14 @@
-import os 
+mport os 
 import logging
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import json
 import base64
 import mimetypes
 import io
-import pytz
 from google.oauth2.service_account import Credentials
 import gspread
 from googleapiclient.discovery import build
@@ -35,7 +35,7 @@ GOOGLE_CREDENTIALS_JSON_RAW = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 SHEETS_ID_REQUESTS = os.getenv("SHEETS_ID_REQUESTS")
 SHEETS_TITLE_REQUESTS = "Solicitudes Vicky"
-tz = pytz.timezone("America/Mazatlan")
+tz = ZoneInfo("America/Mazatlan")
 
 drive_service = None
 sheet_requests = None
@@ -490,7 +490,7 @@ def receive_message():
                 # 5) Registrar en Google Sheets
                 try:
                     if sheet_requests is not None:
-                        now_ts = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+                        now_ts = datetime.now(ZoneInfo("America/Mazatlan")).strftime("%Y-%m-%d %H:%M:%S")
                         sheet_requests.append_row([profile_name or "", sender or "", "Archivo recibido", now_ts, "Pendiente"])
                 except Exception as e:
                     logging.error(f"❌ Error registrando en Sheets: {e}")
