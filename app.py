@@ -566,6 +566,31 @@ except NameError:
         except Exception:
             return None
 
+
+
+def vx_wa_send_template(to_e164: str, template_name: str, lang_code: str = "es_MX", components: list | None = None):
+    import requests, logging
+    token = vx_get_env("META_TOKEN")
+    phone_id = vx_get_env("WABA_PHONE_ID")
+    if not token or not phone_id or not to_e164 or not template_name:
+        logging.warning("vx_wa_send_template: falta config/params")
+        return False
+    url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_e164,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": lang_code},
+        }
+    }
+    if components:
+        payload["template"]["components"] = components
+    resp = requests.post(url, headers=headers, json=payload, timeout=12)
+    logging.info(f"vx_wa_send_template: {resp.status_code} {resp.text[:160]}")
+    return resp.status_code == 200
 # >>> VX: WHATSAPP CLIENT (NO TOCAR)
 try:
     vx_wa_send_text
@@ -596,39 +621,7 @@ except NameError:
 try:
     vx_wa_mark_read
 except NameError:
-    
-
-try:
-    vx_wa_send_template
-except NameError:
-    def vx_wa_send_template(to_e164: str, template_name: str, lang_code: str = "es_MX", components: list | None = None):
-        import requests, logging
-        token = vx_get_env("META_TOKEN")
-        phone_id = vx_get_env("WABA_PHONE_ID")
-        if not token or not phone_id or not to_e164 or not template_name:
-            logging.getLogger("vx").warning("vx_wa_send_template: falta config/params")
-            return False
-        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_e164,
-            "type": "template",
-            "template": {
-                "name": template_name,
-                "language": {"code": lang_code},
-            }
-        }
-        if components:
-            payload["template"]["components"] = components
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=12)
-            logging.getLogger("vx").info(f"vx_wa_send_template: {resp.status_code} {resp.text[:160]}")
-            return resp.status_code == 200
-        except Exception as e:
-            logging.getLogger("vx").error(f"vx_wa_send_template error: {e}")
-            return False
-def vx_wa_mark_read(message_id: str):
+    def vx_wa_mark_read(message_id: str):
         import requests, logging
         token = vx_get_env("META_TOKEN")
         phone_id = vx_get_env("WABA_PHONE_ID")
@@ -729,6 +722,51 @@ except NameError:
             return f"Hola {customer_name}, " + base[5:]
         return base
 
+
+
+@_ext_bp.route("/send-promo", methods=["POST"])
+def vx_ext_send_promo():
+    import threading, logging
+    data = request.get_json(force=True, silent=True) or {}
+    to = data.get("to")
+    text = data.get("text")
+    template = data.get("template")
+    params = data.get("params", {})
+
+    if isinstance(to, str):
+        targets = [to]
+    elif isinstance(to, list):
+        targets = [str(x) for x in to if str(x).strip()]
+    else:
+        return jsonify({"ok": False, "error": "Falta 'to' (string o lista)"}), 400
+
+    def _worker(targets, text, template, params):
+        results = []
+        for num in targets:
+            ok = False
+            try:
+                if template:
+                    comps = []
+                    if params:
+                        comps = [{
+                            "type": "body",
+                            "parameters": [
+                                {"type": "text", "text": str(v)}
+                                for v in params.values()
+                            ]
+                        }]
+                    lang = "es" if template in ["promo_auto_v1", "promo_credito_v1"] else "es_MX"
+                    ok = vx_wa_send_template(num, template, lang, comps)
+                elif text:
+                    ok = vx_wa_send_text(num, text)
+                results.append({"to": num, "sent": ok})
+            except Exception as e:
+                logging.error(f"send_promo worker error: {e}")
+                results.append({"to": num, "sent": False, "error": str(e)})
+        logging.info(f"send_promo done: {results}")
+
+    threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
+    return jsonify({"accepted": True, "count": len(targets)}), 202
 # >>> VX: ROUTES /ext (NO TOCAR)
 try:
     vx_ext_routes_registered
@@ -793,63 +831,7 @@ except NameError:
             logging.getLogger("vx").error(f"vx_ext_webhook_post error: {e}")
             return jsonify({"status": "ok"}), 200
 
-    
-
-@app.route("/ext/send-promo", methods=["POST"])
-def vx_ext_send_promo():
-    """
-    Envía PROMO por WhatsApp.
-    Body JSON:
-    {
-      "to": "5216682478005" | ["5216...","5218..."],
-      "text": "mensaje libre",                  # opcional
-      "template": "promo_auto_v1",              # opcional (string)
-      "params": { "nombre": "X", "oferta": "Y"} # opcional (dict)
-    }
-    """
-    import threading, logging
-
-    data = request.get_json(force=True, silent=True) or {}
-    to = data.get("to")
-    text = data.get("text")
-    template = data.get("template")
-    params = data.get("params", {})
-
-    if isinstance(to, str):
-        targets = [to]
-    elif isinstance(to, list):
-        targets = [str(x) for x in to if str(x).strip()]
-    else:
-        return jsonify({"ok": False, "error": "Falta 'to' (string o lista)"}), 400
-
-    def _worker(targets, text, template, params):
-        results = []
-        for num in targets:
-            ok = False
-            try:
-                if template:
-                    comps = []
-                    if params:
-                        comps = [{
-                            "type": "body",
-                            "parameters": [
-                                {"type": "text", "text": str(v)}
-                                for v in params.values()
-                            ]
-                        }]
-                    lang = "es" if template in ["promo_auto_v1", "promo_credito_v1"] else "es_MX"
-                    ok = vx_wa_send_template(num, template, lang, comps)
-                elif text:
-                    ok = vx_wa_send_text(num, text)
-                results.append({"to": num, "sent": ok})
-            except Exception as e:
-                logging.getLogger("vx").error(f"send_promo worker error: {e}")
-                results.append({"to": num, "sent": False, "error": str(e)})
-        logging.getLogger("vx").info(f"vx:send_promo done: {results}")
-
-    threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
-    return jsonify({"accepted": True, "count": len(targets)}), 202
-@app.post("/ext/test-send")
+    @app.post("/ext/test-send")
     def vx_ext_test_send():
         import logging
         try:
