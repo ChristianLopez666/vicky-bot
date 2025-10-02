@@ -436,12 +436,16 @@ def receive_message():
                 if option == "6":
                     USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
                 if option == "7":
-                    motive = LAST_INTENT.get(sender, {}).get("title") or "No especificado"
+                    motive = "Contacto con Christian"
                     notify_text = (
-                        "🔔 *Vicky Bot – Solicitud de contacto*\n"
-                        f"- Nombre: {profile_name or 'No disponible'}\n"
-                        f"- WhatsApp del cliente: {sender}\n"
-                        f"- Motivo: {motive}\n"
+                        "🔔 *Vicky Bot – Solicitud de contacto*
+"
+                        f"- Nombre: {profile_name or 'No disponible'}
+"
+                        f"- WhatsApp del cliente: {sender}
+"
+                        f"- Motivo: {motive}
+"
                         f"- Mensaje original: \"{text.strip()}\""
                     )
                     try:
@@ -450,7 +454,7 @@ def receive_message():
                             logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_WHATSAPP}")
                     except Exception as e:
                         logging.error(f"❌ Error notificando al asesor: {e}")
-                continue
+                    continue
 
             # Saludos/menú
             first_greet_ts = GREETED_USERS.get(sender)
@@ -693,6 +697,48 @@ except NameError:
             if not creds_json or not sheets_id or not sheets_title or not last10:
                 return None
             import gspread
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+import io
+
+def _drive_service():
+    try:
+        import json
+        creds_info = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON", "{}"))
+        if not creds_info:
+            return None
+        creds = Credentials.from_service_account_info(creds_info, scopes=["https://www.googleapis.com/auth/drive"])
+        return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        logging.error(f"[Drive init] {e}")
+        return None
+
+def save_file_to_drive(filename: str, blob: bytes, mime_type: str, customer_name: str, phone: str, parent_id: str=None):
+    try:
+        service = _drive_service()
+        if not service:
+            return False
+        base_folder = os.getenv("DRIVE_FOLDER_ID")
+        if not base_folder:
+            return False
+        folder_name = f"{customer_name.replace(' ', '_')}_{phone[-4:]}"
+        q = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and '{base_folder}' in parents and trashed=false"
+        res = service.files().list(q=q, fields="files(id)").execute()
+        items = res.get("files", [])
+        if items:
+            folder_id = items[0]["id"]
+        else:
+            meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [base_folder]}
+            folder = service.files().create(body=meta, fields="id").execute()
+            folder_id = folder.get("id")
+        media = MediaIoBaseUpload(io.BytesIO(blob), mimetype=mime_type, resumable=True)
+        meta_file = {"name": filename, "parents": [folder_id]}
+        service.files().create(body=meta_file, media_body=media, fields="id").execute()
+        return True
+    except Exception as e:
+        logging.error(f"[Drive save] {e}")
+        return False
+
             from gspread import service_account_from_dict
             creds_dict = json.loads(creds_json)
             client = service_account_from_dict(creds_dict)
@@ -839,11 +885,7 @@ except NameError:
 @app.route("/ext/send-promo", methods=["POST"])
 def vx_ext_send_promo():
     """
-    Envía PROMO por WhatsApp.
-    Puede recibir:
-      - {"to": "521...", "text": "mensaje"}
-      - {"to": ["521...","521..."], "template": "promo_x", "params": {...}}
-      - {"secom": true, "producto": "auto", "text": "..."}
+    Optimizado: carga de SECOM y envío en segundo plano
     """
     import json, gspread, re
     from google.oauth2.service_account import Credentials
@@ -856,50 +898,42 @@ def vx_ext_send_promo():
     use_secom = bool(data.get("secom"))
     producto = (data.get("producto") or "").strip().lower()
 
-    targets = []
+    def _worker():
+        targets = []
+        if use_secom:
+            try:
+                gj = os.getenv("GOOGLE_CREDENTIALS_JSON")
+                sid = os.getenv("SHEETS_ID_LEADS")
+                title = os.getenv("SHEETS_TITLE_LEADS")
+                if gj and sid and title and producto:
+                    info = json.loads(gj)
+                    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+                    creds = Credentials.from_service_account_info(info, scopes=scopes)
+                    client = gspread.authorize(creds)
+                    ws = client.open_by_key(sid).worksheet(title)
+                    rows = ws.get_all_records()
+                    seen = set()
+                    for row in rows:
+                        prod = str(row.get("PRODUCTO", "")).strip().lower()
+                        wa = str(row.get("WhatsApp", "")).strip()
+                        if not wa:
+                            continue
+                        last10 = re.sub(r"\D", "", wa)[-10:]
+                        if not last10:
+                            continue
+                        e164 = f"521{last10}"
+                        if prod == producto and e164 not in seen:
+                            seen.add(e164)
+                            targets.append(e164)
+            except Exception as e:
+                logging.error(f"/ext/send-promo SECOM error: {e}")
+        elif isinstance(to, str):
+            targets.append(to)
+        elif isinstance(to, list):
+            targets.extend([str(x) for x in to if str(x).strip()])
 
-    if use_secom:
-        try:
-            gj = os.getenv("GOOGLE_CREDENTIALS_JSON")
-            sid = os.getenv("SHEETS_ID_LEADS")
-            title = os.getenv("SHEETS_TITLE_LEADS")
-            if gj and sid and title and producto:
-                info = json.loads(gj)
-                scopes = [
-                    "https://www.googleapis.com/auth/spreadsheets.readonly",
-                    "https://www.googleapis.com/auth/drive.readonly",
-                ]
-                creds = Credentials.from_service_account_info(info, scopes=scopes)
-                client = gspread.authorize(creds)
-                ws = client.open_by_key(sid).worksheet(title)
-                rows = ws.get_all_records()
-                seen = set()
-                for row in rows:
-                    prod = str(row.get("PRODUCTO", "")).strip().lower()
-                    wa = str(row.get("WhatsApp", "")).strip()
-                    if not wa:
-                        continue
-                    last10 = re.sub(r"\D", "", wa)[-10:]
-                    if not last10:
-                        continue
-                    e164 = f"521{last10}"
-                    if prod == producto and e164 not in seen:
-                        seen.add(e164)
-                        targets.append(e164)
-        except Exception as e:
-            logging.error(f"/ext/send-promo SECOM error: {e}")
-
-    elif isinstance(to, str):
-        targets = [to]
-    elif isinstance(to, list):
-        targets = [str(x) for x in to if str(x).strip()]
-
-    if not targets:
-        return jsonify({"ok": False, "error": "No se encontraron destinatarios"}), 400
-
-    def _worker(nums, text, template, params):
         results = []
-        for num in nums:
+        for num in targets:
             ok = False
             try:
                 if text:
@@ -909,8 +943,9 @@ def vx_ext_send_promo():
                 results.append({"to": num, "sent": False, "error": str(e)})
         logging.info(f"Promo results: {results}")
 
-    threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
-    return jsonify({"accepted": True, "count": len(targets)}), 202
+    threading.Thread(target=_worker, daemon=True).start()
+    return jsonify({"accepted": True}), 202
+return jsonify({"accepted": True, "count": len(targets)}), 202
 
 
 
