@@ -436,25 +436,25 @@ def receive_message():
                 if option == "6":
                     USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
                 if option == "7":
-                    motive = "Contacto con Christian"
-                    notify_text = (
-                        "🔔 *Vicky Bot – Solicitud de contacto*
+    motive = "Contacto con Christian"
+    notify_text = (
+        "🔔 *Vicky Bot – Solicitud de contacto*
 "
-                        f"- Nombre: {profile_name or 'No disponible'}
+        f"- Nombre: {profile_name or 'No disponible'}
 "
-                        f"- WhatsApp del cliente: {sender}
+        f"- WhatsApp del cliente: {sender}
 "
-                        f"- Motivo: {motive}
+        f"- Motivo: {motive}
 "
-                        f"- Mensaje original: \"{text.strip()}\""
-                    )
-                    try:
-                        if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender:
-                            send_message(ADVISOR_WHATSAPP, notify_text)
-                            logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_WHATSAPP}")
-                    except Exception as e:
-                        logging.error(f"❌ Error notificando al asesor: {e}")
-                    continue
+        f"- Mensaje original: \"{text.strip()}\""
+    )
+    try:
+        if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender:
+            send_message(ADVISOR_WHATSAPP, notify_text)
+            logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_WHATSAPP}")
+    except Exception as e:
+        logging.error(f"❌ Error notificando al asesor: {e}")
+    continue
 
             # Saludos/menú
             first_greet_ts = GREETED_USERS.get(sender)
