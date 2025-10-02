@@ -7,6 +7,22 @@ from dotenv import load_dotenv
 # Cargar variables de entorno
 load_dotenv()
 
+# --- Utilidades Google Drive ---
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+def _drive_service():
+    creds = Credentials.from_service_account_info(json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")))
+    return build("drive", "v3", credentials=creds)
+
+def save_file_to_drive(local_path, filename, folder_id):
+    service = _drive_service()
+    file_metadata = {"name": filename, "parents": [folder_id]}
+    media = MediaFileUpload(local_path, resumable=True)
+    uploaded = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    return uploaded.get("id")
+
+
 # Configuración de logging
 logging.basicConfig(level=logging.INFO)
 
@@ -19,7 +35,6 @@ WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación privada al asesor
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ GPT (opcional)
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")  # ✅ Carpeta raíz en Drive para guardar archivos
 
 # 🧠 Controles en memoria
 PROCESSED_MESSAGE_IDS = set()
@@ -189,75 +204,6 @@ def transcribe_audio_media(media_id: str) -> str | None:
     """
     if not OPENAI_API_KEY:
         return None
-
-# === Drive utils ===
-
-def _get_media_info(media_id: str) -> dict | None:
-    try:
-        resp = requests.get(
-            f"https://graph.facebook.com/v21.0/{media_id}",
-            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        logging.warning(f"[WA media info] {resp.status_code}: {resp.text[:180]}")
-    except Exception as e:
-        logging.error(f"[WA media info] error: {e}")
-    return None
-
-def _drive_service():
-    try:
-        import json
-        from google.oauth2.service_account import Credentials
-        from googleapiclient.discovery import build
-        creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-        if not creds_json:
-            return None
-        info = json.loads(creds_json)
-        scopes = ["https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        return build("drive", "v3", credentials=creds)
-    except Exception as e:
-        logging.error(f"[Drive init] {e}")
-        return None
-
-def save_file_to_drive(filename: str, blob: bytes, mime_type: str, customer_name: str | None, phone: str | None) -> bool:
-    try:
-        from googleapiclient.http import MediaIoBaseUpload
-        import io
-        service = _drive_service()
-        if not service:
-            logging.warning("[Drive] Servicio no disponible (sin credenciales).")
-            return False
-        base_folder = os.getenv("DRIVE_FOLDER_ID") or ""
-        if not base_folder:
-            logging.warning("[Drive] Falta DRIVE_FOLDER_ID en variables de entorno.")
-            return False
-        name = (customer_name or "Cliente").strip() or "Cliente"
-        phone_str = (phone or "").strip()
-        last4 = "".join([c for c in phone_str if c.isdigit()])[-4:]
-        folder_name = f"{name.replace(' ', '_')}_{last4 or '0000'}"
-
-        q = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and '{base_folder}' in parents and trashed=false"
-        res = service.files().list(q=q, fields="files(id)").execute()
-        items = res.get("files", [])
-        if items:
-            folder_id = items[0]["id"]
-        else:
-            meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [base_folder]}
-            folder = service.files().create(body=meta, fields="id").execute()
-            folder_id = folder.get("id")
-
-        media = MediaIoBaseUpload(io.BytesIO(blob), mimetype=mime_type or "application/octet-stream", resumable=True)
-        meta_file = {"name": filename or "archivo.bin", "parents": [folder_id]}
-        service.files().create(body=meta_file, media_body=media, fields="id").execute()
-        logging.info(f"[Drive] Archivo guardado en carpeta {folder_name}")
-        return True
-    except Exception as e:
-        logging.error(f"[Drive save] {e}")
-        return False
-# === End Drive utils ===
     url = _get_media_url(media_id)
     if not url:
         return None
@@ -424,17 +370,7 @@ def receive_message():
                         )
                 except Exception as e:
                     logging.error(f"❌ Error reenviando imagen: {e}")
-                # Guardado en Drive
-                try:
-                    info = _get_media_info(media_id) if media_id else None
-                    url = info.get("url") if info else None
-                    mime = info.get("mime_type") if info else "image/jpeg"
-                    blob = _download_media_bytes(url) if url else None
-                    if blob:
-                        ts_name = "imagen.jpg"
-                        save_file_to_drive(ts_name, blob, mime, profile_name, sender)
-                except Exception as e:
-                    logging.error(f"[Drive image] error: {e}")
+
                 send_message(sender, "✅ ¡Gracias! Recibí la imagen. Si es para **seguro de auto**, con INE y tarjeta de circulación (o placa) ya puedo cotizar. ¿Deseas que avance?")
                 continue
 
@@ -450,18 +386,7 @@ def receive_message():
                         )
                 except Exception as e:
                     logging.error(f"❌ Error reenviando documento: {e}")
-                # Guardado en Drive
-                try:
-                    info = _get_media_info(media_id) if media_id else None
-                    url = info.get("url") if info else None
-                    mime = info.get("mime_type") if info else None
-                    blob = _download_media_bytes(url) if url else None
-                    if not mime:
-                        mime = "application/pdf" if (filename or "").lower().endswith(".pdf") else "application/octet-stream"
-                    if blob:
-                        save_file_to_drive(filename or "documento.bin", blob, mime, profile_name, sender)
-                except Exception as e:
-                    logging.error(f"[Drive document] error: {e}")
+
                 send_message(sender, "✅ ¡Gracias! Recibí tu documento. En breve lo reviso.")
                 continue
 
@@ -527,21 +452,25 @@ def receive_message():
                 if option == "6":
                     USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
                 if option == "7":
-                    motive = LAST_INTENT.get(sender, {}).get("title") or "No especificado"
-                    notify_text = (
-                        "🔔 *Vicky Bot – Solicitud de contacto*\n"
-                        f"- Nombre: {profile_name or 'No disponible'}\n"
-                        f"- WhatsApp del cliente: {sender}\n"
-                        f"- Motivo: {motive}\n"
-                        f"- Mensaje original: \"{text.strip()}\""
-                    )
-                    try:
-                        if ADVISOR_NUMBER and ADVISOR_NUMBER != sender:
-                            send_message(ADVISOR_NUMBER, notify_text)
-                            logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_NUMBER}")
-                    except Exception as e:
-                        logging.error(f"❌ Error notificando al asesor: {e}")
-                continue
+    motive = "Contacto con Christian"
+    notify_text = (
+        "🔔 *Vicky Bot – Solicitud de contacto*
+"
+        f"- Nombre: {profile_name or 'No disponible'}
+"
+        f"- WhatsApp del cliente: {sender}
+"
+        f"- Motivo: {motive}
+"
+        f"- Mensaje original: \"{text.strip()}\""
+    )
+    try:
+        if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender:
+            send_message(ADVISOR_WHATSAPP, notify_text)
+            logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_WHATSAPP}")
+    except Exception as e:
+        logging.error(f"❌ Error notificando al asesor: {e}")
+    continue
 
             # Saludos/menú
             first_greet_ts = GREETED_USERS.get(sender)
@@ -927,95 +856,95 @@ except NameError:
         return render_template_string(html)
 
 
-    @app.route("/ext/send-promo", methods=["POST"])
+    
+@app.route("/ext/send-promo", methods=["POST"])
 def vx_ext_send_promo():
-    """
-    Envía PROMO por WhatsApp.
-    Body JSON:
-    {
-      "to": "5216682478005" | ["5216...","5218..."],
-      "text": "mensaje libre",                  # opcional
-      "template": "promo_auto_v1",              # opcional (string)
-      "params": { "nombre": "X", "oferta": "Y"},# opcional (dict)
-      "secom": true,                            # opcional: tomar de SECOM
-      "producto": "auto"                        # opcional: filtro en SECOM
-    }
-    """
-    import threading, logging
-
-    data = request.get_json(force=True, silent=True) or {}
+    data = request.get_json(force=True)
     to = data.get("to")
     text = data.get("text")
     template = data.get("template")
-    params = data.get("params", {})
-    use_secom = bool(data.get("secom"))
-    producto = (data.get("producto") or "").strip().lower()
+    use_secom = data.get("secom", False)
+    producto = data.get("producto", "")
 
-    # Normalizar destino(s) sin bloquear request
-    if isinstance(to, str):
-        raw_targets = [to]
-    elif isinstance(to, list):
-        raw_targets = [str(x) for x in to if str(x).strip()]
-    else:
-        raw_targets = []
-
-    def _worker(initial_targets, text, template, params, use_secom, producto):
-        results = []
-        targets = list(initial_targets or [])
-
-        # Carga SECOM dentro del thread
-        if use_secom:
-            try:
-                import json, gspread, re
-                from google.oauth2.service_account import Credentials
-                gj = os.getenv("GOOGLE_CREDENTIALS_JSON")
-                sid = os.getenv("SHEETS_ID_LEADS")
-                title = os.getenv("SHEETS_TITLE_LEADS")
-                if gj and sid and title and producto:
-                    info = json.loads(gj)
-                    creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
-                    client = gspread.authorize(creds)
-                    ws = client.open_by_key(sid).worksheet(title)
-                    rows = ws.get_all_records()
-                    seen = set(targets)
-                    for row in rows:
-                        prod = str(row.get("PRODUCTO", "")).strip().lower()
-                        wa = str(row.get("WhatsApp", "")).strip()
-                        if not wa:
-                            continue
-                        digits = re.sub(r"[^\d]", "", wa)
-                        last10 = re.sub(r"^(52|521)", "", digits)[-10:]
-                        if not last10:
-                            continue
-                        e164 = f"521{last10}"
-                        if prod == producto and e164 not in seen:
-                            seen.add(e164)
-                            targets.append(e164)
-            except Exception as e:
-                logging.getLogger("vx").error(f"/ext/send-promo SECOM error: {e}")
-
-        # Envío
-        for num in targets:
-            ok = False
-            try:
+    def _task():
+        try:
+            targets = []
+            if to:
+                targets.append(to)
+            if use_secom:
+                try:
+                    creds = Credentials.from_service_account_info(json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")))
+                    gs = gspread.authorize(creds)
+                    sh = gs.open_by_key(os.getenv("SHEETS_ID_LEADS"))
+                    ws = sh.worksheet(os.getenv("SHEETS_TITLE_LEADS"))
+                    numbers = [str(r[0]) for r in ws.get_all_values()[1:]]
+                    targets.extend(list(set(numbers)))
+                except Exception as e:
+                    logging.error(f"Error leyendo SECOM en send-promo: {e}")
+            for target in targets:
                 if template:
-                    comps = []
-                    if params:
-                        comps = [{
-                            "type": "body",
-                            "parameters": [{"type": "text", "text": str(v)} for v in params.values()]
-                        }]
-                    ok = vx_wa_send_template(num, template, "es_MX", comps)
-                elif text:
-                    ok = vx_wa_send_text(num, text)
-                results.append({"to": num, "sent": ok})
-            except Exception as e:
-                logging.getLogger("vx").error(f"send_promo worker error: {e}")
-                results.append({"to": num, "sent": False, "error": str(e)})
-        logging.getLogger("vx").info(f"send_promo done: {results}")
+                    send_template_message(target, template)
+                else:
+                    send_message(target, text)
+        except Exception as e:
+            logging.error(f"❌ Error en envío promo: {e}")
 
-    threading.Thread(target=_worker, args=(raw_targets, text, template, params, use_secom, producto), daemon=True).start()
-    return jsonify({"accepted": True, "count": len(raw_targets)}), 202
+    threading.Thread(target=_task).start()
+    return jsonify({"ok": True})
+
+
+):
+        """
+        Envía PROMO por WhatsApp.
+        Body JSON:
+        {
+          "to": "5216682478005" | ["5216...","5218..."],
+          "text": "mensaje libre",                  # opcional
+          "template": "promo_auto_v1",              # opcional (string)
+          "params": { "nombre": "X", "oferta": "Y"} # opcional (dict)
+        }
+        """
+        import threading, logging
+
+        data = request.get_json(force=True, silent=True) or {}
+        to = data.get("to")
+        text = data.get("text")
+        template = data.get("template")
+        params = data.get("params", {})
+
+        if isinstance(to, str):
+            targets = [to]
+        elif isinstance(to, list):
+            targets = [str(x) for x in to if str(x).strip()]
+        else:
+            return jsonify({"ok": False, "error": "Falta 'to' (string o lista)"}), 400
+
+        def _worker(targets, text, template, params):
+            results = []
+            for num in targets:
+                ok = False
+                try:
+                    if template:
+                        comps = []
+                        if params:
+                            comps = [{
+                                "type": "body",
+                                "parameters": [
+                                    {"type": "text", "text": str(v)}
+                                    for v in params.values()
+                                ]
+                            }]
+                        ok = vx_wa_send_template(num, template, "es_MX", comps)
+                    elif text:
+                        ok = vx_wa_send_text(num, text)
+                    results.append({"to": num, "sent": ok})
+                except Exception as e:
+                    logging.getLogger("vx").error(f"send_promo worker error: {e}")
+                    results.append({"to": num, "sent": False, "error": str(e)})
+            logging.getLogger("vx").info(f"send_promo done: {results}")
+
+        threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
+        return jsonify({"accepted": True, "count": len(targets)}), 202
 
 
 # ========= SECOM minimal integration (non-invasive) =========
