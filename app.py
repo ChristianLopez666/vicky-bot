@@ -3,16 +3,6 @@ import logging
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from datetime import datetime
-import json
-import base64
-import mimetypes
-import io
-import pytz
-from google.oauth2.service_account import Credentials
-import gspread
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 # Cargar variables de entorno
 load_dotenv()
@@ -28,31 +18,7 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación privada al asesor
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# === Google Drive/Sheets env & setup ===
-GOOGLE_CREDENTIALS_JSON_RAW = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-SHEETS_ID_REQUESTS = os.getenv("SHEETS_ID_REQUESTS")
-SHEETS_TITLE_REQUESTS = "Solicitudes Vicky"
-tz = pytz.timezone("America/Mazatlan")
-
-drive_service = None
-sheet_requests = None
-try:
-    if GOOGLE_CREDENTIALS_JSON_RAW and DRIVE_FOLDER_ID and SHEETS_ID_REQUESTS:
-        info = json.loads(GOOGLE_CREDENTIALS_JSON_RAW)
-        scopes = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        drive_service = build("drive", "v3", credentials=creds)
-        gclient = gspread.authorize(creds)
-        sheet_requests = gclient.open_by_key(SHEETS_ID_REQUESTS).worksheet(SHEETS_TITLE_REQUESTS)
-    else:
-        logging.warning("Google env incompleto: revisa GOOGLE_CREDENTIALS_JSON, DRIVE_FOLDER_ID, SHEETS_ID_REQUESTS")
-except Exception as e:
-    logging.error(f"Error inicializando Google APIs: {e}")
-# === fin setup Google ===
-  # ✅ GPT (opcional)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ GPT (opcional)
 
 # 🧠 Controles en memoria
 PROCESSED_MESSAGE_IDS = set()
@@ -245,61 +211,6 @@ def transcribe_audio_media(media_id: str) -> str | None:
     return None
 # === FIN BLOQUE 1 ===
 
-# === Helpers Drive/Sheets ===
-def _vx_clean_name(name: str) -> str:
-    try:
-        import re as _re
-        return _re.sub(r"[^A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ]+", "_", name or "").strip("_")
-    except Exception:
-        return "SinNombre"
-
-def _vx_folder_name(name: str, number: str) -> str:
-    import re as _re
-    digits = _re.sub(r"\D", "", str(number or ""))
-    last4 = digits[-4:] if len(digits) >= 4 else (digits or "0000")
-    tokens = [t for t in _re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", name or "")]
-    if len(tokens) >= 2:
-        base = f"{tokens[-1]}_{tokens[0]}"
-    else:
-        base = _vx_clean_name(name or "SinNombre")
-    return f"{_vx_clean_name(base)}_{last4}"
-
-def get_client_folder(name: str, number: str) -> str | None:
-    if not drive_service or not DRIVE_FOLDER_ID:
-        logging.warning("Drive no inicializado o falta DRIVE_FOLDER_ID")
-        return None
-    try:
-        folder_name = _vx_folder_name(name, number)
-        query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false and '{DRIVE_FOLDER_ID}' in parents"
-        res = drive_service.files().list(q=query, spaces='drive', fields="files(id, name)").execute()
-        if res.get('files'):
-            return res['files'][0]['id']
-        file_metadata = {
-            "name": folder_name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [DRIVE_FOLDER_ID]
-        }
-        f = drive_service.files().create(body=file_metadata, fields="id").execute()
-        return f.get("id")
-    except Exception as e:
-        logging.error(f"get_client_folder error: {e}")
-        return None
-
-def upload_to_drive(folder_id: str, file_name: str, mime_type: str, content_bytes: bytes) -> str | None:
-    if not drive_service or not folder_id:
-        logging.warning("Drive no inicializado o falta folder_id")
-        return None
-    try:
-        media = MediaIoBaseUpload(io.BytesIO(content_bytes), mimetype=mime_type, resumable=False)
-        file_metadata = {"name": file_name, "parents": [folder_id]}
-        f = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-        return f.get("id")
-    except Exception as e:
-        logging.error(f"upload_to_drive error: {e}")
-        return None
-# === fin helpers Drive/Sheets ===
-
-
 # Endpoint de verificación
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -450,27 +361,6 @@ def receive_message():
             if msg_type == "document":
                 media_id = (message.get("document") or {}).get("id")
                 filename = (message.get("document") or {}).get("filename", "")
-                mime_type = (message.get("document") or {}).get("mime_type") or (mimetypes.guess_type(filename)[0] if filename else "application/octet-stream")
-
-                # 1) Descargar bytes desde WhatsApp
-                file_bytes = None
-                try:
-                    file_url = _get_media_url(media_id) if media_id else None
-                    if file_url:
-                        file_bytes = _download_media_bytes(file_url)
-                except Exception as e:
-                    logging.error(f"❌ Error descargando documento: {e}")
-
-                # 2) Subir a Drive en carpeta por cliente
-                try:
-                    if file_bytes and DRIVE_FOLDER_ID:
-                        folder_id = get_client_folder(profile_name or "SinNombre", sender)
-                        if folder_id:
-                            upload_to_drive(folder_id, filename or "archivo.bin", mime_type, file_bytes)
-                except Exception as e:
-                    logging.error(f"❌ Error subiendo a Drive: {e}")
-
-                # 3) Reenviar al asesor (usamos el mismo media_id para evitar re-subida)
                 try:
                     if ADVISOR_NUMBER and ADVISOR_NUMBER != sender and media_id:
                         send_media_document(
@@ -479,23 +369,9 @@ def receive_message():
                             caption=f"📄 Documento recibido de {profile_name or sender} {f'({filename})' if filename else ''}"
                         )
                 except Exception as e:
-                    logging.error(f"❌ Error reenviando documento al asesor: {e}")
+                    logging.error(f"❌ Error reenviando documento: {e}")
 
-                # 4) Confirmación al cliente
-                try:
-                    send_message(sender, "✅ Recibí tu documento y ya fue enviado a Christian. ¡Gracias!")
-                except Exception as e:
-                    logging.error(f"❌ Error confirmando al cliente: {e}")
-
-                # 5) Registrar en Google Sheets
-                try:
-                    if sheet_requests is not None:
-                        now_ts = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-                        sheet_requests.append_row([profile_name or "", sender or "", "Archivo recibido", now_ts, "Pendiente"])
-                except Exception as e:
-                    logging.error(f"❌ Error registrando en Sheets: {e}")
-            continue
-
+                send_message(sender, "✅ ¡Gracias! Recibí tu documento. En breve lo reviso.")
                 continue
 
             if msg_type == "audio" or (msg_type == "voice"):
@@ -848,7 +724,7 @@ except NameError:
 
 
 
-@app.route("/ext/send-promo", methods=["POST"])
+@_ext_bp.route("/send-promo", methods=["POST"])
 def vx_ext_send_promo():
     import threading, logging
     data = request.get_json(force=True, silent=True) or {}
