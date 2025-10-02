@@ -836,104 +836,82 @@ except NameError:
         return render_template_string(html)
 
 
-    @app.route("/ext/send-promo", methods=["POST"])
-    def vx_ext_send_promo():
-        """
-        Envía PROMO por WhatsApp.
-        Body JSON:
-        {
-          "to": "5216682478005" | ["5216...","5218..."],
-          "text": "mensaje libre",                  # opcional
-          "template": "promo_auto_v1",              # opcional (string)
-          "params": { "nombre": "X", "oferta": "Y"} # opcional (dict)
-        }
-        """
-        import threading, logging
+@app.route("/ext/send-promo", methods=["POST"])
+def vx_ext_send_promo():
+    """
+    Envía PROMO por WhatsApp.
+    Puede recibir:
+      - {"to": "521...", "text": "mensaje"}
+      - {"to": ["521...","521..."], "template": "promo_x", "params": {...}}
+      - {"secom": true, "producto": "auto", "text": "..."}
+    """
+    import json, gspread, re
+    from google.oauth2.service_account import Credentials
 
-        data = request.get_json(force=True, silent=True) or {}
-        to = data.get("to")
-        text = data.get("text")
-        template = data.get("template")
-        params = data.get("params", {})
+    data = request.get_json(force=True, silent=True) or {}
+    to = data.get("to")
+    text = data.get("text")
+    template = data.get("template")
+    params = data.get("params", {})
+    use_secom = bool(data.get("secom"))
+    producto = (data.get("producto") or "").strip().lower()
 
-        
-        use_secom = bool(data.get("secom"))
-        producto = (data.get("producto") or "").strip().lower()
-if use_secom:
-    # 🔎 Leer SECOM y filtrar por PRODUCTO
-    try:
-        import json as _json
-        import gspread
-        from google.oauth2.service_account import Credentials
-        from logging import getLogger
-        gj = os.getenv("GOOGLE_CREDENTIALS_JSON")
-        sid = os.getenv("SHEETS_ID_LEADS")
-        title = os.getenv("SHEETS_TITLE_LEADS")
-        if not (gj and sid and title and producto):
-            return jsonify({"ok": False, "error": "Faltan variables de entorno o 'producto'"}), 400
-        info = _json.loads(gj)
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        client = gspread.authorize(creds)
-        ws = client.open_by_key(sid).worksheet(title)
-        rows = ws.get_all_records()
-        seen = set()
-        import re as _re
-        for row in rows:
-            prod = str(row.get("PRODUCTO", "")).strip().lower()
-            wa = str(row.get("WhatsApp", "")).strip()
-            if not wa:
-                continue
-            # normalizar a E.164 MX
+    targets = []
+
+    if use_secom:
+        try:
+            gj = os.getenv("GOOGLE_CREDENTIALS_JSON")
+            sid = os.getenv("SHEETS_ID_LEADS")
+            title = os.getenv("SHEETS_TITLE_LEADS")
+            if gj and sid and title and producto:
+                info = json.loads(gj)
+                scopes = [
+                    "https://www.googleapis.com/auth/spreadsheets.readonly",
+                    "https://www.googleapis.com/auth/drive.readonly",
+                ]
+                creds = Credentials.from_service_account_info(info, scopes=scopes)
+                client = gspread.authorize(creds)
+                ws = client.open_by_key(sid).worksheet(title)
+                rows = ws.get_all_records()
+                seen = set()
+                for row in rows:
+                    prod = str(row.get("PRODUCTO", "")).strip().lower()
+                    wa = str(row.get("WhatsApp", "")).strip()
+                    if not wa:
+                        continue
+                    last10 = re.sub(r"\D", "", wa)[-10:]
+                    if not last10:
+                        continue
+                    e164 = f"521{last10}"
+                    if prod == producto and e164 not in seen:
+                        seen.add(e164)
+                        targets.append(e164)
+        except Exception as e:
+            logging.error(f"/ext/send-promo SECOM error: {e}")
+
+    elif isinstance(to, str):
+        targets = [to]
+    elif isinstance(to, list):
+        targets = [str(x) for x in to if str(x).strip()]
+
+    if not targets:
+        return jsonify({"ok": False, "error": "No se encontraron destinatarios"}), 400
+
+    def _worker(nums, text, template, params):
+        results = []
+        for num in nums:
+            ok = False
             try:
-                last10 = vx_last10(wa) if 'vx_last10' in globals() else _re.sub(r"[^\d]", "", wa)[-10:]
-            except Exception:
-                last10 = _re.sub(r"[^\d]", "", wa)[-10:]
-            if not last10:
-                continue
-            e164 = f"521{last10}"
-            if prod == producto and e164 not in seen:
-                seen.add(e164)
-                targets.append(e164)
-    except Exception as e:
-        getLogger("vx").error(f"/ext/send-promo SECOM error: {e}")
-elif isinstance(to, str):
-    targets = [to]
-elif isinstance(to, list):
-    targets = [str(x) for x in to if str(x).strip()]
-else:
-    return jsonify({"ok": False, "error": "Falta 'to' (string o lista)"}), 400
+                if text:
+                    ok = send_message(num, text)
+                results.append({"to": num, "sent": ok})
+            except Exception as e:
+                results.append({"to": num, "sent": False, "error": str(e)})
+        logging.info(f"Promo results: {results}")
 
+    threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
+    return jsonify({"accepted": True, "count": len(targets)}), 202
 
-        def _worker(targets, text, template, params):
-            results = []
-            for num in targets:
-                ok = False
-                try:
-                    if template:
-                        comps = []
-                        if params:
-                            comps = [{
-                                "type": "body",
-                                "parameters": [
-                                    {"type": "text", "text": str(v)}
-                                    for v in params.values()
-                                ]
-                            }]
-                        ok = vx_wa_send_template(num, template, "es_MX", comps)
-                    elif text:
-                        ok = vx_wa_send_text(num, text)
-                    results.append({"to": num, "sent": ok})
-                except Exception as e:
-                    logging.getLogger("vx").error(f"send_promo worker error: {e}")
-                    results.append({"to": num, "sent": False, "error": str(e)})
-            logging.getLogger("vx").info(f"send_promo done: {results}")
-
-        threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
-        return jsonify({"accepted": True, "count": len(targets)}), 202
 
 
 # ========= SECOM minimal integration (non-invasive) =========
