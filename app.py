@@ -17,7 +17,7 @@ app = Flask(__name__)
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación privada al asesor
+ADVISOR_WHATSAPP = os.getenv("ADVISOR_WHATSAPP", "5216682478005")  # Notificación privada al asesor
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ GPT (opcional)
 
 # 🧠 Controles en memoria
@@ -346,9 +346,9 @@ def receive_message():
                 media_id = (message.get("image") or {}).get("id")
                 caption = (message.get("image") or {}).get("caption", "") or ""
                 try:
-                    if ADVISOR_NUMBER and ADVISOR_NUMBER != sender and media_id:
+                    if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender and media_id:
                         send_media_image(
-                            ADVISOR_NUMBER,
+                            ADVISOR_WHATSAPP,
                             media_id,
                             caption=f"📎 Imagen recibida de {profile_name or sender}. {('Nota: ' + caption) if caption else ''}"
                         )
@@ -362,9 +362,9 @@ def receive_message():
                 media_id = (message.get("document") or {}).get("id")
                 filename = (message.get("document") or {}).get("filename", "")
                 try:
-                    if ADVISOR_NUMBER and ADVISOR_NUMBER != sender and media_id:
+                    if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender and media_id:
                         send_media_document(
-                            ADVISOR_NUMBER,
+                            ADVISOR_WHATSAPP,
                             media_id,
                             caption=f"📄 Documento recibido de {profile_name or sender} {f'({filename})' if filename else ''}"
                         )
@@ -447,7 +447,7 @@ def receive_message():
                     try:
                         if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender:
                             send_message(ADVISOR_WHATSAPP, notify_text)
-                            logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_NUMBER}")
+                            logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_WHATSAPP}")
                     except Exception as e:
                         logging.error(f"❌ Error notificando al asesor: {e}")
                 continue
