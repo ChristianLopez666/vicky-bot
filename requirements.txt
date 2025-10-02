@@ -10,3 +10,4 @@ google-auth-httplib2==0.2.0
 httpx==0.28.1
 pydantic==2.11.9
 redis==4.6.0
+google-api-python-client==2.137.0
