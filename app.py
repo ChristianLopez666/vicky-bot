@@ -19,6 +19,7 @@ WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación privada al asesor
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ GPT (opcional)
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")  # ✅ Carpeta raíz en Drive para guardar archivos
 
 # 🧠 Controles en memoria
 PROCESSED_MESSAGE_IDS = set()
@@ -188,6 +189,75 @@ def transcribe_audio_media(media_id: str) -> str | None:
     """
     if not OPENAI_API_KEY:
         return None
+
+# === Drive utils ===
+
+def _get_media_info(media_id: str) -> dict | None:
+    try:
+        resp = requests.get(
+            f"https://graph.facebook.com/v21.0/{media_id}",
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        logging.warning(f"[WA media info] {resp.status_code}: {resp.text[:180]}")
+    except Exception as e:
+        logging.error(f"[WA media info] error: {e}")
+    return None
+
+def _drive_service():
+    try:
+        import json
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+        creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        if not creds_json:
+            return None
+        info = json.loads(creds_json)
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        logging.error(f"[Drive init] {e}")
+        return None
+
+def save_file_to_drive(filename: str, blob: bytes, mime_type: str, customer_name: str | None, phone: str | None) -> bool:
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
+        service = _drive_service()
+        if not service:
+            logging.warning("[Drive] Servicio no disponible (sin credenciales).")
+            return False
+        base_folder = os.getenv("DRIVE_FOLDER_ID") or ""
+        if not base_folder:
+            logging.warning("[Drive] Falta DRIVE_FOLDER_ID en variables de entorno.")
+            return False
+        name = (customer_name or "Cliente").strip() or "Cliente"
+        phone_str = (phone or "").strip()
+        last4 = "".join([c for c in phone_str if c.isdigit()])[-4:]
+        folder_name = f"{name.replace(' ', '_')}_{last4 or '0000'}"
+
+        q = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and '{base_folder}' in parents and trashed=false"
+        res = service.files().list(q=q, fields="files(id)").execute()
+        items = res.get("files", [])
+        if items:
+            folder_id = items[0]["id"]
+        else:
+            meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [base_folder]}
+            folder = service.files().create(body=meta, fields="id").execute()
+            folder_id = folder.get("id")
+
+        media = MediaIoBaseUpload(io.BytesIO(blob), mimetype=mime_type or "application/octet-stream", resumable=True)
+        meta_file = {"name": filename or "archivo.bin", "parents": [folder_id]}
+        service.files().create(body=meta_file, media_body=media, fields="id").execute()
+        logging.info(f"[Drive] Archivo guardado en carpeta {folder_name}")
+        return True
+    except Exception as e:
+        logging.error(f"[Drive save] {e}")
+        return False
+# === End Drive utils ===
     url = _get_media_url(media_id)
     if not url:
         return None
@@ -354,7 +424,17 @@ def receive_message():
                         )
                 except Exception as e:
                     logging.error(f"❌ Error reenviando imagen: {e}")
-
+                # Guardado en Drive
+                try:
+                    info = _get_media_info(media_id) if media_id else None
+                    url = info.get("url") if info else None
+                    mime = info.get("mime_type") if info else "image/jpeg"
+                    blob = _download_media_bytes(url) if url else None
+                    if blob:
+                        ts_name = "imagen.jpg"
+                        save_file_to_drive(ts_name, blob, mime, profile_name, sender)
+                except Exception as e:
+                    logging.error(f"[Drive image] error: {e}")
                 send_message(sender, "✅ ¡Gracias! Recibí la imagen. Si es para **seguro de auto**, con INE y tarjeta de circulación (o placa) ya puedo cotizar. ¿Deseas que avance?")
                 continue
 
@@ -370,7 +450,18 @@ def receive_message():
                         )
                 except Exception as e:
                     logging.error(f"❌ Error reenviando documento: {e}")
-
+                # Guardado en Drive
+                try:
+                    info = _get_media_info(media_id) if media_id else None
+                    url = info.get("url") if info else None
+                    mime = info.get("mime_type") if info else None
+                    blob = _download_media_bytes(url) if url else None
+                    if not mime:
+                        mime = "application/pdf" if (filename or "").lower().endswith(".pdf") else "application/octet-stream"
+                    if blob:
+                        save_file_to_drive(filename or "documento.bin", blob, mime, profile_name, sender)
+                except Exception as e:
+                    logging.error(f"[Drive document] error: {e}")
                 send_message(sender, "✅ ¡Gracias! Recibí tu documento. En breve lo reviso.")
                 continue
 
@@ -418,7 +509,7 @@ def receive_message():
             # ---------- GPT primero para consultas naturales ----------
             is_numeric_option = text_norm in OPTION_RESPONSES
             is_menu = text_norm in ("hola", "menú", "menu")
-            is_natural_query = (not is_numeric_option) and (not is_menu)
+            is_natural_query = (not is_numeric_option) and (not is_menu) and any(ch.isalpha() for ch in text_norm) and (len(text_norm.split()) >= 3)
 
             if is_natural_query:
                 ai = gpt_reply(text)
@@ -500,3 +591,502 @@ def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+# >>> VX: CONFIG & UTILS (NO TOCAR)
+try:
+    vx_get_env
+except NameError:
+    def vx_get_env(name, default=None):
+        import os
+        return os.getenv(name, default)
+
+try:
+    vx_normalize_phone
+except NameError:
+    def vx_normalize_phone(raw):
+        import re
+        if not raw:
+            return ""
+        phone = re.sub(r"[^\d]", "", str(raw))
+        phone = re.sub(r"^(52|521)", "", phone)
+        return phone[-10:] if len(phone) >= 10 else phone
+
+try:
+    vx_last10
+except NameError:
+    def vx_last10(phone):
+        return vx_normalize_phone(phone)
+
+try:
+    vx_Settings
+except NameError:
+    class vx_Settings:
+        def __init__(self):
+            self.META_TOKEN = vx_get_env("META_TOKEN")
+            self.WABA_PHONE_ID = vx_get_env("WABA_PHONE_ID")
+            self.VERIFY_TOKEN = vx_get_env("VERIFY_TOKEN")
+            self.OPENAI_API_KEY = vx_get_env("OPENAI_API_KEY")
+            self.REDIS_URL = vx_get_env("REDIS_URL")
+            self.GOOGLE_CREDENTIALS_JSON = vx_get_env("GOOGLE_CREDENTIALS_JSON")
+            self.SHEETS_ID_LEADS = vx_get_env("SHEETS_ID_LEADS")
+            self.SHEETS_TITLE_LEADS = vx_get_env("SHEETS_TITLE_LEADS")
+            self.ADVISOR_WHATSAPP = vx_get_env("ADVISOR_WHATSAPP")
+
+# >>> VX: LOGGING (NO TOCAR)
+try:
+    vx_setup_logging
+except NameError:
+    def vx_setup_logging():
+        import logging
+        logger = logging.getLogger()
+        if not logger.hasHandlers():
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        return logging.getLogger("vx")
+
+# >>> VX: REDIS (NO TOCAR, OPCIONAL)
+try:
+    vx_get_redis
+except NameError:
+    def vx_get_redis():
+        try:
+            url = vx_get_env("REDIS_URL")
+            if not url:
+                return None
+            import redis
+            return redis.from_url(url)
+        except Exception:
+            return None
+
+# >>> VX: WHATSAPP CLIENT (NO TOCAR)
+try:
+    vx_wa_send_text
+except NameError:
+    def vx_wa_send_text(to_e164: str, body: str):
+        import requests, logging
+        token = vx_get_env("META_TOKEN")
+        phone_id = vx_get_env("WABA_PHONE_ID")
+        if not token or not phone_id or not to_e164:
+            logging.getLogger("vx").warning("vx_wa_send_text: falta config")
+            return False
+        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_e164,
+            "type": "text",
+            "text": {"body": body}
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=9)
+            logging.getLogger("vx").info(f"vx_wa_send_text: {resp.status_code} {resp.text[:160]}")
+            return resp.status_code == 200
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_wa_send_text error: {e}")
+            return False
+
+try:
+    vx_wa_mark_read
+except NameError:
+    def vx_wa_mark_read(message_id: str):
+        import requests, logging
+        token = vx_get_env("META_TOKEN")
+        phone_id = vx_get_env("WABA_PHONE_ID")
+        if not token or not phone_id or not message_id:
+            logging.getLogger("vx").warning("vx_wa_mark_read: falta config")
+            return False
+        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "messaging_product": "whatsapp",
+            "status": "read",
+            "message_id": message_id
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=9)
+            logging.getLogger("vx").info(f"vx_wa_mark_read: {resp.status_code} {resp.text[:120]}")
+            return resp.status_code == 200
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_wa_mark_read error: {e}")
+            return False
+
+
+try:
+    vx_wa_send_template
+except NameError:
+    def vx_wa_send_template(to_e164: str, template_name: str, lang_code: str = "es_MX", components: list | None = None):
+        import requests, logging
+        token = vx_get_env("META_TOKEN")
+        phone_id = vx_get_env("WABA_PHONE_ID")
+        if not token or not phone_id or not to_e164 or not template_name:
+            logging.getLogger("vx").warning("vx_wa_send_template: falta config/params")
+            return False
+        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_e164,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": lang_code},
+            }
+        }
+        if components:
+            payload["template"]["components"] = components
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=12)
+            logging.getLogger("vx").info(f"vx_wa_send_template: {resp.status_code} {resp.text[:160]}")
+            return resp.status_code == 200
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_wa_send_template error: {e}")
+            return False
+
+# >>> VX: GPT (NO TOCAR)
+try:
+    vx_gpt_reply
+except NameError:
+    def vx_gpt_reply(user_text: str, system_text: str = None) -> str:
+        import logging
+        api_key = vx_get_env("OPENAI_API_KEY")
+        if not api_key:
+            return "No tengo IA disponible en este momento. Por favor elige una opción del menú."
+        try:
+            import openai
+            client = openai.OpenAI(api_key=api_key)
+            system = system_text or (
+                "Eres Vicky, asistente de Christian López. Responde en español, breve, clara y orientada al siguiente paso."
+            )
+            completion = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_text},
+                ],
+                max_tokens=120,
+                temperature=0.2,
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_gpt_reply error: {e}")
+            return "No tengo IA disponible en este momento. Por favor elige una opción del menú."
+
+# >>> VX: SHEETS (NO TOCAR)
+try:
+    vx_sheet_find_by_phone
+except NameError:
+    def vx_sheet_find_by_phone(last10: str):
+        import logging
+        import json
+        try:
+            creds_json = vx_get_env("GOOGLE_CREDENTIALS_JSON")
+            sheets_id = vx_get_env("SHEETS_ID_LEADS")
+            sheets_title = vx_get_env("SHEETS_TITLE_LEADS")
+            if not creds_json or not sheets_id or not sheets_title or not last10:
+                return None
+            import gspread
+            from gspread import service_account_from_dict
+            creds_dict = json.loads(creds_json)
+            client = service_account_from_dict(creds_dict)
+            sheet = client.open_by_key(sheets_id)
+            ws = sheet.worksheet(sheets_title)
+            rows = ws.get_all_records()
+            for row in rows:
+                wa = str(row.get("WhatsApp", ""))
+                if vx_last10(wa) == last10:
+                    return row
+            return None
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_sheet_find_by_phone error: {e}")
+            return None
+
+# >>> VX: MENU BUILDER (NO TOCAR)
+try:
+    vx_menu_text
+except NameError:
+    def vx_menu_text(customer_name: str = None) -> str:
+        base = (
+            "Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n"
+            "1) Asesoría en pensiones IMSS\n"
+            "2) Seguro de auto (Amplia PLUS, Amplia, Limitada) — solicita INE y tarjeta de circulación o número de placa\n"
+            "3) Seguros de vida y salud\n"
+            "4) Tarjetas médicas VRIM\n"
+            "5) Préstamos a pensionados IMSS ($10,000 a $650,000)\n"
+            "6) Financiamiento empresarial (incluye financiamiento para tus clientes)\n"
+            "7) Nómina empresarial\n"
+            "8) Contactar con Christian (te notifico para que te atienda)\n\n"
+            "¿En qué te ayudo?"
+        )
+        if customer_name:
+            return f"Hola {customer_name}, " + base[5:]
+        return base
+
+# >>> VX: ROUTES /ext (NO TOCAR)
+try:
+    vx_ext_routes_registered
+except NameError:
+    vx_ext_routes_registered = True
+    from flask import request, jsonify
+
+    @app.get("/ext/health")
+    def vx_ext_health():
+        return jsonify({"status": "ok"})
+
+    @app.get("/ext/webhook")
+    def vx_ext_webhook_get():
+        import logging
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        verify_token = vx_get_env("VERIFY_TOKEN")
+        if mode == "subscribe" and token == verify_token:
+            logging.getLogger("vx").info("vx_ext_webhook: verificado OK")
+            return challenge or "OK", 200
+        else:
+            logging.getLogger("vx").warning("vx_ext_webhook: verificación fallida")
+            return "Verification failed", 403
+
+    @app.post("/ext/webhook")
+    def vx_ext_webhook_post():
+        import logging, json
+        try:
+            payload = request.get_json(force=True, silent=True)
+            if not payload:
+                return jsonify({"status": "ignored"}), 200
+            entry = payload.get("entry", [{}])[0]
+            changes = entry.get("changes", [{}])
+            if not changes or "value" not in changes[0]:
+                return jsonify({"status": "ignored"}), 200
+            value = changes[0]["value"]
+            msgs = value.get("messages", [])
+            if not msgs:
+                return jsonify({"status": "ignored"}), 200
+            msg = msgs[0]
+            from_number = msg.get("from")
+            message_id = msg.get("id")
+            body = ""
+            if msg.get("type") == "text":
+                body = msg.get("text", {}).get("body", "") or ""
+            else:
+                body = ""
+            last10 = vx_last10(from_number)
+            customer = None
+            sheet_row = None
+            if last10:
+                sheet_row = vx_sheet_find_by_phone(last10)
+                if sheet_row and "Nombre" in sheet_row:
+                    customer = str(sheet_row["Nombre"])
+            menu_text = vx_menu_text(customer)
+            vx_wa_send_text(from_number, menu_text)
+            if message_id:
+                vx_wa_mark_read(message_id)
+            return jsonify({"status": "ok"}), 200
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_ext_webhook_post error: {e}")
+            return jsonify({"status": "ok"}), 200
+
+    @app.route("/ext/test-send", methods=["GET", "POST"])
+    def vx_ext_test_send():
+        import logging
+        try:
+            if request.method == "GET":
+                return jsonify({
+                    "status": "ready",
+                    "note": "Usa POST con {to, text} en JSON para enviar mensaje de prueba"
+                }), 200
+
+            data = request.get_json(force=True, silent=True)
+            if not data:
+                return jsonify({"ok": False, "error": "Falta JSON con 'to' y 'text'"}), 400
+
+            to = data.get("to")
+            text = data.get("text")
+            ok = vx_wa_send_text(to, text)
+            return jsonify({"ok": ok}), 200
+        except Exception as e:
+            logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
+            return jsonify({"ok": False, "error": str(e)}), 200
+
+    @app.route("/ext/test-send-form", methods=["GET", "POST"])
+    def vx_ext_test_send_form():
+        from flask import render_template_string, request
+        if request.method == "POST":
+            to = request.form.get("to")
+            text = request.form.get("text")
+            ok = vx_wa_send_text(to, text)
+            return f"<p>Mensaje enviado a {to}: {ok}</p><a href='/ext/test-send-form'>Volver</a>"
+        html = """
+        <h2>Prueba de envío WhatsApp</h2>
+        <form method='post'>
+            <label>Número (E.164, ej. 5216682478005):</label><br>
+            <input type='text' name='to' style='width:300px'><br><br>
+            <label>Mensaje:</label><br>
+            <textarea name='text' rows='4' cols='40'></textarea><br><br>
+            <button type='submit'>Enviar</button>
+        </form>
+        """
+        return render_template_string(html)
+
+
+    @app.route("/ext/send-promo", methods=["POST"])
+def vx_ext_send_promo():
+    """
+    Envía PROMO por WhatsApp.
+    Body JSON:
+    {
+      "to": "5216682478005" | ["5216...","5218..."],
+      "text": "mensaje libre",                  # opcional
+      "template": "promo_auto_v1",              # opcional (string)
+      "params": { "nombre": "X", "oferta": "Y"},# opcional (dict)
+      "secom": true,                            # opcional: tomar de SECOM
+      "producto": "auto"                        # opcional: filtro en SECOM
+    }
+    """
+    import threading, logging
+
+    data = request.get_json(force=True, silent=True) or {}
+    to = data.get("to")
+    text = data.get("text")
+    template = data.get("template")
+    params = data.get("params", {})
+    use_secom = bool(data.get("secom"))
+    producto = (data.get("producto") or "").strip().lower()
+
+    # Normalizar destino(s) sin bloquear request
+    if isinstance(to, str):
+        raw_targets = [to]
+    elif isinstance(to, list):
+        raw_targets = [str(x) for x in to if str(x).strip()]
+    else:
+        raw_targets = []
+
+    def _worker(initial_targets, text, template, params, use_secom, producto):
+        results = []
+        targets = list(initial_targets or [])
+
+        # Carga SECOM dentro del thread
+        if use_secom:
+            try:
+                import json, gspread, re
+                from google.oauth2.service_account import Credentials
+                gj = os.getenv("GOOGLE_CREDENTIALS_JSON")
+                sid = os.getenv("SHEETS_ID_LEADS")
+                title = os.getenv("SHEETS_TITLE_LEADS")
+                if gj and sid and title and producto:
+                    info = json.loads(gj)
+                    creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+                    client = gspread.authorize(creds)
+                    ws = client.open_by_key(sid).worksheet(title)
+                    rows = ws.get_all_records()
+                    seen = set(targets)
+                    for row in rows:
+                        prod = str(row.get("PRODUCTO", "")).strip().lower()
+                        wa = str(row.get("WhatsApp", "")).strip()
+                        if not wa:
+                            continue
+                        digits = re.sub(r"[^\d]", "", wa)
+                        last10 = re.sub(r"^(52|521)", "", digits)[-10:]
+                        if not last10:
+                            continue
+                        e164 = f"521{last10}"
+                        if prod == producto and e164 not in seen:
+                            seen.add(e164)
+                            targets.append(e164)
+            except Exception as e:
+                logging.getLogger("vx").error(f"/ext/send-promo SECOM error: {e}")
+
+        # Envío
+        for num in targets:
+            ok = False
+            try:
+                if template:
+                    comps = []
+                    if params:
+                        comps = [{
+                            "type": "body",
+                            "parameters": [{"type": "text", "text": str(v)} for v in params.values()]
+                        }]
+                    ok = vx_wa_send_template(num, template, "es_MX", comps)
+                elif text:
+                    ok = vx_wa_send_text(num, text)
+                results.append({"to": num, "sent": ok})
+            except Exception as e:
+                logging.getLogger("vx").error(f"send_promo worker error: {e}")
+                results.append({"to": num, "sent": False, "error": str(e)})
+        logging.getLogger("vx").info(f"send_promo done: {results}")
+
+    threading.Thread(target=_worker, args=(raw_targets, text, template, params, use_secom, producto), daemon=True).start()
+    return jsonify({"accepted": True, "count": len(raw_targets)}), 202
+
+
+# ========= SECOM minimal integration (non-invasive) =========
+try:
+    from flask import Blueprint, request, jsonify
+except Exception:
+    from flask import Blueprint, request, jsonify  # type: ignore
+
+def _vx_last10(phone: str) -> str:
+    try:
+        import re as _re
+        if not phone:
+            return ""
+        p = _re.sub(r"[^\d]", "", str(phone))
+        p = _re.sub(r"^(52|521)", "", p)
+        return p[-10:] if len(p) >= 10 else p
+    except Exception:
+        return str(phone)[-10:] if phone else ""
+
+def _vx_sheet_find_by_phone(last10: str):
+    import os, json, logging
+    try:
+        gj = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        sid = os.getenv("SHEETS_ID_LEADS")
+        title = os.getenv("SHEETS_TITLE_LEADS")
+        if not (gj and sid and title and last10):
+            return None, "Missing env vars or phone"
+        from google.oauth2.service_account import Credentials
+        import gspread
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
+        info = json.loads(gj)
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        client = gspread.authorize(creds)
+        ws = client.open_by_key(sid).worksheet(title)
+        rows = ws.get_all_records()
+        for row in rows:
+            wa = str(row.get("WhatsApp", ""))
+            if _vx_last10(wa) == last10:
+                return row, None
+        return None, None
+    except Exception as e:
+        logging.error(f"SECOM lookup error: {e}")
+        return None, str(e)
+
+_ext_bp = Blueprint("vx_ext", __name__)
+
+@_ext_bp.get("/test-secom")
+def vx_test_secom():
+    phone = request.args.get("phone", "").strip()
+    if not phone:
+        return jsonify({"ok": False, "error": "Debes enviar ?phone=NUMERO"}), 400
+    row, err = _vx_sheet_find_by_phone(_vx_last10(phone))
+    if err:
+        return jsonify({"ok": False, "error": err}), 500
+    if row:
+        return jsonify({
+            "ok": True,
+            "match": {
+                "nombre": row.get("Nombre", ""),
+                "whatsapp": row.get("WhatsApp", ""),
+                "rfc": row.get("RFC", ""),
+                "beneficio": "Hasta 60% de descuento en seguro de auto 🚗"
+            }
+        }), 200
+    return jsonify({"ok": False, "message": "No se encontró coincidencia"}), 200
+
+try:
+    app.register_blueprint(_ext_bp, url_prefix="/ext")  # type: ignore
+except Exception:
+    pass
+# ====== End SECOM minimal integration ======
