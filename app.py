@@ -856,14 +856,18 @@ except NameError:
           "template": "promo_auto_v1",              # opcional (string)
           "params": { "nombre": "X", "oferta": "Y"} # opcional (dict)
         }
-        """
-        import threading, logging
+           "params": { "nombre": "X", "oferta": "Y"}  # opcional (dict)
+}
+# <<< aquí terminaba el bloque de ejemplo >>>
 
-        data = request.get_json(force=True, silent=True) or {}
-        to = data.get("to")
-        text = data.get("text")
-        template = data.get("template")
-        params = data.get("params", {})
+import threading, logging
+
+data = request.get_json(force=True, silent=True) or {}
+to = data.get("to")
+text = data.get("text")
+template = data.get("template")
+params = data.get("params", {})
+
 
         if isinstance(to, str):
             targets = [to]
