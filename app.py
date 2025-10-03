@@ -1,3 +1,12 @@
+# ========================================================
+# app.py – Vicky Bot Fase 1 (Render / Flask / WhatsApp API)
+# Versión final corregida, integra:
+# 1. Notificación al asesor (opción 7)
+# 2. Gestión de archivos entrantes (imágenes, docs, audios, respaldo Drive)
+# 3. Integración mínima SECOM (matching + beneficio)
+# 4. Endpoint /ext/send-promo robusto (hilo segundo plano)
+# ========================================================
+
 import os 
 import logging
 import requests
@@ -6,6 +15,22 @@ from dotenv import load_dotenv
 
 # Cargar variables de entorno
 load_dotenv()
+
+# --- Utilidades Google Drive ---
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+def _drive_service():
+    creds = Credentials.from_service_account_info(json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")))
+    return build("drive", "v3", credentials=creds)
+
+def save_file_to_drive(local_path, filename, folder_id):
+    service = _drive_service()
+    file_metadata = {"name": filename, "parents": [folder_id]}
+    media = MediaFileUpload(local_path, resumable=True)
+    uploaded = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    return uploaded.get("id")
+
 
 # Configuración de logging
 logging.basicConfig(level=logging.INFO)
@@ -435,23 +460,18 @@ def receive_message():
                 LAST_INTENT[sender] = {"opt": option, "title": OPTION_TITLES.get(option), "ts": now}
                 if option == "6":
                     USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
-               # Línea 438
-if option == "7":
+                if option == "7":
     motive = "Contacto con Christian"
-    # Enviar notificación al asesor
-    send_whatsapp_message(
-        ADVISOR_NUMBER,
-        f"📩 Nuevo intento de contacto:\n\nCliente: {name}\nNúmero: {phone_number}\nMotivo: {motive}"
-    )
-    # Confirmar al cliente
-    send_whatsapp_message(
-        phone_number,
-        "✅ Gracias, Christian ya fue notificado y en breve te contactará personalmente."
-    )
-# Línea 445 (continúa el resto de tu lógica normal)
-
-- Mensaje original: "{text.strip()}" """
-
+    notify_text = (
+        "🔔 *Vicky Bot – Solicitud de contacto*
+"
+        f"- Nombre: {profile_name or 'No disponible'}
+"
+        f"- WhatsApp del cliente: {sender}
+"
+        f"- Motivo: {motive}
+"
+        f"- Mensaje original: \"{text.strip()}\""
     )
     try:
         if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender:
@@ -845,30 +865,61 @@ except NameError:
         return render_template_string(html)
 
 
-    @app.route("/ext/send-promo", methods=["POST"])
-    def vx_ext_send_promo():
-          "params": { "nombre": "X", "oferta": "Y"}  # opcional (dict)
-# <<< aquí terminaba el bloque de ejemplo >>>
+    
+@app.route("/ext/send-promo", methods=["POST"])
+def vx_ext_send_promo():
+    data = request.get_json(force=True)
+    to = data.get("to")
+    text = data.get("text")
+    template = data.get("template")
+    use_secom = data.get("secom", False)
+    producto = data.get("producto", "")
 
-import threading, logging
+    def _task():
+        try:
+            targets = []
+            if to:
+                targets.append(to)
+            if use_secom:
+                try:
+                    creds = Credentials.from_service_account_info(json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")))
+                    gs = gspread.authorize(creds)
+                    sh = gs.open_by_key(os.getenv("SHEETS_ID_LEADS"))
+                    ws = sh.worksheet(os.getenv("SHEETS_TITLE_LEADS"))
+                    numbers = [str(r[0]) for r in ws.get_all_values()[1:]]
+                    targets.extend(list(set(numbers)))
+                except Exception as e:
+                    logging.error(f"Error leyendo SECOM en send-promo: {e}")
+            for target in targets:
+                if template:
+                    send_template_message(target, template)
+                else:
+                    send_message(target, text)
+        except Exception as e:
+            logging.error(f"❌ Error en envío promo: {e}")
 
-data = request.get_json(force=True, silent=True) or {}
-to = data.get("to")
-text = data.get("text")
-template = data.get("template")
-params = data.get("params", {})
-)
-}
-# <<< aquí terminaba el bloque de ejemplo >>>
+    threading.Thread(target=_task).start()
+    return jsonify({"ok": True})
 
-import threading, logging
 
-data = request.get_json(force=True, silent=True) or {}
-to = data.get("to")
-text = data.get("text")
-template = data.get("template")
-params = data.get("params", {})
+):
+        """
+        Envía PROMO por WhatsApp.
+        Body JSON:
+        {
+          "to": "5216682478005" | ["5216...","5218..."],
+          "text": "mensaje libre",                  # opcional
+          "template": "promo_auto_v1",              # opcional (string)
+          "params": { "nombre": "X", "oferta": "Y"} # opcional (dict)
+        }
+        """
+        import threading, logging
 
+        data = request.get_json(force=True, silent=True) or {}
+        to = data.get("to")
+        text = data.get("text")
+        template = data.get("template")
+        params = data.get("params", {})
 
         if isinstance(to, str):
             targets = [to]
