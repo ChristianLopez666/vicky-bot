@@ -473,6 +473,7 @@ def receive_message():
 "
     f"- Mensaje original: \"{text.strip()}\""
 )}\""
+)}\""
     )
     try:
         if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender:
