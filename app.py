@@ -847,16 +847,17 @@ except NameError:
 
     @app.route("/ext/send-promo", methods=["POST"])
     def vx_ext_send_promo():
-        """
-        Envía PROMO por WhatsApp.
-        Body JSON:
-        {
-          "to": "5216682478005" | ["5216...","5218..."],
-          "text": "mensaje libre",                  # opcional
-          "template": "promo_auto_v1",              # opcional (string)
-          "params": { "nombre": "X", "oferta": "Y"} # opcional (dict)
-        }
-           "params": { "nombre": "X", "oferta": "Y"}  # opcional (dict)
+          "params": { "nombre": "X", "oferta": "Y"}  # opcional (dict)
+# <<< aquí terminaba el bloque de ejemplo >>>
+
+import threading, logging
+
+data = request.get_json(force=True, silent=True) or {}
+to = data.get("to")
+text = data.get("text")
+template = data.get("template")
+params = data.get("params", {})
+)
 }
 # <<< aquí terminaba el bloque de ejemplo >>>
 
