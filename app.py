@@ -438,15 +438,12 @@ def receive_message():
                 if option == "7":
     motive = "Contacto con Christian"
     notify_text = (
-        "🔔 *Vicky Bot – Solicitud de contacto*
-"
-        f"- Nombre: {profile_name or 'No disponible'}
-"
-        f"- WhatsApp del cliente: {sender}
-"
-        f"- Motivo: {motive}
-"
-        f"- Mensaje original: \"{text.strip()}\""
+    notify_text = f"""🔔 *Vicky Bot – Solicitud de contacto*
+- Nombre: {profile_name or 'No disponible'}
+- WhatsApp del cliente: {sender}
+- Motivo: {motive}
+- Mensaje original: "{text.strip()}" """
+
     )
     try:
         if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender:
