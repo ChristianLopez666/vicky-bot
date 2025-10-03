@@ -7,22 +7,6 @@ from dotenv import load_dotenv
 # Cargar variables de entorno
 load_dotenv()
 
-# --- Utilidades Google Drive ---
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-
-def _drive_service():
-    creds = Credentials.from_service_account_info(json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")))
-    return build("drive", "v3", credentials=creds)
-
-def save_file_to_drive(local_path, filename, folder_id):
-    service = _drive_service()
-    file_metadata = {"name": filename, "parents": [folder_id]}
-    media = MediaFileUpload(local_path, resumable=True)
-    uploaded = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-    return uploaded.get("id")
-
-
 # Configuración de logging
 logging.basicConfig(level=logging.INFO)
 
@@ -856,44 +840,8 @@ except NameError:
         return render_template_string(html)
 
 
-    
-@app.route("/ext/send-promo", methods=["POST"])
-def vx_ext_send_promo():
-    data = request.get_json(force=True)
-    to = data.get("to")
-    text = data.get("text")
-    template = data.get("template")
-    use_secom = data.get("secom", False)
-    producto = data.get("producto", "")
-
-    def _task():
-        try:
-            targets = []
-            if to:
-                targets.append(to)
-            if use_secom:
-                try:
-                    creds = Credentials.from_service_account_info(json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON")))
-                    gs = gspread.authorize(creds)
-                    sh = gs.open_by_key(os.getenv("SHEETS_ID_LEADS"))
-                    ws = sh.worksheet(os.getenv("SHEETS_TITLE_LEADS"))
-                    numbers = [str(r[0]) for r in ws.get_all_values()[1:]]
-                    targets.extend(list(set(numbers)))
-                except Exception as e:
-                    logging.error(f"Error leyendo SECOM en send-promo: {e}")
-            for target in targets:
-                if template:
-                    send_template_message(target, template)
-                else:
-                    send_message(target, text)
-        except Exception as e:
-            logging.error(f"❌ Error en envío promo: {e}")
-
-    threading.Thread(target=_task).start()
-    return jsonify({"ok": True})
-
-
-):
+    @app.route("/ext/send-promo", methods=["POST"])
+    def vx_ext_send_promo():
         """
         Envía PROMO por WhatsApp.
         Body JSON:
