@@ -435,13 +435,21 @@ def receive_message():
                 LAST_INTENT[sender] = {"opt": option, "title": OPTION_TITLES.get(option), "ts": now}
                 if option == "6":
                     USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
-                if option == "7":
+               # Línea 438
+if option == "7":
     motive = "Contacto con Christian"
-    notify_text = (
-    notify_text = f"""🔔 *Vicky Bot – Solicitud de contacto*
-- Nombre: {profile_name or 'No disponible'}
-- WhatsApp del cliente: {sender}
-- Motivo: {motive}
+    # Enviar notificación al asesor
+    send_whatsapp_message(
+        ADVISOR_NUMBER,
+        f"📩 Nuevo intento de contacto:\n\nCliente: {name}\nNúmero: {phone_number}\nMotivo: {motive}"
+    )
+    # Confirmar al cliente
+    send_whatsapp_message(
+        phone_number,
+        "✅ Gracias, Christian ya fue notificado y en breve te contactará personalmente."
+    )
+# Línea 445 (continúa el resto de tu lógica normal)
+
 - Mensaje original: "{text.strip()}" """
 
     )
