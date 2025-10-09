@@ -412,10 +412,9 @@ def handle_business_flow(phone_number, user_message):
             user_data[phone_number]["nombre_contacto"] = user_message.title()
             send_message(phone_number,
                 f"✅ Nombre registrado: {user_message.title()}\n\n"
-                "📞 ¿En qué número telefónico podemos contactarte?\n\n"
-                "💡 Puedes proporcionar el mismo número de WhatsApp o uno diferente"
+                "🏙️ ¿En qué ciudad se encuentra tu empresa?"
             )
-            user_state[phone_number] = "esperando_telefono_empresarial"
+            user_state[phone_number] = "esperando_ciudad_empresarial"
         else:
             send_message(phone_number,
                 "Por favor ingresa un nombre válido (solo letras y espacios):\n\n"
@@ -423,23 +422,7 @@ def handle_business_flow(phone_number, user_message):
             )
         return True
 
-    # ✅ NUEVO PASO 6: Capturar teléfono de contacto
-    if user_state.get(phone_number) == "esperando_telefono_empresarial":
-        if is_valid_phone(user_message):
-            user_data[phone_number]["telefono_contacto"] = user_message
-            send_message(phone_number,
-                f"✅ Teléfono registrado: {user_message}\n\n"
-                "🏙️ ¿En qué ciudad se encuentra tu empresa?"
-            )
-            user_state[phone_number] = "esperando_ciudad_empresarial"
-        else:
-            send_message(phone_number,
-                "Por favor ingresa un número de teléfono válido (10 dígitos mínimo):\n\n"
-                "Ejemplo: 6681234567 o +526681234567"
-            )
-        return True
-
-    # ✅ NUEVO PASO 7: Capturar ciudad
+    # ✅ NUEVO PASO 6: Capturar ciudad
     if user_state.get(phone_number) == "esperando_ciudad_empresarial":
         user_data[phone_number]["ciudad_empresa"] = user_message.title()
         send_message(phone_number,
@@ -450,7 +433,7 @@ def handle_business_flow(phone_number, user_message):
         user_state[phone_number] = "esperando_contacto_empresarial"
         return True
 
-    # Paso 8: Capturar horario de contacto y finalizar
+    # Paso 7: Capturar horario de contacto y finalizar
     if user_state.get(phone_number) == "esperando_contacto_empresarial":
         user_data[phone_number]["horario_contacto"] = user_message
         
@@ -469,8 +452,7 @@ def handle_business_flow(phone_number, user_message):
         mensaje_asesor = (
             f"🏢 *NUEVO PROSPECTO EMPRESARIAL - INFORMACIÓN COMPLETA*\n\n"
             f"👤 Nombre: {data.get('nombre_contacto', 'N/D')}\n"
-            f"📞 Teléfono WhatsApp: {phone_number}\n"
-            f"📱 Teléfono contacto: {data.get('telefono_contacto', phone_number)}\n"
+            f"📞 Teléfono: {phone_number}\n"
             f"🏙️ Ciudad: {data.get('ciudad_empresa', 'N/D')}\n"
             f"📊 Tipo de crédito: {data.get('tipo_credito', 'N/D')}\n"
             f"🏭 Giro empresa: {data.get('giro_empresa', 'N/D')}\n"
@@ -625,8 +607,8 @@ def receive_message():
 
             if user_state.get(phone_number) in ["inicio_empresarial", "esperando_tipo_credito", 
                                               "esperando_giro_empresa", "esperando_monto_empresarial",
-                                              "esperando_nombre_empresarial", "esperando_telefono_empresarial",
-                                              "esperando_ciudad_empresarial", "esperando_contacto_empresarial"]:
+                                              "esperando_nombre_empresarial", "esperando_ciudad_empresarial",
+                                              "esperando_contacto_empresarial"]:
                 if handle_business_flow(phone_number, user_message):
                     return jsonify({"status": "ok"}), 200
 
