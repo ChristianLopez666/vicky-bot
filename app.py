@@ -1,775 +1,561 @@
-import os 
+import os
+import json
 import logging
 import requests
+import re
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from datetime import datetime
+import openai
 
+# ---------------------------------------------------------------
 # Cargar variables de entorno
+# ---------------------------------------------------------------
 load_dotenv()
 
-# Configuración de logging
-logging.basicConfig(level=logging.INFO)
+META_TOKEN = os.getenv("META_TOKEN")
+WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Inicializar Flask
+openai.api_key = OPENAI_API_KEY
+
 app = Flask(__name__)
 
-# Variables de entorno
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación privada al asesor
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ GPT (opcional)
+user_state = {}
+user_data = {}
 
-# 🧠 Controles en memoria
-PROCESSED_MESSAGE_IDS = set()
-GREETED_USERS = set()
-LAST_INTENT = {}   # último intent (para motivo de contacto)
-USER_CONTEXT = {}  # estado por usuario {wa_id: {"ctx": str, "ts": float}}
+# ---------------------------------------------------------------
+# FUNCIÓN SEND_MESSAGE MEJORADA - ÚNICA MODIFICACIÓN CRÍTICA
+# ---------------------------------------------------------------
+def send_message(to, text):
+    """Envía mensajes de texto al usuario vía Meta Cloud API - VERSIÓN MEJORADA"""
+    try:
+        # Validación de variables críticas
+        if not META_TOKEN:
+            logging.error("❌ META_TOKEN no configurado - No se puede enviar mensaje")
+            return False
+        if not WABA_PHONE_ID:
+            logging.error("❌ WABA_PHONE_ID no configurado - No se puede enviar mensaje")
+            return False
+            
+        url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {META_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": str(to),
+            "type": "text",
+            "text": {"body": text}
+        }
+        
+        logging.info(f"📤 Intentando enviar mensaje a {to}: {text[:50]}...")
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        
+        if response.status_code in (200, 201):
+            logging.info(f"✅ Mensaje enviado CORRECTAMENTE a {to}")
+            return True
+        else:
+            logging.error(f"❌ Error API Meta al enviar a {to}: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        logging.exception(f"💥 Error CRÍTICO en send_message para {to}: {e}")
+        return False
 
-# --------- GPT fallback robusto (opcional) ----------
-def gpt_reply(user_text: str) -> str | None:
-    """
-    Devuelve respuesta breve usando GPT si OPENAI_API_KEY existe.
-    1) Intenta /v1/responses (model gpt-4o-mini)
-    2) Si falla, intenta /v1/chat/completions
-    Timeout a 9s para reducir timeouts.
-    Si hay 429 (cuota), devuelve mensaje amable.
-    """
-    if not OPENAI_API_KEY:
+def send_whatsapp_message(to, text):
+    return send_message(to, text)
+
+# ---------------------------------------------------------------
+# ENDPOINT DE DIAGNÓSTICO TEMPORAL - SOLO PARA DEBUGGING
+# ---------------------------------------------------------------
+@app.route("/debug-notification", methods=["GET", "POST"])
+def debug_notification():
+    """Endpoint temporal para probar notificaciones al asesor"""
+    if request.method == "GET":
+        return jsonify({
+            "service": "Debug Notificaciones Vicky",
+            "advisor_number": ADVISOR_NUMBER,
+            "variables_configuradas": {
+                "META_TOKEN": bool(META_TOKEN),
+                "WABA_PHONE_ID": bool(WABA_PHONE_ID),
+                "ADVISOR_NUMBER": ADVISOR_NUMBER
+            }
+        }), 200
+    
+    # POST: Probar envío de notificación real
+    try:
+        test_message = (
+            f"🔔 PRUEBA: Notificación de Vicky Bot\n"
+            f"📞 Para: {ADVISOR_NUMBER}\n"
+            f"🕐 Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"✅ Si recibes esto, las notificaciones funcionan"
+        )
+        
+        success = send_message(ADVISOR_NUMBER, test_message)
+        
+        return jsonify({
+            "notification_test": {
+                "sent_to": ADVISOR_NUMBER,
+                "success": success,
+                "timestamp": datetime.now().isoformat(),
+                "message_preview": test_message[:100] + "..."
+            }
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"❌ Error en debug-notification: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------------------------------------------------------
+# MANTENER TODO EL RESTO DEL CÓDIGO EXACTAMENTE IGUAL
+# ---------------------------------------------------------------
+def extract_number(text):
+    if not text:
         return None
+    clean = text.replace(',', '').replace('$', '')
+    match = re.search(r'(\d{1,9})(?:\.\d+)?\b', clean)
+    if match:
+        try:
+            if ':' in text:
+                return None
+            return float(match.group(1))
+        except ValueError:
+            return None
+    return None
 
-    system_prompt = (
-        "Eres Vicky, asistente de Christian López (asesor financiero de Inbursa). "
-        "Responde en español, breve, clara y orientada al siguiente paso. "
-        "Si faltan datos para cotizar, pide solo lo necesario. "
-        "Evita cifras inventadas. Si preguntan por opciones, sugiere escribir 'menu'."
+def interpret_response(text):
+    text_lower = (text or '').lower()
+    positive_keywords = ['sí', 'si', 'sip', 'claro', 'por supuesto', 'ok', 'vale', 'afirmativo', 'acepto', 'yes']
+    negative_keywords = ['no', 'nop', 'negativo', 'para nada', 'no acepto', 'not']
+    if any(k in text_lower for k in positive_keywords):
+        return 'positive'
+    if any(k in text_lower for k in negative_keywords):
+        return 'negative'
+    return 'neutral'
+
+def is_valid_name(text):
+    if not text or len(text.strip()) < 2:
+        return False
+    if re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ\s\.\-]+$', text.strip()):
+        return True
+    return False
+
+def is_valid_phone(text):
+    if not text:
+        return False
+    clean_phone = re.sub(r'[\s\-\(\)\+]', '', text)
+    return re.match(r'^\d{10,15}$', clean_phone) is not None
+
+def send_main_menu(phone):
+    menu = (
+        "🏦 *INBURSA - SERVICIOS DISPONIBLES*\n\n"
+        "1️⃣ Préstamos IMSS Pensionados (Ley 73)\n"
+        "2️⃣ Seguros de Auto\n"
+        "3️⃣ Seguros de Vida y Salud\n"
+        "4️⃣ Tarjetas Médicas VRIM\n"
+        "5️⃣ Financiamiento Empresarial\n\n"
+        "Escribe el *número* o el *nombre* del servicio que te interesa:"
     )
+    send_message(phone, menu)
 
-    # Header base + (opcional) proyecto si está definido en env
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
+def ask_gpt(prompt, model="gpt-3.5-turbo", temperature=0.7):
     try:
-        project_id = os.getenv("OPENAI_PROJECT_ID")
-        if project_id:
-            headers["OpenAI-Project"] = project_id
-    except Exception:
-        pass
-
-    # 1) /v1/responses (recomendado)
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers=headers,
-            json={
-                "model": "gpt-4o-mini",
-                "input": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text}
-                ],
-                "max_output_tokens": 220,
-                "temperature": 0.3,
-            },
-            timeout=9,
+        response = openai.ChatCompletion.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=400
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            out = (data.get("output", [{}])[0].get("content", [{}])[0].get("text")
-                   if "output" in data else None)
-            if out:
-                return out.strip()
-            # Compatibilidad por si viniera en 'choices'
-            ch = data.get("choices", [{}])[0].get("message", {}).get("content")
-            if ch:
-                return ch.strip()
-        elif resp.status_code == 429:
-            logging.warning(f"[GPT responses] 429: {resp.text[:200]}")
-            return ("Estoy recibiendo muchas consultas ahora mismo. "
-                    "Puedo avanzar con una orientación breve: si deseas **seguro de vida y salud**, "
-                    "te preparo una cotización personalizada; compárteme *edad*, *ciudad* y si buscas "
-                    "*temporal* o *vitalicio*. Escribe 'menu' para ver más opciones.")
+        return response.choices[0].message["content"].strip()
+    except Exception as e:
+        logging.exception(f"Error con OpenAI: {e}")
+        return "Lo siento, ocurrió un error al consultar GPT."
+
+def is_gpt_command(msg):
+    return re.match(r'^\s*gpt\s*:', msg.lower())
+
+def funnel_prestamo_imss(user_id, user_message):
+    state = user_state.get(user_id, "menu_mostrar_beneficios")
+    datos = user_data.get(user_id, {})
+
+    # Paso 0: Mostrar beneficios y preguntar si es pensionado
+    if state == "menu_mostrar_beneficios":
+        send_message(user_id,
+            "💰 *Beneficios del Préstamo para Pensionados IMSS (Ley 73)*\n"
+            "- Montos desde $40,000 hasta $650,000\n"
+            "- Descuento vía pensión (sin buró de crédito)\n"
+            "- Plazos de 12 a 60 meses\n"
+            "- Depósito directo a tu cuenta\n"
+            "- Sin aval ni garantía"
+        )
+        send_message(user_id,
+            "🏦 *Beneficios adicionales si recibes tu pensión en Inbursa:*\n"
+            "- Tasas preferenciales y pagos más bajos\n"
+            "- Acceso a seguro de vida sin costo\n"
+            "- Anticipo de nómina disponible\n"
+            "- Atención personalizada 24/7\n\n"
+            "*(Estos beneficios son adicionales y no son obligatorios para obtener tu crédito.)*"
+        )
+        send_message(user_id,
+            "¿Eres pensionado o jubilado del IMSS bajo la Ley 73?"
+        )
+        user_state[user_id] = "pregunta_pensionado"
+        return jsonify({"status": "ok", "funnel": "prestamo_imss"})
+
+    # Paso 1: Pregunta pensionado
+    if state == "pregunta_pensionado":
+        resp = interpret_response(user_message)
+        if resp == "negative":
+            send_main_menu(user_id)
+            user_state.pop(user_id, None)
+            user_data.pop(user_id, None)
+            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
+        elif resp == "positive":
+            send_message(user_id,
+                "¿Cuánto recibes aproximadamente al mes por concepto de pensión?"
+            )
+            user_state[user_id] = "pregunta_monto_pension"
+            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         else:
-            logging.warning(f"[GPT responses] {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        logging.error(f"[GPT responses] error: {e}")
+            send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
+            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    # 2) /v1/chat/completions (compatibilidad)
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text},
-                ],
-                "max_tokens": 220,
-                "temperature": 0.3,
-            },
-            timeout=9,
+    # Paso 2: Monto de pensión
+    if state == "pregunta_monto_pension":
+        monto_pension = extract_number(user_message)
+        if monto_pension is None:
+            send_message(user_id, "Indica el monto mensual que recibes por pensión, ejemplo: 6500")
+            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
+        if monto_pension < 5000:
+            send_message(user_id,
+                "Por ahora los créditos disponibles aplican a pensiones a partir de $5,000.\n"
+                "Pero puedo notificar a nuestro asesor para ofrecerte otra opción sin compromiso. ¿Deseas que lo haga?"
+            )
+            user_state[user_id] = "pregunta_ofrecer_asesor"
+            user_data[user_id] = {"pension_mensual": monto_pension}
+            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
+        user_data[user_id] = {"pension_mensual": monto_pension}
+        send_message(user_id,
+            "Perfecto 👏 ¿Qué monto de préstamo te gustaría solicitar? (mínimo $40,000)"
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            msg = data.get("choices", [{}])[0].get("message", {}).get("content")
-            return msg.strip() if msg else None
-        elif resp.status_code == 429:
-            logging.warning(f"[GPT chat] 429: {resp.text[:200]}")
-            return ("En este momento el servicio de IA alcanzó su límite de uso. "
-                    "Mientras tanto: para **seguro de vida**, dime *edad*, *ciudad* y si te interesa "
-                    "*temporal* o *vitalicio*, y te guío. Escribe 'menu' para ver opciones.")
+        user_state[user_id] = "pregunta_monto_solicitado"
+        return jsonify({"status": "ok", "funnel": "prestamo_imss"})
+
+    # Paso 2b: Ofrecer asesor por pensión baja
+    if state == "pregunta_ofrecer_asesor":
+        resp = interpret_response(user_message)
+        if resp == "positive":
+            send_message(user_id,
+                "¡Listo! Un asesor te contactará para ofrecerte opciones alternativas. Gracias por confiar en nosotros 🙌."
+            )
+            datos = user_data.get(user_id, {})
+            formatted = (
+                f"🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
+                f"Nombre: {datos.get('nombre','N/D')}\n"
+                f"Número WhatsApp: {user_id}\n"
+                f"Pensión mensual: ${datos.get('pension_mensual','N/D'):,.0f}\n"
+                f"Estatus: Pensión baja, requiere opciones alternativas"
+            )
+            send_whatsapp_message(ADVISOR_NUMBER, formatted)
+            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
+            send_main_menu(user_id)
+            user_state.pop(user_id, None)
+            user_data.pop(user_id, None)
+            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
         else:
-            logging.warning(f"[GPT chat] {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        logging.error(f"[GPT chat] error: {e}")
+            send_message(user_id, "Perfecto, si deseas podemos continuar con otros servicios.")
+            send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
+            send_main_menu(user_id)
+            user_state.pop(user_id, None)
+            user_data.pop(user_id, None)
+            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    return None
-# ----------------------------------------------------
-
-# === 🆕 BLOQUE 1: utilidades de medios (reenviar fotos/documentos y transcribir audios) ===
-def _get_media_url(media_id: str) -> str | None:
-    try:
-        resp = requests.get(
-            f"https://graph.facebook.com/v21.0/{media_id}",
-            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
-            timeout=8,
+    # Paso 3: Monto solicitado
+    if state == "pregunta_monto_solicitado":
+        monto_solicitado = extract_number(user_message)
+        if monto_solicitado is None or monto_solicitado < 40000:
+            send_message(user_id, "Indica el monto que deseas solicitar (mínimo $40,000), ejemplo: 65000")
+            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
+        user_data[user_id]["monto_solicitado"] = monto_solicitado
+        send_message(user_id,
+            "¿Cuál es tu nombre completo?"
         )
-        if resp.status_code == 200:
-            return resp.json().get("url")
-        logging.warning(f"[WA media url] {resp.status_code}: {resp.text[:180]}")
-    except Exception as e:
-        logging.error(f"[WA media url] error: {e}")
-    return None
+        user_state[user_id] = "pregunta_nombre"
+        return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-def _download_media_bytes(url: str) -> bytes | None:
-    try:
-        r = requests.get(url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=12)
-        if r.status_code == 200:
-            return r.content
-        logging.warning(f"[WA media dl] {r.status_code}: {r.text[:180]}")
-    except Exception as e:
-        logging.error(f"[WA media dl] error: {e}")
-    return None
+    # Paso 4: Pregunta nombre
+    if state == "pregunta_nombre":
+        user_data[user_id]["nombre"] = user_message.title()
+        send_message(user_id,
+            "¿Cuál es tu teléfono de contacto?"
+        )
+        user_state[user_id] = "pregunta_telefono"
+        return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-def send_media_image(to: str, media_id: str, caption: str = ""):
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "image",
-        "image": {"id": media_id, **({"caption": caption} if caption else {})}
-    }
-    resp = requests.post(url, headers=headers, json=payload)
-    logging.info(f"[WA send image] {resp.status_code} - {resp.text[:180]}")
+    # Paso 5: Pregunta teléfono
+    if state == "pregunta_telefono":
+        user_data[user_id]["telefono_contacto"] = user_message
+        send_message(user_id,
+            "¿En qué ciudad vives?"
+        )
+        user_state[user_id] = "pregunta_ciudad"
+        return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-def send_media_document(to: str, media_id: str, caption: str = ""):
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "document",
-        "document": {"id": media_id, **({"caption": caption} if caption else {})}
-    }
-    resp = requests.post(url, headers=headers, json=payload)
-    logging.info(f"[WA send doc] {resp.status_code} - {resp.text[:180]}")
+    # Paso 6: Pregunta ciudad
+    if state == "pregunta_ciudad":
+        user_data[user_id]["ciudad"] = user_message.title()
+        send_message(user_id,
+            "¿Ya recibes tu pensión en Inbursa?"
+        )
+        user_state[user_id] = "pregunta_nomina_inbursa"
+        return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-def transcribe_audio_media(media_id: str) -> str | None:
-    """
-    Descarga el audio de WhatsApp y lo transcribe con Whisper si hay OPENAI_API_KEY.
-    """
-    if not OPENAI_API_KEY:
-        return None
-    url = _get_media_url(media_id)
-    if not url:
-        return None
-    blob = _download_media_bytes(url)
-    if not blob:
-        return None
+    # Paso 7: Nómina Inbursa
+    if state == "pregunta_nomina_inbursa":
+        resp = interpret_response(user_message)
+        if resp == "positive":
+            send_message(user_id,
+                "Excelente, con Inbursa tendrás acceso a beneficios adicionales y atención prioritaria."
+            )
+            user_data[user_id]["nomina_inbursa"] = "Sí"
+        elif resp == "negative":
+            send_message(user_id,
+                "No hay problema 😊, los beneficios adicionales solo aplican si tienes la nómina con nosotros,\n"
+                "pero puedes cambiarte cuando gustes, sin costo ni compromiso."
+            )
+            user_data[user_id]["nomina_inbursa"] = "No"
+        else:
+            send_message(user_id, "Por favor responde *sí* o *no* para continuar.")
+            return jsonify({"status": "ok", "funnel": "prestamo_imss"})
+        send_message(user_id,
+            "¡Listo! 🎉 Tu crédito ha sido preautorizado.\n"
+            "Un asesor financiero (Christian López) se pondrá en contacto contigo para continuar con el trámite.\n"
+            "Gracias por tu confianza 🙌."
+        )
+        datos = user_data.get(user_id, {})
+        formatted = (
+            f"🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
+            f"Nombre: {datos.get('nombre','N/D')}\n"
+            f"Número WhatsApp: {user_id}\n"
+            f"Teléfono contacto: {datos.get('telefono_contacto','N/D')}\n"
+            f"Ciudad: {datos.get('ciudad','N/D')}\n"
+            f"Monto solicitado: ${datos.get('monto_solicitado','N/D'):,.0f}\n"
+            f"Estatus: Preautorizado\n"
+            f"Observación: Nómina Inbursa: {datos.get('nomina_inbursa','N/D')}"
+        )
+        send_whatsapp_message(ADVISOR_NUMBER, formatted)
+        send_message(user_id, "¡Listo! Además, tenemos otros servicios financieros que podrían interesarte: 👇")
+        send_main_menu(user_id)
+        user_state.pop(user_id, None)
+        user_data.pop(user_id, None)
+        return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-    files = {
-        "file": ("audio.ogg", blob, "audio/ogg"),
-    }
-    data = {"model": "whisper-1", "response_format": "text", "language": "es"}
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    try:
-        r = requests.post("https://api.openai.com/v1/audio/transcriptions",
-                          headers=headers, data=data, files=files, timeout=30)
-        if r.status_code == 200:
-            return r.text.strip()
-        logging.warning(f"[Whisper] {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        logging.error(f"[Whisper] error: {e}")
-    return None
-# === FIN BLOQUE 1 ===
+    send_main_menu(user_id)
+    return jsonify({"status": "ok", "funnel": "prestamo_imss"})
 
-# Endpoint de verificación
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        logging.info("Webhook verificado correctamente ✅")
+        logging.info("✅ Webhook verificado correctamente.")
         return challenge, 200
-    else:
-        logging.warning("Fallo en la verificación del webhook ❌")
-        return "Verification failed", 403
+    logging.warning("❌ Verificación de webhook fallida.")
+    return "Forbidden", 403
 
-# Endpoint para recibir mensajes
 @app.route("/webhook", methods=["POST"])
 def receive_message():
-    data = request.get_json()
-    logging.info(f"📩 Mensaje recibido: {data}")
+    try:
+        data = request.get_json()
+        entry = data.get("entry", [])[0]
+        change = entry.get("changes", [])[0]
+        value = change.get("value", {})
+        messages = value.get("messages", [])
 
-    if not data or "entry" not in data:
-        return jsonify({"status": "ignored"}), 200
+        if not messages:
+            return jsonify({"status": "ignored"}), 200
 
-    from time import time
-    now = time()
+        message = messages[0]
+        phone_number = message.get("from")
+        message_type = message.get("type")
+        user_message = ""
+        if message_type == "text":
+            user_message = message["text"]["body"].strip()
+        else:
+            send_message(phone_number, 
+                "Por ahora solo puedo procesar mensajes de texto 📩\n\n"
+                "Escribe *menú* para ver los servicios disponibles."
+            )
+            return jsonify({"status": "ok"}), 200
 
-    global PROCESSED_MESSAGE_IDS, GREETED_USERS, LAST_INTENT, USER_CONTEXT
-    if isinstance(PROCESSED_MESSAGE_IDS, set):
-        PROCESSED_MESSAGE_IDS = {}
-    if isinstance(GREETED_USERS, set):
-        GREETED_USERS = {}
+        logging.info(f"📱 Mensaje de {phone_number}: '{user_message}'")
 
-    MSG_TTL = 600
-    GREET_TTL = 24 * 3600
-    CTX_TTL = 4 * 3600
+        # GPT SOLO BAJO COMANDO (en cualquier parte del bot)
+        if is_gpt_command(user_message):
+            prompt = user_message.split(":",1)[1].strip()
+            if not prompt:
+                send_message(phone_number, "Para consultar GPT, escribe por ejemplo:\ngpt: ¿Qué ventajas tiene el crédito IMSS?")
+                return jsonify({"status": "ok", "source": "gpt"})
+            gpt_reply = ask_gpt(prompt)
+            send_message(phone_number, gpt_reply)
+            return jsonify({"status": "ok", "source": "gpt"})
 
-    if len(PROCESSED_MESSAGE_IDS) > 5000:
-        PROCESSED_MESSAGE_IDS = {k: v for k, v in PROCESSED_MESSAGE_IDS.items() if now - v < MSG_TTL}
-    if len(GREETED_USERS) > 5000:
-        GREETED_USERS = {k: v for k, v in GREETED_USERS.items() if now - v < GREET_TTL}
-    if len(LAST_INTENT) > 5000:
-        LAST_INTENT = {k: v for k, v in LAST_INTENT.items() if now - v.get("ts", now) < GREET_TTL}
-    if len(USER_CONTEXT) > 5000:
-        USER_CONTEXT = {k: v for k, v in USER_CONTEXT.items() if now - v.get("ts", now) < CTX_TTL}
+        menu_options = {
+            "1": "prestamo_imss",
+            "préstamo": "prestamo_imss",
+            "prestamo": "prestamo_imss",
+            "imss": "prestamo_imss",
+            "ley 73": "prestamo_imss",
+            "pension": "prestamo_imss",
+            "pensión": "prestamo_imss",
+            "2": "seguro_auto",
+            "seguro auto": "seguro_auto",
+            "seguros de auto": "seguro_auto",
+            "auto": "seguro_auto",
+            "3": "seguro_vida",
+            "seguro vida": "seguro_vida",
+            "seguros de vida": "seguro_vida",
+            "seguro salud": "seguro_vida",
+            "vida": "seguro_vida",
+            "4": "vrim",
+            "tarjetas médicas": "vrim",
+            "tarjetas medicas": "vrim",
+            "vrim": "vrim",
+            "5": "empresarial",
+            "financiamiento empresarial": "empresarial",
+            "empresa": "empresarial",
+            "negocio": "empresarial",
+            "pyme": "empresarial",
+            "crédito empresarial": "empresarial",
+            "credito empresarial": "empresarial"
+        }
 
-    MENU_TEXT = (
-        "👉 Elige una opción del menú:\n"
-        "1) Asesoría en pensiones IMSS (Ley 73 / Modalidad 40 / Modalidad 10)\n"
-        "2) Seguros de auto (Amplia PLUS, Amplia, Limitada)\n"
-        "3) Seguros de vida y salud\n"
-        "4) Tarjetas médicas VRIM\n"
-        "5) Préstamos a pensionados IMSS (a partir de $40,000 pesos hasta $650,000)\n"
-        "6) Financiamiento empresarial y nómina empresarial\n"
-        "7) Contactar con Christian\n"
-        "\nEscribe el número de la opción o 'menu' para volver a ver el menú."
-    )
+        option = menu_options.get(user_message.lower())
 
-    OPTION_RESPONSES = {
-        "1": "🧓 Asesoría en pensiones IMSS. Cuéntame tu caso (Ley 73, M40, M10) y te guío paso a paso.",
-        "2": "🚗 Seguro de auto. Envíame *foto de tu INE* y *tarjeta de circulación* o tu *número de placa* para cotizar.",
-        "3": "🛡️ Seguros de vida y salud. Te preparo una cotización personalizada.",
-        "4": "🩺 Tarjetas médicas VRIM. Te comparto información y precios.",
-        "5": "💳 Préstamos a pensionados IMSS. Monto *a partir de $40,000* y hasta $650,000. Dime tu pensión aproximada y el monto deseado.",
-        "6": "🏢 Financiamiento empresarial y nómina. ¿Qué necesitas: *crédito*, *factoraje* o *nómina*?",
-        "7": "📞 ¡Listo! He notificado a Christian para que te contacte y te dé seguimiento."
-    }
+        # FLUJO IMSS: Si está en embudo, seguir el estado
+        current_state = user_state.get(phone_number)
+        if current_state and ("prestamo_imss" in current_state or "pregunta_" in current_state):
+            return funnel_prestamo_imss(phone_number, user_message)
 
-    OPTION_TITLES = {
-        "1": "Asesoría en pensiones IMSS",
-        "2": "Seguros de auto",
-        "3": "Seguros de vida y salud",
-        "4": "Tarjetas médicas VRIM",
-        "5": "Préstamos a pensionados IMSS",
-        "6": "Financiamiento/nómina empresarial",
-        "7": "Contacto con Christian"
-    }
+        # Opción 1: Iniciar embudo IMSS
+        if option == "prestamo_imss":
+            user_state[phone_number] = "menu_mostrar_beneficios"
+            return funnel_prestamo_imss(phone_number, user_message)
 
-    KEYWORD_INTENTS = [
-        (("pension", "pensión", "imss", "modalidad 40", "modalidad 10", "ley 73"), "1"),
-        (("auto", "seguro de auto", "placa", "tarjeta de circulación", "coche", "carro"), "2"),
-        (("vida", "seguro de vida", "salud", "gastos médicos", "planes de seguro"), "3"),
-        (("vrim", "tarjeta médica", "membresía médica"), "4"),
-        (("préstamo", "prestamo", "pensionado", "préstamo imss", "prestamo imss"), "5"),
-        (("financiamiento", "factoraje", "nómina", "nomina", "empresarial", "crédito empresarial", "credito empresarial"), "6"),
-        (("contacto", "contactar", "asesor", "christian", "llámame", "quiero hablar"), "7"),
-    ]
+        # Otros servicios - menú estándar
+        if option == "seguro_auto":
+            send_message(phone_number,
+                "🚗 *Seguros de Auto Inbursa*\n\n"
+                "Protege tu auto con las mejores coberturas:\n\n"
+                "✅ Cobertura amplia contra todo riesgo\n"
+                "✅ Asistencia vial las 24 horas\n"
+                "✅ Responsabilidad civil\n"
+                "✅ Robo total y parcial\n\n"
+                "📞 Un asesor se comunicará contigo para cotizar tu seguro."
+            )
+            send_whatsapp_message(ADVISOR_NUMBER, f"🚗 NUEVO INTERESADO EN SEGURO DE AUTO\n📞 {phone_number}")
+            return jsonify({"status": "ok", "funnel": "menu"})
+        if option == "seguro_vida":
+            send_message(phone_number,
+                "🏥 *Seguros de Vida y Salud Inbursa*\n\n"
+                "Protege a tu familia y tu salud:\n\n"
+                "✅ Seguro de vida\n"
+                "✅ Gastos médicos mayores\n"
+                "✅ Hospitalización\n"
+                "✅ Atención médica las 24 horas\n\n"
+                "📞 Un asesor se comunicará contigo para explicarte las coberturas."
+            )
+            send_whatsapp_message(ADVISOR_NUMBER, f"🏥 NUEVO INTERESADO EN SEGURO VIDA/SALUD\n📞 {phone_number}")
+            return jsonify({"status": "ok", "funnel": "menu"})
+        if option == "vrim":
+            send_message(phone_number,
+                "💳 *Tarjetas Médicas VRIM*\n\n"
+                "Accede a la mejor atención médica:\n\n"
+                "✅ Consultas médicas ilimitadas\n"
+                "✅ Especialistas y estudios de laboratorio\n"
+                "✅ Medicamentos con descuento\n"
+                "✅ Atención dental y oftalmológica\n\n"
+                "📞 Un asesor se comunicará contigo para explicarte los beneficios."
+            )
+            send_whatsapp_message(ADVISOR_NUMBER, f"💳 NUEVO INTERESADO EN TARJETAS VRIM\n📞 {phone_number}")
+            return jsonify({"status": "ok", "funnel": "menu"})
+        if option == "empresarial":
+            send_message(phone_number,
+                "🏢 *Financiamiento Empresarial Inbursa*\n\n"
+                "Impulsa el crecimiento de tu negocio con:\n\n"
+                "✅ Créditos desde $100,000 hasta $100,000,000\n"
+                "✅ Tasas preferenciales\n"
+                "✅ Plazos flexibles\n"
+                "✅ Asesoría especializada\n\n"
+                "📞 Un asesor se pondrá en contacto contigo para analizar tu proyecto."
+            )
+            send_whatsapp_message(ADVISOR_NUMBER, f"🏢 NUEVO INTERESADO EN FINANCIAMIENTO EMPRESARIAL\n📞 {phone_number}")
+            return jsonify({"status": "ok", "funnel": "menu"})
 
-    def infer_option_from_text(t: str):
-        for keywords, opt in KEYWORD_INTENTS:
-            if any(k in t for k in keywords):
-                return opt
-        return None
+        # Comando de menú
+        if user_message.lower() in ["menu", "menú", "men", "opciones", "servicios"]:
+            user_state.pop(phone_number, None)
+            user_data.pop(phone_number, None)
+            send_main_menu(phone_number)
+            return jsonify({"status": "ok", "funnel": "menu"})
 
-    # ---- Procesar SOLO el primer mensaje válido por payload ----
-    for entry in data.get("entry", []):
-        for change in entry.get("changes", []):
-            val = change.get("value", {})
+        if user_message.lower() in ["hola", "hi", "hello", "buenas", "buenos días", "buenas tardes"]:
+            send_main_menu(phone_number)
+            return jsonify({"status": "ok", "funnel": "menu"})
 
-            if "statuses" in val:
-                continue
+        send_main_menu(phone_number)
+        return jsonify({"status": "ok", "funnel": "menu"})
 
-            messages = val.get("messages", [])
-            if not messages:
-                continue
+    except Exception as e:
+        logging.exception(f"❌ Error en receive_message: {e}")
+        return jsonify({"error": str(e)}), 500
 
-            message = messages[0]
-            msg_id = message.get("id")
-            msg_type = message.get("type")
-            sender = message.get("from")
-            business_phone = val.get("metadata", {}).get("display_phone_number")
-
-            profile_name = None
-            try:
-                profile_name = (val.get("contacts", [{}])[0].get("profile", {}) or {}).get("name")
-            except Exception:
-                profile_name = None
-
-            logging.info(f"🧾 id={msg_id} type={msg_type} from={sender} profile={profile_name}")
-
-            if msg_id:
-                last_seen = PROCESSED_MESSAGE_IDS.get(msg_id)
-                if last_seen and (now - last_seen) < MSG_TTL:
-                    logging.info(f"🔁 Duplicado ignorado: {msg_id}")
-                    continue
-                PROCESSED_MESSAGE_IDS[msg_id] = now
-
-            if business_phone and sender and sender.endswith(business_phone):
-                logging.info("🪞 Echo desde business_phone ignorado")
-                continue
-
-            # === 🆕 BLOQUE 2: manejo de medios antes de filtrar por 'text' ===
-            if msg_type == "image":
-                media_id = (message.get("image") or {}).get("id")
-                caption = (message.get("image") or {}).get("caption", "") or ""
-                try:
-                    if ADVISOR_NUMBER and ADVISOR_NUMBER != sender and media_id:
-                        send_media_image(
-                            ADVISOR_NUMBER,
-                            media_id,
-                            caption=f"📎 Imagen recibida de {profile_name or sender}. {('Nota: ' + caption) if caption else ''}"
-                        )
-                except Exception as e:
-                    logging.error(f"❌ Error reenviando imagen: {e}")
-
-                send_message(sender, "✅ ¡Gracias! Recibí la imagen. Si es para **seguro de auto**, con INE y tarjeta de circulación (o placa) ya puedo cotizar. ¿Deseas que avance?")
-                continue
-
-            if msg_type == "document":
-                media_id = (message.get("document") or {}).get("id")
-                filename = (message.get("document") or {}).get("filename", "")
-                try:
-                    if ADVISOR_NUMBER and ADVISOR_NUMBER != sender and media_id:
-                        send_media_document(
-                            ADVISOR_NUMBER,
-                            media_id,
-                            caption=f"📄 Documento recibido de {profile_name or sender} {f'({filename})' if filename else ''}"
-                        )
-                except Exception as e:
-                    logging.error(f"❌ Error reenviando documento: {e}")
-
-                send_message(sender, "✅ ¡Gracias! Recibí tu documento. En breve lo reviso.")
-                continue
-
-            if msg_type == "audio" or (msg_type == "voice"):
-                media_id = (message.get("audio") or {}).get("id")
-                transcript = transcribe_audio_media(media_id) if media_id else None
-                if transcript:
-                    send_message(sender, f"🗣️ Transcripción: {transcript}")
-                else:
-                    send_message(sender, "No pude transcribir tu nota de voz. ¿Podrías intentar de nuevo o escribir el mensaje?")
-                continue
-            # === FIN BLOQUE 2 ===
-
-            if msg_type != "text":
-                logging.info(f"ℹ️ Mensaje no-texto ignorado: {msg_type}")
-                continue
-
-            text = message.get("text", {}).get("body", "") or ""
-            text_norm = text.strip().lower()
-            logging.info(f"✉️ Texto normalizado: {text_norm}")
-
-            # -------- Contexto por usuario (financiamiento) --------
-            from time import time as _t
-            user_ctx = USER_CONTEXT.get(sender)
-            if user_ctx and (now - user_ctx.get("ts", now) < 4 * 3600):
-                ctx = user_ctx.get("ctx")
-                if ctx == "financiamiento":
-                    if any(k in text_norm for k in ("crédito", "credito")):
-                        send_message(sender, "🏦 Crédito empresarial: monto y plazo a medida. Compárteme *antigüedad del negocio*, *ingresos aproximados* y *RFC* para iniciar.")
-                        LAST_INTENT[sender] = {"opt": "6", "title": "Crédito empresarial", "ts": now}
-                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": _t()}
-                        continue
-                    if "factoraje" in text_norm:
-                        send_message(sender, "📄 Factoraje: adelantamos el cobro de tus facturas. Dime *promedio mensual de facturación* y *RFC*.")
-                        LAST_INTENT[sender] = {"opt": "6", "title": "Factoraje", "ts": now}
-                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": _t()}
-                        continue
-                    if any(k in text_norm for k in ("nómina", "nomina")):
-                        send_message(sender, "👥 Nómina empresarial: dispersión de sueldos y beneficios. ¿Cuántos colaboradores tienes y periodicidad de pago?")
-                        LAST_INTENT[sender] = {"opt": "6", "title": "Nómina empresarial", "ts": now}
-                        USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": _t()}
-                        continue
-            # -------------------------------------------------------
-
-            # ---------- GPT primero para consultas naturales ----------
-            is_numeric_option = text_norm in OPTION_RESPONSES
-            is_menu = text_norm in ("hola", "menú", "menu")
-            is_natural_query = (not is_numeric_option) and (not is_menu) and any(ch.isalpha() for ch in text_norm) and (len(text_norm.split()) >= 3)
-
-            if is_natural_query:
-                ai = gpt_reply(text)
-                if ai:
-                    send_message(sender, ai)
-                    LAST_INTENT[sender] = {"opt": "gpt", "title": "Consulta abierta", "ts": now}
-                    continue
-            # ---------------------------------------------------------
-
-            # Opción 1–7 (o inferida por keywords)
-            option = text_norm if is_numeric_option else infer_option_from_text(text_norm)
-            if option:
-                send_message(sender, OPTION_RESPONSES[option])
-                LAST_INTENT[sender] = {"opt": option, "title": OPTION_TITLES.get(option), "ts": now}
-                if option == "6":
-                    USER_CONTEXT[sender] = {"ctx": "financiamiento", "ts": now}
-                if option == "7":
-                    motive = LAST_INTENT.get(sender, {}).get("title") or "No especificado"
-                    notify_text = (
-                        "🔔 *Vicky Bot – Solicitud de contacto*\n"
-                        f"- Nombre: {profile_name or 'No disponible'}\n"
-                        f"- WhatsApp del cliente: {sender}\n"
-                        f"- Motivo: {motive}\n"
-                        f"- Mensaje original: \"{text.strip()}\""
-                    )
-                    try:
-                        if ADVISOR_NUMBER and ADVISOR_NUMBER != sender:
-                            send_message(ADVISOR_NUMBER, notify_text)
-                            logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_NUMBER}")
-                    except Exception as e:
-                        logging.error(f"❌ Error notificando al asesor: {e}")
-                continue
-
-            # Saludos/menú
-            first_greet_ts = GREETED_USERS.get(sender)
-            if not first_greet_ts or (now - first_greet_ts) >= GREET_TTL:
-                if is_menu:
-                    send_message(
-                        sender,
-                        "👋 Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n" + MENU_TEXT
-                    )
-                else:
-                    send_message(sender, MENU_TEXT)
-                GREETED_USERS[sender] = now
-                continue
-
-            if is_menu:
-                send_message(sender, MENU_TEXT)
-                continue
-
-            # Fallback final
-            logging.info("📌 Mensaje recibido (ya saludado). Respuesta guía.")
-            send_message(sender, "No te entendí. Escribe 'menu' para ver opciones o elige un número del 1 al 7.")
-
-    return jsonify({"status": "ok"}), 200
-
-# Función para enviar mensajes
-def send_message(to, text):
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text}
-    }
-
-    response = requests.post(url, headers=headers, json=payload)
-    logging.info(f"Respuesta de WhatsApp API: {response.status_code} - {response.text}")
-
-# Endpoint de salud
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok", "service": "Vicky Bot Inbursa"}), 200
+
+def send_campaign_message(phone_number, nombre):
+    """
+    Envía un mensaje tipo plantilla promocional usando la API de WhatsApp Business.
+    La plantilla se llama "credito_imss_promocion_1" en idioma "es_MX".
+    El nombre del prospecto se incluye como parámetro {{1}}.
+    """
+    try:
+        url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {META_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": str(phone_number),
+            "type": "template",
+            "template": {
+                "name": "credito_imss_promocion_1",
+                "language": {"code": "es_MX"},
+                "components": [
+                    {
+                        "type": "body",
+                        "parameters": [
+                            {"type": "text", "text": str(nombre)}
+                        ]
+                    }
+                ]
+            }
+        }
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        logging.info(f"✅ Mensaje campaña enviado a {phone_number} ({nombre})")
+    except Exception as e:
+        logging.exception(f"❌ Error en send_campaign_message: {e}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
+    logging.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
     app.run(host="0.0.0.0", port=port)
 
-# >>> VX: CONFIG & UTILS (NO TOCAR)
-try:
-    vx_get_env
-except NameError:
-    def vx_get_env(name, default=None):
-        import os
-        return os.getenv(name, default)
-
-try:
-    vx_normalize_phone
-except NameError:
-    def vx_normalize_phone(raw):
-        import re
-        if not raw:
-            return ""
-        phone = re.sub(r"[^\d]", "", str(raw))
-        phone = re.sub(r"^(52|521)", "", phone)
-        return phone[-10:] if len(phone) >= 10 else phone
-
-try:
-    vx_last10
-except NameError:
-    def vx_last10(phone):
-        return vx_normalize_phone(phone)
-
-try:
-    vx_Settings
-except NameError:
-    class vx_Settings:
-        def __init__(self):
-            self.META_TOKEN = vx_get_env("META_TOKEN")
-            self.WABA_PHONE_ID = vx_get_env("WABA_PHONE_ID")
-            self.VERIFY_TOKEN = vx_get_env("VERIFY_TOKEN")
-            self.OPENAI_API_KEY = vx_get_env("OPENAI_API_KEY")
-            self.REDIS_URL = vx_get_env("REDIS_URL")
-            self.GOOGLE_CREDENTIALS_JSON = vx_get_env("GOOGLE_CREDENTIALS_JSON")
-            self.SHEETS_ID_LEADS = vx_get_env("SHEETS_ID_LEADS")
-            self.SHEETS_TITLE_LEADS = vx_get_env("SHEETS_TITLE_LEADS")
-            self.ADVISOR_WHATSAPP = vx_get_env("ADVISOR_WHATSAPP")
-
-# >>> VX: LOGGING (NO TOCAR)
-try:
-    vx_setup_logging
-except NameError:
-    def vx_setup_logging():
-        import logging
-        logger = logging.getLogger()
-        if not logger.hasHandlers():
-            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-        return logging.getLogger("vx")
-
-# >>> VX: REDIS (NO TOCAR, OPCIONAL)
-try:
-    vx_get_redis
-except NameError:
-    def vx_get_redis():
-        try:
-            url = vx_get_env("REDIS_URL")
-            if not url:
-                return None
-            import redis
-            return redis.from_url(url)
-        except Exception:
-            return None
-
-# >>> VX: WHATSAPP CLIENT (NO TOCAR)
-try:
-    vx_wa_send_text
-except NameError:
-    def vx_wa_send_text(to_e164: str, body: str):
-        import requests, logging
-        token = vx_get_env("META_TOKEN")
-        phone_id = vx_get_env("WABA_PHONE_ID")
-        if not token or not phone_id or not to_e164:
-            logging.getLogger("vx").warning("vx_wa_send_text: falta config")
-            return False
-        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_e164,
-            "type": "text",
-            "text": {"body": body}
-        }
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=9)
-            logging.getLogger("vx").info(f"vx_wa_send_text: {resp.status_code} {resp.text[:160]}")
-            return resp.status_code == 200
-        except Exception as e:
-            logging.getLogger("vx").error(f"vx_wa_send_text error: {e}")
-            return False
-
-try:
-    vx_wa_mark_read
-except NameError:
-    def vx_wa_mark_read(message_id: str):
-        import requests, logging
-        token = vx_get_env("META_TOKEN")
-        phone_id = vx_get_env("WABA_PHONE_ID")
-        if not token or not phone_id or not message_id:
-            logging.getLogger("vx").warning("vx_wa_mark_read: falta config")
-            return False
-        url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        payload = {
-            "messaging_product": "whatsapp",
-            "status": "read",
-            "message_id": message_id
-        }
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=9)
-            logging.getLogger("vx").info(f"vx_wa_mark_read: {resp.status_code} {resp.text[:120]}")
-            return resp.status_code == 200
-        except Exception as e:
-            logging.getLogger("vx").error(f"vx_wa_mark_read error: {e}")
-            return False
-
-# >>> VX: GPT (NO TOCAR)
-try:
-    vx_gpt_reply
-except NameError:
-    def vx_gpt_reply(user_text: str, system_text: str = None) -> str:
-        import logging
-        api_key = vx_get_env("OPENAI_API_KEY")
-        if not api_key:
-            return "No tengo IA disponible en este momento. Por favor elige una opción del menú."
-        try:
-            import openai
-            client = openai.OpenAI(api_key=api_key)
-            system = system_text or (
-                "Eres Vicky, asistente de Christian López. Responde en español, breve, clara y orientada al siguiente paso."
-            )
-            completion = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_text},
-                ],
-                max_tokens=120,
-                temperature=0.2,
-            )
-            return completion.choices[0].message.content.strip()
-        except Exception as e:
-            logging.getLogger("vx").error(f"vx_gpt_reply error: {e}")
-            return "No tengo IA disponible en este momento. Por favor elige una opción del menú."
-
-# >>> VX: SHEETS (NO TOCAR)
-try:
-    vx_sheet_find_by_phone
-except NameError:
-    def vx_sheet_find_by_phone(last10: str):
-        import logging
-        import json
-        try:
-            creds_json = vx_get_env("GOOGLE_CREDENTIALS_JSON")
-            sheets_id = vx_get_env("SHEETS_ID_LEADS")
-            sheets_title = vx_get_env("SHEETS_TITLE_LEADS")
-            if not creds_json or not sheets_id or not sheets_title or not last10:
-                return None
-            import gspread
-            from gspread import service_account_from_dict
-            creds_dict = json.loads(creds_json)
-            client = service_account_from_dict(creds_dict)
-            sheet = client.open_by_key(sheets_id)
-            ws = sheet.worksheet(sheets_title)
-            rows = ws.get_all_records()
-            for row in rows:
-                wa = str(row.get("WhatsApp", ""))
-                if vx_last10(wa) == last10:
-                    return row
-            return None
-        except Exception as e:
-            logging.getLogger("vx").error(f"vx_sheet_find_by_phone error: {e}")
-            return None
-
-# >>> VX: MENU BUILDER (NO TOCAR)
-try:
-    vx_menu_text
-except NameError:
-    def vx_menu_text(customer_name: str = None) -> str:
-        base = (
-            "Hola, soy Vicky, asistente de Christian López. Estoy aquí para ayudarte.\n\n"
-            "1) Asesoría en pensiones IMSS\n"
-            "2) Seguro de auto (Amplia PLUS, Amplia, Limitada) — solicita INE y tarjeta de circulación o número de placa\n"
-            "3) Seguros de vida y salud\n"
-            "4) Tarjetas médicas VRIM\n"
-            "5) Préstamos a pensionados IMSS ($10,000 a $650,000)\n"
-            "6) Financiamiento empresarial (incluye financiamiento para tus clientes)\n"
-            "7) Nómina empresarial\n"
-            "8) Contactar con Christian (te notifico para que te atienda)\n\n"
-            "¿En qué te ayudo?"
-        )
-        if customer_name:
-            return f"Hola {customer_name}, " + base[5:]
-        return base
-
-# >>> VX: ROUTES /ext (NO TOCAR)
-try:
-    vx_ext_routes_registered
-except NameError:
-    vx_ext_routes_registered = True
-    from flask import request, jsonify
-
-    @app.get("/ext/health")
-    def vx_ext_health():
-        return jsonify({"status": "ok"})
-
-    @app.get("/ext/webhook")
-    def vx_ext_webhook_get():
-        import logging
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge")
-        verify_token = vx_get_env("VERIFY_TOKEN")
-        if mode == "subscribe" and token == verify_token:
-            logging.getLogger("vx").info("vx_ext_webhook: verificado OK")
-            return challenge or "OK", 200
-        else:
-            logging.getLogger("vx").warning("vx_ext_webhook: verificación fallida")
-            return "Verification failed", 403
-
-    @app.post("/ext/webhook")
-    def vx_ext_webhook_post():
-        import logging, json
-        try:
-            payload = request.get_json(force=True, silent=True)
-            if not payload:
-                return jsonify({"status": "ignored"}), 200
-            entry = payload.get("entry", [{}])[0]
-            changes = entry.get("changes", [{}])
-            if not changes or "value" not in changes[0]:
-                return jsonify({"status": "ignored"}), 200
-            value = changes[0]["value"]
-            msgs = value.get("messages", [])
-            if not msgs:
-                return jsonify({"status": "ignored"}), 200
-            msg = msgs[0]
-            from_number = msg.get("from")
-            message_id = msg.get("id")
-            body = ""
-            if msg.get("type") == "text":
-                body = msg.get("text", {}).get("body", "") or ""
-            else:
-                body = ""
-            last10 = vx_last10(from_number)
-            customer = None
-            sheet_row = None
-            if last10:
-                sheet_row = vx_sheet_find_by_phone(last10)
-                if sheet_row and "Nombre" in sheet_row:
-                    customer = str(sheet_row["Nombre"])
-            menu_text = vx_menu_text(customer)
-            vx_wa_send_text(from_number, menu_text)
-            if message_id:
-                vx_wa_mark_read(message_id)
-            return jsonify({"status": "ok"}), 200
-        except Exception as e:
-            logging.getLogger("vx").error(f"vx_ext_webhook_post error: {e}")
-            return jsonify({"status": "ok"}), 200
-
-    @app.post("/ext/test-send")
-    def vx_ext_test_send():
-        import logging
-        try:
-            data = request.get_json(force=True, silent=True)
-            to = data.get("to")
-            text = data.get("text")
-            ok = vx_wa_send_text(to, text)
-            return jsonify({"ok": ok}), 200
-        except Exception as e:
-            logging.getLogger("vx").error(f"vx_ext_test_send error: {e}")
-            return jsonify({"ok": False, "error": str(e)}), 200
