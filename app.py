@@ -377,7 +377,7 @@ def verify_webhook():
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-    verify_token = os.getenv("WEBHOOK_VERIFY_TOKEN", "vicky-secom-verify")
+    verify_token = os.getenv("VERIFY_TOKEN", "vicky-verify-2025")
     if mode == "subscribe" and token == verify_token:
         return challenge, 200
     return "forbidden", 403
