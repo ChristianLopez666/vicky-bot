@@ -4,77 +4,62 @@ import requests
 from flask import Flask, request, jsonify
 import gspread
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 import openai
-import io
-from datetime import datetime
-import re
+from datetime import datetime, timedelta
+import time
 import json
+from threading import Thread
 
-# Configuración de logging
+# Configuración
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Configuración de variables de entorno
+# Variables de entorno
 META_ACCESS_TOKEN = os.getenv('META_ACCESS_TOKEN')
 VERIFY_TOKEN = os.getenv('VERIFY_TOKEN', 'vicky-verify-2025')
-ADVISOR_NUMBER = os.getenv('ADVISOR_NUMBER')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
 # Configurar OpenAI
 openai.api_key = OPENAI_API_KEY
 
-# Inicializar servicios de Google
-sheet = None
-drive_service = None
+# Base de datos de campañas y seguimientos
+campañas_activas = {}
+seguimiento_clientes = {}
 
+# Configuración de Google Sheets
+sheet = None
 try:
     GOOGLE_SHEETS_CREDENTIALS = os.getenv('GOOGLE_SHEETS_CREDENTIALS')
     if GOOGLE_SHEETS_CREDENTIALS:
         creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS)
         credentials = service_account.Credentials.from_service_account_info(creds_dict)
-        scoped_credentials = credentials.with_scopes([
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive'
-        ])
-        client = gspread.authorize(scoped_credentials)
-        sheet = client.open("Prospectos SECOM Auto").sheet1
+        client = gspread.authorize(credentials)
+        sheet = client.open("SECOM").sheet1
         logger.info("✅ Google Sheets configurado")
 except Exception as e:
-    logger.warning(f"❌ Google Sheets no configurado: {e}")
-
-try:
-    GOOGLE_DRIVE_CREDENTIALS = os.getenv('GOOGLE_DRIVE_CREDENTIALS')
-    if GOOGLE_DRIVE_CREDENTIALS:
-        creds_dict = json.loads(GOOGLE_DRIVE_CREDENTIALS)
-        credentials = service_account.Credentials.from_service_account_info(creds_dict)
-        drive_service = build('drive', 'v3', credentials=credentials)
-        logger.info("✅ Google Drive configurado")
-except Exception as e:
-    logger.warning(f"❌ Google Drive no configurado: {e}")
+    logger.error(f"❌ Error Sheets: {e}")
 
 def get_gpt_response(prompt):
-    """Obtiene respuesta de OpenAI GPT"""
+    """Obtiene respuesta con tono cálido de GPT"""
     try:
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "Eres Vicky, una asistente virtual educada y servicial de SECOM. Ofreces información sobre pensiones IMSS, seguros de auto, tarjetas médicas VRIM y contactas con asesores."},
+                {"role": "system", "content": "Eres Vicky, asistente de SECOM. Usa un tono cálido, empático y cercano. Sé persuasiva pero no insistente."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=150,
-            temperature=0.7
+            temperature=0.8
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"Error en GPT: {e}")
-        return "Lo siento, estoy teniendo dificultades técnicas. Por favor, selecciona una opción del menú:\n\n1️⃣ Pensiones IMSS\n2️⃣ Seguros de Auto\n5️⃣ Tarjetas médicas VRIM\n7️⃣ Contactar a Christian"
+        logger.error(f"Error GPT: {e}")
+        return None
 
-def send_whatsapp_message(phone_number, message):
-    """Envía mensaje a través de Meta WhatsApp API"""
+def enviar_mensaje_whatsapp(numero, mensaje):
+    """Envía mensaje por WhatsApp Business API"""
     try:
         url = "https://graph.facebook.com/v17.0/118469193281675/messages"
         headers = {
@@ -83,269 +68,244 @@ def send_whatsapp_message(phone_number, message):
         }
         data = {
             "messaging_product": "whatsapp",
-            "to": phone_number,
-            "text": {"body": message}
+            "to": numero,
+            "text": {"body": mensaje}
         }
         
         response = requests.post(url, headers=headers, json=data)
         if response.status_code == 200:
-            logger.info(f"✅ Mensaje enviado a {phone_number}")
+            logger.info(f"✅ Mensaje enviado a {numero}")
             return True
         else:
-            logger.error(f"❌ Error enviando mensaje: {response.status_code} - {response.text}")
+            logger.error(f"❌ Error enviando mensaje: {response.text}")
             return False
     except Exception as e:
-        logger.error(f"❌ Excepción enviando mensaje: {e}")
+        logger.error(f"❌ Error API WhatsApp: {e}")
         return False
 
-def notify_advisor(client_number, service_type, message=None):
-    """Notifica al asesor sobre un nuevo prospecto"""
+def cargar_base_datos():
+    """Carga clientes desde Google Sheets"""
     try:
-        notification = f"🚨 NUEVO PROSPECTO 🚨\n\n📞 Teléfono: {client_number}\n📋 Servicio: {service_type}"
-        if message:
-            notification += f"\n💬 Mensaje: {message}"
+        if not sheet:
+            return []
         
-        send_whatsapp_message(ADVISOR_NUMBER, notification)
+        records = sheet.get_all_records()
+        clientes = []
         
-        if sheet:
-            try:
-                next_row = len(sheet.get_all_values()) + 1
-                sheet.update(f"A{next_row}:D{next_row}", [[
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    client_number,
-                    service_type,
-                    "Activo"
-                ]])
-                logger.info(f"✅ Prospecto registrado en Sheets: {client_number}")
-            except Exception as e:
-                logger.error(f"❌ Error registrando en Sheets: {e}")
+        for record in records:
+            if record.get('Telefono') and record.get('Nombre'):
+                clientes.append({
+                    'nombre': record['Nombre'],
+                    'telefono': record['Telefono'],
+                    'producto_interes': record.get('Producto', ''),
+                    'estado': record.get('Estado', 'Activo')
+                })
         
-        logger.info(f"✅ Asesor notificado: {client_number}")
-        return True
+        logger.info(f"📊 {len(clientes)} clientes cargados")
+        return clientes
+        
     except Exception as e:
-        logger.error(f"❌ Error notificando al asesor: {e}")
-        return False
+        logger.error(f"❌ Error cargando BD: {e}")
+        return []
 
-# WEBHOOK PRINCIPAL - VERSIÓN SIMPLIFICADA Y ROBUSTA
+def generar_mensaje_personalizado(nombre_cliente, tipo_campaña):
+    """Genera mensaje personalizado usando GPT"""
+    
+    plantillas = {
+        "seguro_auto": f"""Hola {nombre_cliente}, INBURSA te ofrece hasta un 60% de descuento en tu seguro de auto. 
+
+Este descuento puede ser aprovechado para cualquier familiar que viva en tu domicilio.
+
+¿Te gustaría que te envíe una cotización personalizada?""",
+
+        "tarjeta_credito": f"""Hola {nombre_cliente}, tenemos una promoción exclusiva de tarjetas de crédito para ti.
+
+Sin anualidad el primer año y aprobación inmediata.
+
+¿Puedo ayudarte con el proceso?""",
+
+        "credito_personal": f"""Hola {nombre_cliente}, ¿necesitas liquidez?
+
+Tenemos créditos personales con tasas preferenciales para clientes SECOM.
+
+¡Solicita hasta $100,000 sin aval!"""
+    }
+    
+    # Usar plantilla base y mejorar con GPT
+    plantilla_base = plantillas.get(tipo_campaña, plantillas["seguro_auto"])
+    
+    prompt = f"""Mejora este mensaje comercial para que suene más cálido y natural, manteniendo la esencia del mensaje original:
+
+Mensaje original: {plantilla_base}
+
+Requisitos:
+- Mantener la información clave del descuento/promoción
+- Usar un tono amigable y cercano
+- Incluir el nombre del cliente: {nombre_cliente}
+- Máximo 2 párrafos"""
+
+    mensaje_mejorado = get_gpt_response(prompt)
+    
+    return mensaje_mejorado if mensaje_mejorado else plantilla_base
+
+def ejecutar_campaña_masiva(tipo_campaña):
+    """Ejecuta envío masivo para una campaña"""
+    logger.info(f"🚀 Iniciando campaña: {tipo_campaña}")
+    
+    clientes = cargar_base_datos()
+    if not clientes:
+        logger.error("❌ No hay clientes para la campaña")
+        return
+    
+    for cliente in clientes:
+        if cliente['estado'] != 'Activo':
+            continue
+            
+        # Generar mensaje personalizado
+        mensaje = generar_mensaje_personalizado(cliente['nombre'], tipo_campaña)
+        
+        # Enviar mensaje
+        if enviar_mensaje_whatsapp(cliente['telefono'], mensaje):
+            # Registrar en seguimiento
+            seguimiento_clientes[cliente['telefono']] = {
+                'nombre': cliente['nombre'],
+                'campaña': tipo_campaña,
+                'primer_envio': datetime.now(),
+                'ultimo_envio': datetime.now(),
+                'respuestas': 0,
+                'estado': 'enviado'
+            }
+            
+            # Programar recordatorios
+            programar_recordatorio(cliente['telefono'], 3)  # 3 días
+            programar_recordatorio(cliente['telefono'], 5)  # 5 días
+        
+        time.sleep(2)  # Rate limiting
+
+def programar_recordatorio(telefono, dias_despues):
+    """Programa recordatorio automático"""
+    def enviar_recordatorio():
+        time.sleep(dias_despues * 24 * 3600)  # Esperar X días
+        
+        cliente = seguimiento_clientes.get(telefono)
+        if cliente and cliente['respuestas'] == 0:  # Solo si no ha respondido
+            
+            if dias_despues == 3:
+                mensaje = f"Hola {cliente['nombre']}, solo pasaba para recordarte nuestra promoción especial. ¿Tienes alguna pregunta sobre el {cliente['campaña']}?"
+            else:  # día 5 - cierre de embudo
+                mensaje = f"Entiendo que por el momento no estás interesado/a {cliente['nombre']}. Estaremos a la orden para cuando quieras una propuesta. ¡Que tengas un excelente día!"
+            
+            if enviar_mensaje_whatsapp(telefono, mensaje):
+                seguimiento_clientes[telefono]['ultimo_envio'] = datetime.now()
+                
+                if dias_despues == 5:
+                    seguimiento_clientes[telefono]['estado'] = 'cerrado'
+    
+    thread = Thread(target=enviar_recordatorio)
+    thread.daemon = True
+    thread.start()
+
+# WEBHOOK para respuestas de clientes
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    """Webhook principal para WhatsApp - Versión corregida"""
+    """Maneja respuestas de clientes"""
     
-    # VERIFICACIÓN DEL WEBHOOK (GET)
     if request.method == "GET":
-        logger.info("=== SOLICITUD DE VERIFICACIÓN META RECIBIDA ===")
-        
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
         
-        logger.info(f"Mode: {mode}")
-        logger.info(f"Token recibido: {token}")
-        logger.info(f"Token esperado: {VERIFY_TOKEN}")
-        logger.info(f"Challenge: {challenge}")
-        
-        # Verificar los parámetros
-        if not all([mode, token, challenge]):
-            logger.error("❌ Faltan parámetros en la solicitud")
-            return "Missing parameters", 400
-        
-        if mode == "subscribe" and token == VERIFY_TOKEN:
-            logger.info("✅✅✅ VERIFICACIÓN EXITOSA - Webhook configurado correctamente")
-            # Devolver el challenge como texto plano
+        if mode and token and mode == "subscribe" and token == VERIFY_TOKEN:
+            logger.info("✅ Webhook verificado")
             from flask import Response
-            response = Response(challenge, status=200, mimetype='text/plain')
-            return response
-        else:
-            logger.error(f"❌ VERIFICACIÓN FALLIDA - Token mismatch: {token} vs {VERIFY_TOKEN}")
-            return "Verification failed", 403
+            return Response(challenge, mimetype='text/plain')
+        return "Verification failed", 403
     
-    # PROCESAR MENSAJES (POST)
     elif request.method == "POST":
-        logger.info("📨 Mensaje POST recibido de Meta")
-        
         try:
             data = request.get_json()
-            logger.info(f"Datos recibidos: {json.dumps(data, indent=2)[:500]}...")
             
-            # Verificar estructura básica
-            if not data or data.get("object") != "whatsapp_business_account":
-                logger.error("Estructura de datos inválida")
-                return jsonify({"status": "error"}), 400
+            if data.get("object") == "whatsapp_business_account":
+                for entry in data.get("entry", []):
+                    for change in entry.get("changes", []):
+                        if change.get("field") == "messages":
+                            message_data = change.get("value", {})
+                            procesar_respuesta_cliente(message_data)
             
-            # Procesar entradas
-            entries = data.get("entry", [])
-            logger.info(f"Número de entradas: {len(entries)}")
-            
-            for entry in entries:
-                changes = entry.get("changes", [])
-                for change in changes:
-                    if change.get("field") == "messages":
-                        message_data = change.get("value", {})
-                        process_message(message_data)
-            
-            logger.info("✅ Webhook procesado correctamente")
             return jsonify({"status": "success"}), 200
             
         except Exception as e:
-            logger.error(f"❌ Error procesando webhook POST: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
+            logger.error(f"❌ Error webhook: {e}")
+            return jsonify({"status": "error"}), 500
 
-def process_message(message_data):
-    """Procesa los mensajes entrantes"""
+def procesar_respuesta_cliente(message_data):
+    """Procesa respuestas de clientes"""
     try:
         messages = message_data.get("messages", [])
         if not messages:
-            logger.info("No hay mensajes en los datos")
             return
         
         message = messages[0]
-        phone_number = message.get("from")
+        telefono = message.get("from")
         message_type = message.get("type")
         
-        if not phone_number:
-            logger.error("No se encontró número de teléfono")
-            return
-        
-        client_number = re.sub(r'\D', '', phone_number)[-10:]
-        logger.info(f"📱 Procesando mensaje de {client_number}, tipo: {message_type}")
-        
         if message_type == "text":
-            process_text_message(message, client_number)
-        elif message_type in ["image", "document"]:
-            process_media_message(message, client_number, message_type)
-        else:
-            logger.info(f"Tipo de mensaje no manejado: {message_type}")
+            texto = message.get("text", {}).get("body", "").lower()
+            
+            # Actualizar seguimiento
+            if telefono in seguimiento_clientes:
+                seguimiento_clientes[telefono]['respuestas'] += 1
+                seguimiento_clientes[telefono]['ultimo_envio'] = datetime.now()
+                seguimiento_clientes[telefono]['estado'] = 'respondio'
+            
+            # Responder automáticamente
+            if any(palabra in texto for palabra in ['si', 'sí', 'info', 'interesado', 'cuanto', 'cuesta']):
+                respuesta = "¡Me alegra tu interés! Te conecto con un especialista para que te dé todos los detalles. ¿Puedes compartirme tu email para enviarte la información?"
+                enviar_mensaje_whatsapp(telefono, respuesta)
+            elif any(palabra in texto for palabra in ['no', 'gracias', 'ahora no']):
+                respuesta = "Entendido, gracias por tu tiempo. Si cambias de opinión, aquí estaré para ayudarte. ¡Que tengas un excelente día!"
+                enviar_mensaje_whatsapp(telefono, respuesta)
+                if telefono in seguimiento_clientes:
+                    seguimiento_clientes[telefono]['estado'] = 'no_interesado'
             
     except Exception as e:
-        logger.error(f"❌ Error en process_message: {e}")
+        logger.error(f"❌ Error procesando respuesta: {e}")
 
-def process_text_message(message, client_number):
-    """Procesa mensajes de texto"""
-    try:
-        text_body = message.get("text", {}).get("body", "").strip()
-        logger.info(f"💬 Texto recibido: {text_body}")
-        
-        # Menú de opciones
-        if text_body == "1":
-            response = """🏥 *PENSIONES IMSS*
-
-¿Cumples alguno de estos requisitos?
-
-• 60 años o más
-• 500 semanas cotizadas
-• Trabajaste antes de 1997
-
-Si cumples alguno, ¡podrías tener derecho a tu pensión! Un asesor se contactará contigo."""
-            send_whatsapp_message(client_number, response)
-            notify_advisor(client_number, "Pensiones IMSS")
-            
-        elif text_body == "2":
-            response = """🚗 *SEGUROS DE AUTO*
-
-Protege tu auto con las mejores coberturas:
-
-• Responsabilidad Civil
-• Daños Materiales
-• Robo Total
-• Asistencia Vial
-
-Por favor, envía fotos de:
-1. INE (ambos lados)
-2. Tarjeta de circulación"""
-            send_whatsapp_message(client_number, response)
-            notify_advisor(client_number, "Seguros de Auto")
-            
-        elif text_body == "5":
-            response = """🏥 *TARJETAS MÉDICAS VRIM*
-
-Beneficios exclusivos para militares:
-
-• Atención médica especializada
-• Medicamentos gratuitos
-• Estudios de laboratorio
-• Consultas con especialistas
-
-Un asesor te contactará para explicarte el proceso."""
-            send_whatsapp_message(client_number, response)
-            notify_advisor(client_number, "Tarjetas Médicas VRIM")
-            
-        elif text_body == "7":
-            response = "👨‍💼 Te pondré en contacto con Christian, nuestro especialista. Él te atenderá personalmente en breve."
-            send_whatsapp_message(client_number, response)
-            notify_advisor(client_number, "Contactar Asesor")
-            
-        else:
-            lower_text = text_body.lower()
-            if any(word in lower_text for word in ['hola', 'buenas', 'info', 'opciones', 'menu']):
-                welcome_message = """¡Hola! 👋 Soy Vicky, tu asistente virtual de SECOM.
-
-¿En qué te puedo ayudar? Selecciona una opción:
-
-1️⃣ Pensiones IMSS
-2️⃣ Seguros de Auto  
-5️⃣ Tarjetas médicas VRIM
-7️⃣ Contactar a Christian"""
-                send_whatsapp_message(client_number, welcome_message)
-            else:
-                gpt_response = get_gpt_response(f"El cliente dijo: '{text_body}'. Responde educadamente como Vicky de SECOM y sugiere las opciones del menú.")
-                send_whatsapp_message(client_number, gpt_response)
-            
-    except Exception as e:
-        logger.error(f"❌ Error en process_text_message: {e}")
-        send_whatsapp_message(client_number, "Lo siento, hubo un error. Por favor, selecciona: 1, 2, 5 o 7.")
-
-def process_media_message(message, client_number, message_type):
-    """Procesa archivos multimedia"""
-    try:
-        file_type = "imagen" if message_type == "image" else "documento"
-        logger.info(f"📎 {file_type} recibido de {client_number}")
-        
-        notification = f"📎 Se recibió un {file_type} del cliente {client_number}"
-        send_whatsapp_message(ADVISOR_NUMBER, notification)
-        
-        confirmation = f"✅ Recibí tu {file_type}. Un asesor revisará tu documentación y te contactará pronto."
-        send_whatsapp_message(client_number, confirmation)
-            
-    except Exception as e:
-        logger.error(f"❌ Error en process_media_message: {e}")
-
+# Endpoints de control
 @app.route("/")
 def health_check():
     return jsonify({
         "status": "active",
-        "service": "Vicky Bot SECOM",
-        "webhook_url": "https://vicky-bot-x6wt.onrender.com/webhook",
-        "verify_token": VERIFY_TOKEN,
+        "service": "Vicky SECOM - Campañas Masivas",
+        "clientes_seguimiento": len(seguimiento_clientes),
         "timestamp": datetime.now().isoformat()
     })
 
-@app.route("/debug-webhook")
-def debug_webhook():
-    """Página de debug para el webhook"""
-    return f"""
-    <html>
-        <head><title>Debug Webhook Meta</title></head>
-        <body>
-            <h1>🔧 Debug Webhook Meta</h1>
-            <p><strong>URL del Webhook:</strong> https://vicky-bot-x6wt.onrender.com/webhook</p>
-            <p><strong>Token de Verificación:</strong> {VERIFY_TOKEN}</p>
-            <p><strong>Estado:</strong> ✅ Activo</p>
-            <p><strong>Instrucciones:</strong></p>
-            <ol>
-                <li>Ve a Meta Developer → WhatsApp → Configuration</li>
-                <li>En Callback URL pon: <code>https://vicky-bot-x6wt.onrender.com/webhook</code></li>
-                <li>En Verify Token pon: <code>{VERIFY_TOKEN}</code></li>
-                <li>Haz clic en "Verify and Save"</li>
-            </ol>
-            <p><a href="https://vicky-bot-x6wt.onrender.com/">Volver al inicio</a></p>
-        </body>
-    </html>
-    """
+@app.route("/iniciar-campaña/<tipo_campaña>")
+def iniciar_campaña(tipo_campaña):
+    """Endpoint para iniciar campaña manualmente"""
+    try:
+        thread = Thread(target=ejecutar_campaña_masiva, args=(tipo_campaña,))
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            "status": "campaña_iniciada",
+            "tipo": tipo_campaña,
+            "mensaje": "Campaña en proceso en segundo plano"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/estado-campaña")
+def estado_campaña():
+    """Muestra estado actual de campañas"""
+    return jsonify({
+        "seguimiento_clientes": seguimiento_clientes,
+        "total_clientes": len(seguimiento_clientes)
+    })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    logger.info(f"🚀 Iniciando Vicky Bot en puerto {port}")
-    logger.info(f"🔗 Webhook URL: https://vicky-bot-x6wt.onrender.com/webhook")
-    logger.info(f"🔑 Verify Token: {VERIFY_TOKEN}")
+    logger.info(f"🚀 Vicky SECOM - Sistema de Campañas Masivas iniciado en puerto {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
-
