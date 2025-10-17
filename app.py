@@ -108,7 +108,7 @@ def cargar_base_datos():
         logger.error(f"❌ Error cargando BD: {e}")
         return []
 
-def generar_mensaje_personalizado(nombre_cliente, tipo_campaña):
+def generar_mensaje_personalizado(nombre_cliente, tipo_campana):
     """Genera mensaje personalizado usando GPT"""
     
     plantillas = {
@@ -132,7 +132,7 @@ Tenemos créditos personales con tasas preferenciales para clientes SECOM.
     }
     
     # Usar plantilla base y mejorar con GPT
-    plantilla_base = plantillas.get(tipo_campaña, plantillas["seguro_auto"])
+    plantilla_base = plantillas.get(tipo_campana, plantillas["seguro_auto"])
     
     prompt = f"""Mejora este mensaje comercial para que suene más cálido y natural, manteniendo la esencia del mensaje original:
 
@@ -148,9 +148,9 @@ Requisitos:
     
     return mensaje_mejorado if mensaje_mejorado else plantilla_base
 
-def ejecutar_campaña_masiva(tipo_campaña):
+def ejecutar_campana_masiva(tipo_campana):
     """Ejecuta envío masivo para una campaña"""
-    logger.info(f"🚀 Iniciando campaña: {tipo_campaña}")
+    logger.info(f"🚀 Iniciando campaña: {tipo_campana}")
     
     clientes = cargar_base_datos()
     if not clientes:
@@ -162,14 +162,14 @@ def ejecutar_campaña_masiva(tipo_campaña):
             continue
             
         # Generar mensaje personalizado
-        mensaje = generar_mensaje_personalizado(cliente['nombre'], tipo_campaña)
+        mensaje = generar_mensaje_personalizado(cliente['nombre'], tipo_campana)
         
         # Enviar mensaje
         if enviar_mensaje_whatsapp(cliente['telefono'], mensaje):
             # Registrar en seguimiento
             seguimiento_clientes[cliente['telefono']] = {
                 'nombre': cliente['nombre'],
-                'campaña': tipo_campaña,
+                'campana': tipo_campana,
                 'primer_envio': datetime.now(),
                 'ultimo_envio': datetime.now(),
                 'respuestas': 0,
@@ -191,7 +191,7 @@ def programar_recordatorio(telefono, dias_despues):
         if cliente and cliente['respuestas'] == 0:  # Solo si no ha respondido
             
             if dias_despues == 3:
-                mensaje = f"Hola {cliente['nombre']}, solo pasaba para recordarte nuestra promoción especial. ¿Tienes alguna pregunta sobre el {cliente['campaña']}?"
+                mensaje = f"Hola {cliente['nombre']}, solo pasaba para recordarte nuestra promoción especial. ¿Tienes alguna pregunta sobre el {cliente['campana']}?"
             else:  # día 5 - cierre de embudo
                 mensaje = f"Entiendo que por el momento no estás interesado/a {cliente['nombre']}. Estaremos a la orden para cuando quieras una propuesta. ¡Que tengas un excelente día!"
             
@@ -271,7 +271,7 @@ def procesar_respuesta_cliente(message_data):
     except Exception as e:
         logger.error(f"❌ Error procesando respuesta: {e}")
 
-# Endpoints de control
+# Endpoints de control - CORREGIDOS (sin ñ)
 @app.route("/")
 def health_check():
     return jsonify({
@@ -281,24 +281,24 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     })
 
-@app.route("/iniciar-campaña/<tipo_campaña>")
-def iniciar_campaña(tipo_campaña):
+@app.route("/iniciar-campana/<tipo_campana>")
+def iniciar_campana(tipo_campana):
     """Endpoint para iniciar campaña manualmente"""
     try:
-        thread = Thread(target=ejecutar_campaña_masiva, args=(tipo_campaña,))
+        thread = Thread(target=ejecutar_campana_masiva, args=(tipo_campana,))
         thread.daemon = True
         thread.start()
         
         return jsonify({
-            "status": "campaña_iniciada",
-            "tipo": tipo_campaña,
+            "status": "campana_iniciada",
+            "tipo": tipo_campana,
             "mensaje": "Campaña en proceso en segundo plano"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/estado-campaña")
-def estado_campaña():
+@app.route("/estado-campana")
+def estado_campana():
     """Muestra estado actual de campañas"""
     return jsonify({
         "seguimiento_clientes": seguimiento_clientes,
@@ -309,3 +309,4 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"🚀 Vicky SECOM - Sistema de Campañas Masivas iniciado en puerto {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+
