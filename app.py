@@ -1,11 +1,11 @@
 import os
 import logging
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import gspread
 from google.oauth2 import service_account
 import openai
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
 import json
 from threading import Thread
@@ -217,7 +217,6 @@ def webhook():
         
         if mode and token and mode == "subscribe" and token == VERIFY_TOKEN:
             logger.info("✅ Webhook verificado")
-            from flask import Response
             return Response(challenge, mimetype='text/plain')
         return "Verification failed", 403
     
@@ -271,7 +270,7 @@ def procesar_respuesta_cliente(message_data):
     except Exception as e:
         logger.error(f"❌ Error procesando respuesta: {e}")
 
-# Endpoints de control - CORREGIDOS (sin ñ)
+# Endpoints de control - SIN Ñ
 @app.route("/")
 def health_check():
     return jsonify({
@@ -309,4 +308,5 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"🚀 Vicky SECOM - Sistema de Campañas Masivas iniciado en puerto {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+
 
