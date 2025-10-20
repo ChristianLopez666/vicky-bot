@@ -10,7 +10,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-import openai
 import io
 
 # ---------------------------------------------------------------
@@ -54,12 +53,16 @@ try:
 except Exception as e:
     logger.error(f"❌ Error inicializando clientes de Google: {e}")
 
+# Inicializar OpenAI (manejo de versiones)
 try:
     if OPENAI_API_KEY:
+        # Para la versión 1.x de OpenAI
+        import openai
         openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
         logger.info("✅ Cliente OpenAI inicializado correctamente")
 except Exception as e:
     logger.error(f"❌ Error inicializando cliente OpenAI: {e}")
+    openai_client = None
 
 # Controles en memoria
 PROCESSED_MESSAGE_IDS = {}
@@ -114,18 +117,23 @@ def update_client_status(phone, status, additional_data=None):
         for i, record in enumerate(records, start=2):  # start=2 porque la primera fila es encabezado
             record_phone = str(record.get('WhatsApp', '') or record.get('Teléfono', '') or '')
             if record_phone and record_phone[-10:] == phone_normalized:
-                # Actualizar estatus
-                worksheet.update_cell(i, worksheet.find("Estatus").col, status)
+                # Encontrar columnas por nombre
+                col_names = worksheet.row_values(1)
+                status_col = col_names.index("Estatus") + 1 if "Estatus" in col_names else None
+                last_contact_col = col_names.index("Último Contacto") + 1 if "Último Contacto" in col_names else None
                 
-                # Actualizar fecha de último contacto
-                if worksheet.find("Último Contacto"):
-                    worksheet.update_cell(i, worksheet.find("Último Contacto").col, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                if status_col:
+                    worksheet.update_cell(i, status_col, status)
+                
+                if last_contact_col:
+                    worksheet.update_cell(i, last_contact_col, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                 
                 # Actualizar datos adicionales
                 if additional_data:
                     for key, value in additional_data.items():
-                        if worksheet.find(key):
-                            worksheet.update_cell(i, worksheet.find(key).col, value)
+                        if key in col_names:
+                            col_idx = col_names.index(key) + 1
+                            worksheet.update_cell(i, col_idx, value)
                 
                 logger.info(f"✅ Estatus actualizado para {phone}: {status}")
                 return True
@@ -141,23 +149,30 @@ def register_new_interaction(phone, interaction_type, details):
     
     try:
         client_data = find_client_in_sheet(phone)
+        
+        sheet = sheets_client.open_by_key(SHEETS_ID_LEADS)
+        worksheet = sheet.worksheet(SHEETS_TITLE_LEADS)
+        col_names = worksheet.row_values(1)
+        
         if not client_data:
             # Crear nuevo registro si no existe
-            sheet = sheets_client.open_by_key(SHEETS_ID_LEADS)
-            worksheet = sheet.worksheet(SHEETS_TITLE_LEADS)
+            new_row = [""] * len(col_names)
             
-            new_row = [
-                phone[-10:],  # WhatsApp (últimos 10 dígitos)
-                "",  # Nombre (desconocido)
-                "",  # Email
-                "",  # RFC
-                "Nuevo Prospecto",  # Estatus
-                interaction_type,  # Tipo de Interacción
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # Último Contacto
-                details,  # Detalles
-                "",  # Vencimiento Póliza
-                datetime.now().strftime("%Y-%m-%d")  # Fecha Registro
-            ]
+            # Mapear datos a columnas
+            if "WhatsApp" in col_names:
+                new_row[col_names.index("WhatsApp")] = phone[-10:]
+            if "Nombre" in col_names:
+                new_row[col_names.index("Nombre")] = "Nuevo Cliente"
+            if "Estatus" in col_names:
+                new_row[col_names.index("Estatus")] = "Nuevo Prospecto"
+            if "Tipo de Interacción" in col_names:
+                new_row[col_names.index("Tipo de Interacción")] = interaction_type
+            if "Último Contacto" in col_names:
+                new_row[col_names.index("Último Contacto")] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if "Detalles" in col_names:
+                new_row[col_names.index("Detalles")] = details
+            if "Fecha Registro" in col_names:
+                new_row[col_names.index("Fecha Registro")] = datetime.now().strftime("%Y-%m-%d")
             
             worksheet.append_row(new_row)
             logger.info(f"✅ Nuevo cliente registrado: {phone}")
@@ -175,68 +190,36 @@ def register_new_interaction(phone, interaction_type, details):
         return False
 
 # ---------------------------------------------------------------
-# SECCIÓN: GOOGLE DRIVE (RESPALDO)
+# SECCIÓN: MOTOR GPT (CORREGIDO)
 # ---------------------------------------------------------------
 
-def save_to_drive(file_bytes, filename, client_phone, mime_type=None):
-    """Guarda archivo en Google Drive"""
-    if not drive_service or not DRIVE_FOLDER_ID:
-        logger.warning("❌ Servicio de Drive no disponible")
+def ask_gpt(prompt, system_message=None):
+    """Consulta a GPT para respuestas naturales"""
+    if not openai_client:
         return None
     
     try:
-        # Determinar tipo MIME
-        if not mime_type:
-            if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-                mime_type = 'image/jpeg'
-            elif filename.lower().endswith('.pdf'):
-                mime_type = 'application/pdf'
-            elif filename.lower().endswith(('.mp3', '.ogg', '.wav')):
-                mime_type = 'audio/mpeg'
-            else:
-                mime_type = 'application/octet-stream'
+        system_msg = system_message or (
+            "Eres Vicky, asistente virtual de Christian López en SECOM. "
+            "Eres cálida, profesional y servicial. Responde en español de manera "
+            "breve, clara y orientada a soluciones. Usa emojis moderadamente. "
+            "Si no tienes información específica, sugiere contactar al asesor."
+        )
         
-        # Crear nombre de carpeta del cliente
-        client_data = find_client_in_sheet(client_phone)
-        client_name = client_data.get('nombre', '') if client_data else ''
-        folder_name = f"{client_name}_{client_phone[-4:]}" if client_name else f"Cliente_{client_phone[-4:]}"
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",  # Modelo más económico y rápido
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=150,
+            temperature=0.7
+        )
         
-        # Buscar o crear carpeta del cliente
-        folder_query = f"name='{folder_name}' and '{DRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-        folder_results = drive_service.files().list(q=folder_query).execute()
-        
-        if folder_results.get('files'):
-            folder_id = folder_results['files'][0]['id']
-        else:
-            # Crear nueva carpeta
-            folder_metadata = {
-                'name': folder_name,
-                'mimeType': 'application/vnd.google-apps.folder',
-                'parents': [DRIVE_FOLDER_ID]
-            }
-            folder = drive_service.files().create(body=folder_metadata, fields='id').execute()
-            folder_id = folder.get('id')
-        
-        # Subir archivo
-        file_metadata = {
-            'name': filename,
-            'parents': [folder_id]
-        }
-        
-        file_stream = io.BytesIO(file_bytes)
-        media = MediaIoBaseUpload(file_stream, mimetype=mime_type, resumable=True)
-        
-        file = drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, webViewLink'
-        ).execute()
-        
-        logger.info(f"✅ Archivo guardado en Drive: {filename}")
-        return file.get('webViewLink')
+        return response.choices[0].message.content.strip()
     
     except Exception as e:
-        logger.error(f"❌ Error guardando archivo en Drive: {e}")
+        logger.error(f"❌ Error consultando GPT: {e}")
         return None
 
 # ---------------------------------------------------------------
@@ -280,43 +263,6 @@ def send_message(to, text):
         logger.error(f"❌ Error enviando mensaje: {e}")
         return None
 
-def send_template(template_name, to, variables=None):
-    """Envía plantilla de WhatsApp"""
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    components = []
-    if variables:
-        components = [{
-            "type": "body",
-            "parameters": [{"type": "text", "text": str(var)} for var in variables]
-        }]
-    
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        "template": {
-            "name": template_name,
-            "language": {"code": "es_MX"},
-            "components": components
-        }
-    }
-    
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
-        if response.status_code == 200:
-            logger.info(f"✅ Plantilla {template_name} enviada a {to}")
-        else:
-            logger.error(f"❌ Error enviando plantilla: {response.status_code} - {response.text}")
-        return response
-    except Exception as e:
-        logger.error(f"❌ Error enviando plantilla: {e}")
-        return None
-
 def send_main_menu(to, client_name=None):
     """Envía el menú principal personalizado"""
     greeting = f"👋 Hola {client_name}, " if client_name else "👋 Hola, "
@@ -336,39 +282,6 @@ def send_main_menu(to, client_name=None):
     )
     
     send_message_async(to, menu_text)
-
-# ---------------------------------------------------------------
-# SECCIÓN: MOTOR GPT
-# ---------------------------------------------------------------
-
-def ask_gpt(prompt, system_message=None):
-    """Consulta a GPT para respuestas naturales"""
-    if not openai_client:
-        return None
-    
-    try:
-        system_msg = system_message or (
-            "Eres Vicky, asistente virtual de Christian López en SECOM. "
-            "Eres cálida, profesional y servicial. Responde en español de manera "
-            "breve, clara y orientada a soluciones. Usa emojis moderadamente. "
-            "Si no tienes información específica, sugiere contactar al asesor."
-        )
-        
-        response = openai_client.chat.completions.create(
-            model="gpt-4-turbo-preview",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=150,
-            temperature=0.7
-        )
-        
-        return response.choices[0].message.content.strip()
-    
-    except Exception as e:
-        logger.error(f"❌ Error consultando GPT: {e}")
-        return None
 
 # ---------------------------------------------------------------
 # SECCIÓN: FLUJOS SECOM PRINCIPALES
@@ -524,7 +437,7 @@ def handle_contact_advisor(to, client_phone, message_text):
     return True
 
 # ---------------------------------------------------------------
-# SECCIÓN: WEBHOOK PRINCIPAL
+# SECCIÓN: WEBHOOK PRINCIPAL (SIMPLIFICADO)
 # ---------------------------------------------------------------
 
 @app.route("/webhook", methods=["GET"])
@@ -553,20 +466,10 @@ def receive_message():
     # Limpieza periódica de controles en memoria
     now = datetime.now().timestamp()
     MSG_TTL = 600
-    GREET_TTL = 24 * 3600
-    CTX_TTL = 4 * 3600
 
     # Limpiar mensajes procesados antiguos
-    if len(PROCESSED_MESSAGE_IDS) > 5000:
+    if len(PROCESSED_MESSAGE_IDS) > 1000:
         PROCESSED_MESSAGE_IDS = {k: v for k, v in PROCESSED_MESSAGE_IDS.items() if now - v < MSG_TTL}
-    
-    # Limpiar usuarios saludados antiguos
-    if len(GREETED_USERS) > 5000:
-        GREETED_USERS = {k: v for k, v in GREETED_USERS.items() if now - v < GREET_TTL}
-    
-    # Limpiar contextos antiguos
-    if len(USER_CONTEXT) > 5000:
-        USER_CONTEXT = {k: v for k, v in USER_CONTEXT.items() if now - v.get("timestamp", now) < CTX_TTL}
 
     for entry in data.get("entry", []):
         for change in entry.get("changes", []):
@@ -585,6 +488,14 @@ def receive_message():
             msg_type = message.get("type")
             sender = message.get("from")
             
+            # Verificar duplicados
+            if msg_id:
+                last_seen = PROCESSED_MESSAGE_IDS.get(msg_id)
+                if last_seen and (now - last_seen) < MSG_TTL:
+                    logger.info(f"🔁 Mensaje duplicado ignorado: {msg_id}")
+                    continue
+                PROCESSED_MESSAGE_IDS[msg_id] = now
+            
             # Obtener nombre del perfil
             profile_name = None
             try:
@@ -596,32 +507,21 @@ def receive_message():
             
             logger.info(f"🧾 id={msg_id} type={msg_type} from={sender} profile={profile_name}")
             
-            # Verificar duplicados
-            if msg_id:
-                last_seen = PROCESSED_MESSAGE_IDS.get(msg_id)
-                if last_seen and (now - last_seen) < MSG_TTL:
-                    logger.info(f"🔁 Mensaje duplicado ignorado: {msg_id}")
-                    continue
-                PROCESSED_MESSAGE_IDS[msg_id] = now
-            
             # Buscar información del cliente
             client_data = find_client_in_sheet(sender)
             client_name = client_data.get('nombre') if client_data else None
             
-            # Manejar diferentes tipos de mensaje
+            # Manejar mensajes de texto
             if msg_type == "text":
-                handle_text_message(sender, message, client_name, client_data)
-            
-            elif msg_type in ["image", "document", "audio"]:
-                handle_media_message(sender, message, msg_type, client_name)
-            
+                handle_text_message(sender, message, client_name)
             else:
-                logger.info(f"ℹ️ Mensaje no manejado tipo: {msg_type}")
-                send_message_async(sender, "⚠️ Lo siento, solo puedo procesar texto, imágenes, documentos y audio por ahora.")
+                # Para otros tipos de mensaje, enviar menú principal
+                send_main_menu(sender, client_name)
+                GREETED_USERS[sender] = now
     
     return jsonify({"status": "ok"}), 200
 
-def handle_text_message(sender, message, client_name, client_data):
+def handle_text_message(sender, message, client_name):
     """Maneja mensajes de texto"""
     text = message.get("text", {}).get("body", "").strip()
     text_lower = text.lower()
@@ -649,13 +549,13 @@ def handle_text_message(sender, message, client_name, client_data):
     
     # Opciones del menú
     option_handlers = {
-        "1": handle_policy_renewal,
-        "2": handle_auto_documents,
-        "3": handle_promotions,
-        "4": handle_follow_up,
+        "1": lambda to, phone, msg: handle_policy_renewal(to, phone, msg),
+        "2": lambda to, phone, msg: handle_auto_documents(to, phone, msg),
+        "3": lambda to, phone, msg: handle_promotions(to, phone),
+        "4": lambda to, phone, msg: handle_follow_up(to, phone),
         "5": lambda to, phone, msg: send_message_async(to, "📞 Para préstamos IMSS, Christian te contactará con las mejores tasas."),
         "6": lambda to, phone, msg: send_message_async(to, "🏥 VRIM: Cobertura médica familiar. Christian te dará todos los detalles."),
-        "7": handle_contact_advisor
+        "7": lambda to, phone, msg: handle_contact_advisor(to, phone, msg)
     }
     
     # Verificar si es una opción numérica
@@ -676,7 +576,7 @@ def handle_text_message(sender, message, client_name, client_data):
     # Si ya fue saludado pero no entendemos el mensaje
     if sender in GREETED_USERS:
         # Usar GPT como fallback para mensajes naturales
-        if len(text.split()) >= 3 and any(c.isalpha() for c in text):
+        if len(text.split()) >= 2 and any(c.isalpha() for c in text):
             gpt_response = ask_gpt(f"El cliente dice: '{text}'. Responde brevemente como asistente de seguros.")
             if gpt_response:
                 send_message_async(sender, gpt_response)
@@ -691,112 +591,29 @@ def handle_text_message(sender, message, client_name, client_data):
         send_main_menu(sender, client_name)
         GREETED_USERS[sender] = datetime.now().timestamp()
 
-def handle_media_message(sender, message, msg_type, client_name):
-    """Maneja mensajes multimedia"""
-    media_info = None
-    file_extension = ""
-    mime_type = ""
-    
-    if msg_type == "image":
-        media_info = message.get("image", {})
-        file_extension = ".jpg"
-        mime_type = "image/jpeg"
-    elif msg_type == "document":
-        media_info = message.get("document", {})
-        filename = media_info.get("filename", "documento")
-        file_extension = "." + filename.split(".")[-1] if "." in filename else ""
-        mime_type = media_info.get("mime_type", "application/octet-stream")
-    elif msg_type == "audio":
-        media_info = message.get("audio", {})
-        file_extension = ".ogg"
-        mime_type = "audio/ogg"
-    
-    if not media_info:
-        send_message_async(sender, "⚠️ No pude procesar el archivo. Intenta nuevamente.")
-        return
-    
-    media_id = media_info.get("id")
-    if not media_id:
-        send_message_async(sender, "⚠️ Error al obtener el archivo.")
-        return
-    
-    # Descargar media
-    try:
-        # Obtener URL del media
-        url = f"https://graph.facebook.com/v21.0/{media_id}"
-        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
-        media_response = requests.get(url, headers=headers, timeout=10)
-        
-        if media_response.status_code != 200:
-            send_message_async(sender, "⚠️ Error al descargar el archivo.")
-            return
-        
-        media_data = media_response.json()
-        media_url = media_data.get("url")
-        
-        if not media_url:
-            send_message_async(sender, "⚠️ Error al obtener URL del archivo.")
-            return
-        
-        # Descargar contenido
-        download_response = requests.get(media_url, headers=headers, timeout=15)
-        if download_response.status_code != 200:
-            send_message_async(sender, "⚠️ Error al descargar el contenido.")
-            return
-        
-        file_bytes = download_response.content
-        
-        # Crear nombre de archivo
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{msg_type}_{timestamp}{file_extension}"
-        
-        # Guardar en Drive
-        drive_url = save_to_drive(file_bytes, filename, sender, mime_type)
-        
-        if drive_url:
-            # Notificar al asesor si es documento importante
-            if msg_type in ["image", "document"] and ADVISOR_NUMBER:
-                advisor_msg = (
-                    f"📎 *Nuevo archivo recibido*\n\n"
-                    f"👤 De: {client_name or sender}\n"
-                    f"📱 Tel: {sender}\n"
-                    f"📂 Tipo: {msg_type}\n"
-                    f"🔗 Drive: {drive_url}"
-                )
-                send_message_async(ADVISOR_NUMBER, advisor_msg)
-            
-            # Confirmar al cliente
-            confirmation_msg = (
-                f"✅ ¡Gracias! He recibido tu {msg_type} y lo he guardado "
-                f"de forma segura en tu expediente."
-            )
-            
-            # Mensaje adicional según contexto
-            context = USER_CONTEXT.get(sender, {}).get("context")
-            if context == "awaiting_auto_docs":
-                confirmation_msg += (
-                    "\n\n¿Tienes más documentos para enviar o prefieres "
-                    "que proceda con la cotización?"
-                )
-            
-            send_message_async(sender, confirmation_msg)
-            register_new_interaction(sender, f"Archivo {msg_type} Recibido", f"Guardado en Drive: {drive_url}")
-        
-        else:
-            send_message_async(sender, "⚠️ Recibí tu archivo pero hubo un error al guardarlo. Intenta más tarde.")
-    
-    except Exception as e:
-        logger.error(f"❌ Error procesando media: {e}")
-        send_message_async(sender, "⚠️ Ocurrió un error al procesar tu archivo. Intenta más tarde.")
-
 # ---------------------------------------------------------------
 # SECCIÓN: ENDPOINTS AUXILIARES
 # ---------------------------------------------------------------
 
+@app.route("/", methods=["GET"])
+def home():
+    """Página de inicio"""
+    return jsonify({
+        "status": "ok", 
+        "service": "Vicky Bot SECOM",
+        "timestamp": datetime.now().isoformat()
+    }), 200
+
 @app.route("/health", methods=["GET"])
 def health():
     """Endpoint de salud"""
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()}), 200
+    return jsonify({
+        "status": "ok", 
+        "timestamp": datetime.now().isoformat(),
+        "whatsapp_connected": bool(WHATSAPP_TOKEN and PHONE_NUMBER_ID),
+        "sheets_connected": bool(sheets_client),
+        "openai_connected": bool(openai_client)
+    }), 200
 
 @app.route("/ext/test-send", methods=["POST"])
 def test_send():
@@ -804,66 +621,18 @@ def test_send():
     try:
         data = request.get_json()
         to = data.get("to")
-        text = data.get("text")
+        text = data.get("text", "Mensaje de prueba de Vicky Bot SECOM")
         
-        if not to or not text:
-            return jsonify({"error": "Faltan parámetros 'to' o 'text'"}), 400
+        if not to:
+            return jsonify({"error": "Falta parámetro 'to'"}), 400
         
         result = send_message(to, text)
-        return jsonify({"success": result is not None}), 200
+        success = result is not None and result.status_code == 200
+        return jsonify({"success": success}), 200
     
     except Exception as e:
         logger.error(f"❌ Error en test-send: {e}")
         return jsonify({"error": str(e)}), 500
-
-@app.route("/ext/send-promo", methods=["POST"])
-def send_promo():
-    """Endpoint para envío masivo de promociones"""
-    def _send_promo_async():
-        try:
-            data = request.get_json()
-            template_name = data.get("template", "promocion_secom")
-            phones = data.get("phones", [])
-            
-            if not phones:
-                logger.error("❌ No se proporcionaron números para envío masivo")
-                return
-            
-            success_count = 0
-            for phone in phones:
-                try:
-                    result = send_template(template_name, phone)
-                    if result and result.status_code == 200:
-                        success_count += 1
-                    
-                    # Pequeña pausa para evitar rate limiting
-                    threading.Event().wait(0.5)
-                    
-                except Exception as e:
-                    logger.error(f"❌ Error enviando a {phone}: {e}")
-            
-            logger.info(f"✅ Envío masivo completado: {success_count}/{len(phones)} exitosos")
-            
-            # Notificar al asesor
-            if ADVISOR_NUMBER:
-                summary_msg = (
-                    f"📊 *Resumen Envío Masivo*\n\n"
-                    f"📤 Enviados: {len(phones)}\n"
-                    f"✅ Exitosos: {success_count}\n"
-                    f"❌ Fallidos: {len(phones) - success_count}\n"
-                    f"⏰ Hora: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-                )
-                send_message(ADVISOR_NUMBER, summary_msg)
-                
-        except Exception as e:
-            logger.error(f"❌ Error en envío masivo: {e}")
-    
-    # Ejecutar en hilo separado para evitar timeout
-    thread = threading.Thread(target=_send_promo_async)
-    thread.daemon = True
-    thread.start()
-    
-    return jsonify({"status": "procesando", "message": "Envío masivo iniciado en segundo plano"}), 202
 
 # ---------------------------------------------------------------
 # EJECUCIÓN PRINCIPAL
@@ -877,7 +646,7 @@ if __name__ == "__main__":
     logger.info(f"📱 Phone Number ID: {PHONE_NUMBER_ID}")
     logger.info(f"👤 Advisor Number: {ADVISOR_NUMBER}")
     logger.info(f"📊 Sheets ID: {SHEETS_ID_LEADS}")
-    logger.info(f"📁 Drive Folder: {DRIVE_FOLDER_ID}")
     
     app.run(host="0.0.0.0", port=port, debug=debug)
+
 
