@@ -4,12 +4,10 @@ import requests
 from flask import Flask, request, jsonify, Response
 import gspread
 from google.oauth2 import service_account
-from openai import OpenAI
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
 import json
 from threading import Thread
-import uuid
 
 # Configuración de logging
 logging.basicConfig(
@@ -20,27 +18,25 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ==================== CONFIGURACIÓN CRÍTICA ====================
-# VARIABLES DE ENTORNO QUE DEBEN ESTAR EN RENDER:
+# ==================== CONFIGURACIÓN CORREGIDA ====================
+# VARIABLES DE ENTORNO - USAR ESTOS NOMBRES EXACTOS EN RENDER:
 WHATSAPP_ACCESS_TOKEN = os.getenv('WHATSAPP_ACCESS_TOKEN')
 WHATSAPP_VERIFY_TOKEN = os.getenv('WHATSAPP_VERIFY_TOKEN', 'vicky-verify-2025')
 WHATSAPP_PHONE_NUMBER_ID = os.getenv('WHATSAPP_PHONE_NUMBER_ID')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 GOOGLE_SHEETS_CREDENTIALS = os.getenv('GOOGLE_SHEETS_CREDENTIALS')
 
-# Verificar variables críticas
+# Verificar variables críticas (solo log, no detener ejecución)
 if not WHATSAPP_ACCESS_TOKEN:
-    logger.error("❌ WHATSAPP_ACCESS_TOKEN no configurado")
+    logger.warning("⚠️ WHATSAPP_ACCESS_TOKEN no configurado - El bot no podrá enviar mensajes")
 if not WHATSAPP_PHONE_NUMBER_ID:
-    logger.error("❌ WHATSAPP_PHONE_NUMBER_ID no configurado")
-
-# Configurar OpenAI (nueva API)
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    logger.warning("⚠️ WHATSAPP_PHONE_NUMBER_ID no configurado - El bot no podrá enviar mensajes")
+if not OPENAI_API_KEY:
+    logger.warning("⚠️ OPENAI_API_KEY no configurado - Se usarán plantillas básicas")
 
 # ==================== BASE DE DATOS EN MEMORIA ====================
 campañas_activas = {}
 seguimiento_clientes = {}
-recordatorios_pendientes = {}
 
 # ==================== CONFIGURACIÓN GOOGLE SHEETS ====================
 def inicializar_google_sheets():
@@ -67,7 +63,7 @@ def enviar_mensaje_whatsapp(numero, mensaje):
     """Envía mensaje por WhatsApp Business API"""
     try:
         if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-            logger.error("❌ Faltan credenciales de WhatsApp")
+            logger.error("❌ Faltan credenciales de WhatsApp - No se puede enviar mensaje")
             return False
 
         url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
@@ -100,28 +96,41 @@ def enviar_mensaje_whatsapp(numero, mensaje):
         logger.error(f"❌ Error enviando mensaje WhatsApp: {e}")
         return False
 
-# ==================== FUNCIONES GPT ====================
+# ==================== FUNCIONES GPT (VERSIÓN SEGURA) ====================
 def get_gpt_response(prompt):
-    """Obtiene respuesta con tono cálido de GPT"""
+    """Obtiene respuesta usando OpenAI API (versión compatible)"""
     try:
-        if not openai_client:
-            logger.warning("⚠️ OpenAI no configurado")
+        if not OPENAI_API_KEY:
             return None
 
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
+        # Usar requests directamente para evitar problemas de compatibilidad
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": "gpt-3.5-turbo",
+            "messages": [
                 {
                     "role": "system", 
-                    "content": """Eres Vicky, asistente de SECOM. Usa un tono cálido, empático y cercano. 
-                    Sé persuasiva pero no insistente. Responde en español."""
+                    "content": "Eres Vicky, asistente de SECOM. Usa un tono cálido, empático y cercano. Sé persuasiva pero no insistente. Responde en español."
                 },
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=150,
-            temperature=0.8
-        )
-        return response.choices[0].message.content.strip()
+            "max_tokens": 150,
+            "temperature": 0.8
+        }
+        
+        response = requests.post(url, headers=headers, json=data, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result['choices'][0]['message']['content'].strip()
+        else:
+            logger.error(f"❌ Error API OpenAI: {response.status_code} - {response.text}")
+            return None
+            
     except Exception as e:
         logger.error(f"❌ Error GPT: {e}")
         return None
@@ -193,19 +202,19 @@ def generar_mensaje_personalizado(nombre_cliente, tipo_campana):
     """Genera mensaje personalizado usando GPT o plantilla"""
     
     plantillas = {
-        "seguro_auto": f"""Hola {nombre_cliente}, INBURSA te ofrece hasta un 60% de descuento en tu seguro de auto. 
+        "seguro_auto": f"""Hola {nombre_cliente} 😊, INBURSA te ofrece hasta un 60% de descuento en tu seguro de auto. 
 
 Este descuento puede ser aprovechado para cualquier familiar que viva en tu domicilio.
 
 ¿Te gustaría que te envíe una cotización personalizada?""",
 
-        "tarjeta_credito": f"""Hola {nombre_cliente}, tenemos una promoción exclusiva de tarjetas de crédito para ti.
+        "tarjeta_credito": f"""Hola {nombre_cliente} 💳, tenemos una promoción exclusiva de tarjetas de crédito para ti.
 
 Sin anualidad el primer año y aprobación inmediata.
 
 ¿Puedo ayudarte con el proceso?""",
 
-        "credito_personal": f"""Hola {nombre_cliente}, ¿necesitas liquidez?
+        "credito_personal": f"""Hola {nombre_cliente} 💰, ¿necesitas liquidez?
 
 Tenemos créditos personales con tasas preferenciales para clientes SECOM.
 
@@ -214,21 +223,18 @@ Tenemos créditos personales con tasas preferenciales para clientes SECOM.
     
     plantilla_base = plantillas.get(tipo_campana, plantillas["seguro_auto"])
     
-    if openai_client:
-        prompt = f"""Mejora este mensaje comercial para que suene más cálido y natural:
+    # Intentar mejorar con GPT si está disponible
+    mensaje_mejorado = get_gpt_response(f"""Mejora este mensaje comercial para que suene más cálido y natural:
 
 Mensaje original: {plantilla_base}
 
 Requisitos:
 - Mantener la información clave
-- Tonos amigable y cercano
+- Tono amigable y cercano
 - Incluir el nombre: {nombre_cliente}
-- Máximo 2 párrafos en español"""
-
-        mensaje_mejorado = get_gpt_response(prompt)
-        return mensaje_mejorado if mensaje_mejorado else plantilla_base
-    else:
-        return plantilla_base
+- Máximo 2 párrafos en español""")
+    
+    return mensaje_mejorado if mensaje_mejorado else plantilla_base
 
 def ejecutar_campana_masiva(tipo_campana):
     """Ejecuta envío masivo para una campaña"""
@@ -306,10 +312,13 @@ def webhook():
         try:
             logger.info("📨 Webhook POST recibido")
             data = request.get_json()
-            logger.info(f"📊 Datos recibidos: {json.dumps(data, indent=2)}")
             
-            if data.get("object") == "whatsapp_business_account":
-                for entry in data.get("entry", []):
+            # Log simplificado para no saturar
+            if data and data.get("object") == "whatsapp_business_account":
+                entries = data.get("entry", [])
+                logger.info(f"📋 Procesando {len(entries)} entradas del webhook")
+                
+                for entry in entries:
                     for change in entry.get("changes", []):
                         if change.get("field") == "messages":
                             message_data = change.get("value", {})
@@ -331,7 +340,6 @@ def procesar_mensaje_entrante(message_data):
         message = messages[0]
         telefono = message.get("from")
         message_type = message.get("type")
-        timestamp = message.get("timestamp")
         
         logger.info(f"📩 Mensaje recibido de {telefono}, tipo: {message_type}")
         
@@ -403,17 +411,14 @@ def health_check():
         "service": "Vicky SECOM - Campañas Masivas",
         "clientes_seguimiento": len(seguimiento_clientes),
         "campañas_activas": len(campañas_activas),
-        "timestamp": datetime.now().isoformat(),
-        "webhook_url": "https://vicky-bot-x6wt.onrender.com/webhook"
+        "whatsapp_configured": bool(WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID),
+        "timestamp": datetime.now().isoformat()
     })
 
 @app.route("/health")
 def health():
     return jsonify({
         "status": "healthy",
-        "whatsapp_configured": bool(WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID),
-        "openai_configured": bool(openai_client),
-        "sheets_configured": bool(sheet),
         "timestamp": datetime.now().isoformat()
     })
 
@@ -440,13 +445,12 @@ def iniciar_campana(tipo_campana):
         logger.error(f"❌ Error iniciando campaña: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route("/estado-campana")
+@app.route("/estado")
 def estado_campana():
     """Muestra estado actual de campañas"""
     return jsonify({
         "campañas_activas": campañas_activas,
-        "seguimiento_clientes": seguimiento_clientes,
-        "total_clientes": len(seguimiento_clientes),
+        "total_clientes_seguimiento": len(seguimiento_clientes),
         "timestamp": datetime.now().isoformat()
     })
 
@@ -469,17 +473,15 @@ def test_mensaje():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ==================== INICIALIZACIÓN ====================
+# ==================== FINAL CORRECTO DEL ARCHIVO ====================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"🚀 Vicky SECOM - Sistema de Campañas Masivas")
     logger.info(f"🔧 Configuración:")
-    logger.info(f"   WhatsApp: {bool(WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID)}")
-    logger.info(f"   OpenAI: {bool(openai_client)}")
-    logger.info(f"   Google Sheets: {bool(sheet)}")
+    logger.info(f"   WhatsApp Token: {'✅' if WHATSAPP_ACCESS_TOKEN else '❌'}")
+    logger.info(f"   WhatsApp Phone ID: {'✅' if WHATSAPP_PHONE_NUMBER_ID else '❌'}")
+    logger.info(f"   OpenAI: {'✅' if OPENAI_API_KEY else '❌'}")
+    logger.info(f"   Google Sheets: {'✅' if sheet else '❌'}")
     logger.info(f"🌐 Servidor iniciado en puerto {port}")
     
     app.run(host='0.0.0.0', port=port, debug=False)
-
-
-
