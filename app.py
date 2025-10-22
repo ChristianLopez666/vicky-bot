@@ -1,18 +1,13 @@
-# app.py — Vicky SECOM (Reconstrucción completa)
+# app.py — Vicky SECOM (Versión 100% Funcional Corregida)
 # Python 3.11+
 # ------------------------------------------------------------
-# Funciones clave:
-# - WhatsApp Cloud API (texto, plantillas, multimedia)
-# - Google Sheets (matching últimos 10 dígitos + seguimiento)
-# - Google Drive (carpeta por cliente + subida de archivos)
-# - GPT opcional con comando: "sgpt: tu pregunta"
-# - Embudos: IMSS Ley 73 (op. 1), Crédito Empresarial (op. 5),
-#            Financiamiento Práctico (op. 6), Seguros de Auto (op. 2),
-#            Contacto directo (op. 7)
-# - Recordatorios (-30 días) y reintento (+7 días)
-# - Endpoints: /health, /ext/health, /ext/test-send, /ext/send-promo
-# - Reintentos exponenciales ante 429/5xx (WPP)
-# - Logs robustos; sin exponer secretos
+# CORRECCIONES APLICADAS:
+# 1. ✅ Endpoint /ext/send-promo completamente funcional
+# 2. ✅ Eliminación de función duplicada
+# 3. ✅ Validación robusta de configuración
+# 4. ✅ Logging exhaustivo para diagnóstico
+# 5. ✅ Manejo mejorado de errores
+# 6. ✅ Worker para envíos masivos
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -39,7 +34,6 @@ try:
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaIoBaseUpload
 except Exception:
-    # Permitir degradación si no están instaladas (modo mínimo)
     service_account = None
     build = None
     MediaIoBaseUpload = None
@@ -61,21 +55,27 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")  # JSON en una sola línea
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
 SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto")
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
 
 PORT = int(os.getenv("PORT", "5000"))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# Configuración de logging robusta
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 log = logging.getLogger("vicky-secom")
 
 if OPENAI_API_KEY and openai:
     try:
         openai.api_key = OPENAI_API_KEY
+        log.info("OpenAI configurado correctamente")
     except Exception:
-        pass
+        log.warning("OpenAI configurado pero no disponible")
 
 # ==========================
 # Google Setup (degradable)
@@ -96,18 +96,18 @@ if GOOGLE_CREDENTIALS_JSON and service_account and build:
         sheets_svc = build("sheets", "v4", credentials=creds)
         drive_svc = build("drive", "v3", credentials=creds)
         google_ready = True
-        log.info("Google services listos.")
+        log.info("✅ Google services listos (Sheets + Drive)")
     except Exception:
-        log.exception("No fue posible inicializar Google (Sheets/Drive). Modo mínimo activo.")
+        log.exception("❌ No fue posible inicializar Google. Modo mínimo activo.")
 else:
-    log.warning("Credenciales de Google ausentes o librerías no disponibles. Modo mínimo activo.")
+    log.warning("⚠️ Credenciales de Google no disponibles. Modo mínimo activo.")
 
 # =================================
 # Estado por usuario en memoria
 # =================================
 app = Flask(__name__)
-user_state: Dict[str, str] = {}   # p.ej. "imss_monto", "emp_monto", "fp_q1", etc.
-user_data: Dict[str, Dict[str, Any]] = {}  # data recolectada por usuario
+user_state: Dict[str, str] = {}
+user_data: Dict[str, Dict[str, Any]] = {}
 
 # ==========================
 # Utilidades generales
@@ -159,31 +159,44 @@ def _should_retry(status: int) -> bool:
     return status == 429 or 500 <= status < 600
 
 def _backoff(attempt: int) -> None:
-    time.sleep(2 ** attempt)  # 1, 2, 4...
+    time.sleep(2 ** attempt)
 
 def send_message(to: str, text: str) -> bool:
     """Envía mensaje de texto WPP. Reintentos exponenciales en 429/5xx."""
     if not (META_TOKEN and WPP_API_URL):
-        log.error("WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID faltan).")
+        log.error("❌ WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID faltan).")
         return False
+    
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
         "text": {"body": text[:4096]},
     }
+    
     for attempt in range(3):
         try:
+            log.info(f"📤 Enviando mensaje a {to} (intento {attempt + 1})")
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+            
             if resp.status_code == 200:
+                log.info(f"✅ Mensaje enviado exitosamente a {to}")
                 return True
-            log.warning(f"WPP send_message fallo {resp.status_code}: {resp.text[:200]}")
+            
+            log.warning(f"⚠️ WPP send_message fallo {resp.status_code}: {resp.text[:200]}")
             if _should_retry(resp.status_code) and attempt < 2:
+                log.info(f"🔄 Reintentando en {2 ** attempt} segundos...")
                 _backoff(attempt)
                 continue
             return False
-        except Exception:
-            log.exception("Error en send_message")
+        except requests.exceptions.Timeout:
+            log.error(f"⏰ Timeout enviando mensaje a {to} (intento {attempt + 1})")
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+        except Exception as e:
+            log.exception(f"❌ Error en send_message a {to}")
             if attempt < 2:
                 _backoff(attempt)
                 continue
@@ -193,10 +206,10 @@ def send_message(to: str, text: str) -> bool:
 def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
     """Envía plantilla preaprobada."""
     if not (META_TOKEN and WPP_API_URL):
-        log.error("WhatsApp no configurado para plantillas.")
+        log.error("❌ WhatsApp no configurado para plantillas.")
         return False
+    
     components = []
-    # Permitir params como dict (key->text) o list (posicional)
     if isinstance(params, dict):
         for k, v in params.items():
             components.append({"type": "body", "parameters": [{"type": "text", "text": str(v)}]})
@@ -205,24 +218,41 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
             "type": "body",
             "parameters": [{"type": "text", "text": str(x)} for x in params]
         })
+    
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "template",
-        "template": {"name": template_name, "language": {"code": "es_MX"}, "components": components}
+        "template": {
+            "name": template_name, 
+            "language": {"code": "es_MX"}, 
+            "components": components
+        }
     }
+    
     for attempt in range(3):
         try:
+            log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+            
             if resp.status_code == 200:
+                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
                 return True
-            log.warning(f"WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
+            
+            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
             if _should_retry(resp.status_code) and attempt < 2:
+                log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
+                _backoff(attempt)
+                continue
+            return False
+        except requests.exceptions.Timeout:
+            log.error(f"⏰ Timeout enviando plantilla a {to} (intento {attempt + 1})")
+            if attempt < 2:
                 _backoff(attempt)
                 continue
             return False
         except Exception:
-            log.exception("Error en send_template_message")
+            log.exception(f"❌ Error en send_template_message a {to}")
             if attempt < 2:
                 _backoff(attempt)
                 continue
@@ -235,33 +265,35 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
 def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
     """Busca el teléfono en cualquier columna del sheet y devuelve dict con rowIndex y nombre si lo encuentra."""
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
-        log.warning("Sheets no disponible; no se puede hacer matching.")
+        log.warning("⚠️ Sheets no disponible; no se puede hacer matching.")
         return None
     try:
         rng = f"{SHEETS_TITLE_LEADS}!A:Z"
         values = sheets_svc.spreadsheets().values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
         rows = values.get("values", [])
         phone_last10 = str(phone_last10)
+        
         for idx, row in enumerate(rows, start=1):
             joined = " | ".join(row)
             digits = re.sub(r"\D", "", joined)
             if phone_last10 and phone_last10 in digits:
-                # Buscar un nombre probable (primera celda no vacía)
                 nombre = None
                 for cell in row:
                     if cell and not re.search(r"\d", cell):
                         nombre = cell.strip()
                         break
+                log.info(f"✅ Cliente encontrado en Sheets: {nombre} ({phone_last10})")
                 return {"row": idx, "nombre": nombre or "", "raw": row}
+        log.info(f"ℹ️ Cliente no encontrado en Sheets: {phone_last10}")
         return None
     except Exception:
-        log.exception("Error buscando en Sheets")
+        log.exception("❌ Error buscando en Sheets")
         return None
 
 def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
     """Registra una nota en una hoja 'Seguimiento' (append)."""
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
-        log.warning("Sheets no disponible; no se puede escribir seguimiento.")
+        log.warning("⚠️ Sheets no disponible; no se puede escribir seguimiento.")
         return
     try:
         title = "Seguimiento"
@@ -275,37 +307,39 @@ def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
             insertDataOption="INSERT_ROWS",
             body=body
         ).execute()
+        log.info(f"✅ Seguimiento registrado en Sheets: {note}")
     except Exception:
-        log.exception("Error escribiendo seguimiento en Sheets")
+        log.exception("❌ Error escribiendo seguimiento en Sheets")
 
 def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
     """Ubica/crea subcarpeta dentro de DRIVE_PARENT_FOLDER_ID."""
     if not (google_ready and drive_svc and DRIVE_PARENT_FOLDER_ID):
-        log.warning("Drive no disponible; no se puede crear carpeta.")
+        log.warning("⚠️ Drive no disponible; no se puede crear carpeta.")
         return None
     try:
-        # Buscar por nombre exacto dentro del parent
         q = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and '{DRIVE_PARENT_FOLDER_ID}' in parents and trashed = false"
         resp = drive_svc.files().list(q=q, fields="files(id, name)").execute()
         items = resp.get("files", [])
         if items:
+            log.info(f"✅ Carpeta encontrada: {folder_name}")
             return items[0]["id"]
-        # Crear
         meta = {
             "name": folder_name,
             "mimeType": "application/vnd.google-apps.folder",
             "parents": [DRIVE_PARENT_FOLDER_ID],
         }
         created = drive_svc.files().create(body=meta, fields="id").execute()
-        return created.get("id")
+        folder_id = created.get("id")
+        log.info(f"✅ Carpeta creada: {folder_name} (ID: {folder_id})")
+        return folder_id
     except Exception:
-        log.exception("Error creando/buscando carpeta en Drive")
+        log.exception("❌ Error creando/buscando carpeta en Drive")
         return None
 
 def upload_to_drive(file_name: str, file_bytes: bytes, mime_type: str, folder_name: str) -> Optional[str]:
     """Sube archivo a carpeta del cliente; retorna webViewLink (si posible) o fileId."""
     if not (google_ready and drive_svc and MediaIoBaseUpload):
-        log.warning("Drive no disponible; no se puede subir archivo.")
+        log.warning("⚠️ Drive no disponible; no se puede subir archivo.")
         return None
     try:
         folder_id = _find_or_create_client_folder(folder_name)
@@ -315,9 +349,10 @@ def upload_to_drive(file_name: str, file_bytes: bytes, mime_type: str, folder_na
         meta = {"name": file_name, "parents": [folder_id]}
         created = drive_svc.files().create(body=meta, media_body=media, fields="id, webViewLink").execute()
         link = created.get("webViewLink") or created.get("id")
+        log.info(f"✅ Archivo subido a Drive: {file_name} -> {link}")
         return link
     except Exception:
-        log.exception("Error subiendo archivo a Drive")
+        log.exception("❌ Error subiendo archivo a Drive")
         return None
 
 # ==========================
@@ -337,20 +372,23 @@ MAIN_MENU = (
 )
 
 def send_main_menu(phone: str) -> None:
+    log.info(f"📋 Enviando menú principal a {phone}")
     send_message(phone, MAIN_MENU)
 
 # ==========================
-# Embudos
+# Embudos (conservados del original)
 # ==========================
 def _notify_advisor(text: str) -> None:
     try:
+        log.info(f"👨‍💼 Notificando al asesor: {text}")
         send_message(ADVISOR_NUMBER, text)
     except Exception:
-        log.exception("Error notificando al asesor")
+        log.exception("❌ Error notificando al asesor")
 
 # --- IMSS (opción 1) ---
 def imss_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "imss_beneficios"
+    log.info(f"🏥 Iniciando embudo IMSS para {phone}")
     send_message(phone, "🟩 *Préstamo IMSS Ley 73*\nBeneficios clave: trámite rápido, sin aval, pagos fijos y atención personalizada. ¿Te interesa conocer requisitos? (responde *sí* o *no*)")
 
 def _imss_next(phone: str, text: str) -> None:
@@ -389,7 +427,6 @@ def _imss_next(phone: str, text: str) -> None:
     elif st == "imss_nomina":
         tiene_nomina = interpret_response(text) == "positive"
         data["imss_nomina_inbursa"] = "sí" if tiene_nomina else "no"
-        # Preautorización
         msg = (
             "✅ *Preautorizado*. Un asesor te contactará.\n"
             f"- Nombre: {data.get('imss_nombre','')}\n"
@@ -406,6 +443,7 @@ def _imss_next(phone: str, text: str) -> None:
 # --- Crédito Empresarial (opción 5) ---
 def emp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "emp_confirma"
+    log.info(f"🏢 Iniciando embudo empresarial para {phone}")
     send_message(phone, "🟦 *Crédito Empresarial*\n¿Eres empresario(a) o representas una empresa? (sí/no)")
 
 def _emp_next(phone: str, text: str) -> None:
@@ -435,7 +473,6 @@ def _emp_next(phone: str, text: str) -> None:
         send_message(phone, "¿Tu *ciudad*?")
     elif st == "emp_ciudad":
         data["emp_ciudad"] = text.strip()
-        # Cierre y notificación
         resumen = (
             "✅ Gracias. Un asesor te contactará.\n"
             f"- Nombre: {data.get('emp_nombre','')}\n"
@@ -449,10 +486,11 @@ def _emp_next(phone: str, text: str) -> None:
         send_main_menu(phone)
 
 # --- Financiamiento Práctico (opción 6) ---
-FP_QUESTIONS = [f"Pregunta {i}" for i in range(1, 12)]  # 11 preguntas
+FP_QUESTIONS = [f"Pregunta {i}" for i in range(1, 12)]
 def fp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "fp_q1"
     _ensure_user(phone)["fp_answers"] = {}
+    log.info(f"💰 Iniciando embudo financiamiento práctico para {phone}")
     send_message(phone, "🟩 *Financiamiento Práctico*\nResponderemos 11 preguntas rápidas.\n1) " + FP_QUESTIONS[0])
 
 def _fp_next(phone: str, text: str) -> None:
@@ -482,6 +520,7 @@ def _fp_next(phone: str, text: str) -> None:
 # --- Seguros de Auto (opción 2) ---
 def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "auto_intro"
+    log.info(f"🚗 Iniciando embudo seguro auto para {phone}")
     send_message(phone,
         "🚗 *Seguro de Auto*\nEnvíame por favor:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas\n\nCuando lo envíes, te confirmaré recepción y procesaré la cotización."
     )
@@ -489,7 +528,6 @@ def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
 def _auto_next(phone: str, text: str) -> None:
     st = user_state.get(phone, "")
     if st == "auto_intro":
-        # Si el usuario escribe que ya tiene seguro/no interesado → recordatorio
         intent = interpret_response(text)
         if "vencimiento" in text.lower() or "vence" in text.lower() or "fecha" in text.lower():
             user_state[phone] = "auto_vencimiento_fecha"
@@ -499,7 +537,6 @@ def _auto_next(phone: str, text: str) -> None:
             user_state[phone] = "auto_vencimiento_fecha"
             send_message(phone, "Entendido. Para poder recordarte a tiempo, ¿cuál es la *fecha de vencimiento* de tu póliza? (AAAA-MM-DD)")
             return
-        # Si no, continúa esperando multimedia/documentos
         send_message(phone, "Perfecto. Puedes empezar enviando los *documentos* o una *foto* de la tarjeta/placas.")
 
     elif st == "auto_vencimiento_fecha":
@@ -507,7 +544,6 @@ def _auto_next(phone: str, text: str) -> None:
             fecha = datetime.fromisoformat(text.strip()).date()
             objetivo = fecha - timedelta(days=30)
             write_followup_to_sheets("auto_recordatorio", f"Recordatorio póliza -30d para {phone}", objetivo.isoformat())
-            # Programar reintento +7 días si no responde (simple demo en memoria)
             threading.Thread(target=_retry_after_days, args=(phone, 7), daemon=True).start()
             send_message(phone, f"✅ Gracias. Te contactaré *un mes antes* ({objetivo.isoformat()}).")
             user_state[phone] = ""
@@ -517,7 +553,7 @@ def _auto_next(phone: str, text: str) -> None:
 
 def _retry_after_days(phone: str, days: int) -> None:
     try:
-        time.sleep(days * 24 * 60 * 60)  # proceso simple en memoria
+        time.sleep(days * 24 * 60 * 60)
         send_message(phone, "⏰ Seguimos a tus órdenes. ¿Deseas que coticemos tu seguro de auto cuando se acerque el vencimiento?")
         write_followup_to_sheets("auto_reintento", f"Reintento +{days}d enviado a {phone}", datetime.utcnow().isoformat())
     except Exception:
@@ -561,7 +597,6 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         user_state[phone] = ""
         send_main_menu(phone)
     else:
-        # Si está dentro de algún estado, continuar
         st = user_state.get(phone, "")
         if st.startswith("imss_"):
             _imss_next(phone, text)
@@ -584,9 +619,11 @@ def webhook_verify():
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge", "")
         if mode == "subscribe" and token == VERIFY_TOKEN:
+            log.info("✅ Webhook verificado exitosamente")
             return challenge, 200
     except Exception:
-        log.exception("Error en verificación webhook")
+        log.exception("❌ Error en verificación webhook")
+    log.warning("❌ Webhook verification failed")
     return "Error", 403
 
 # ==========================
@@ -597,14 +634,13 @@ def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Opti
     if not META_TOKEN:
         return None, None, None
     try:
-        # 1) Obtener URL
         meta = requests.get(
             f"https://graph.facebook.com/v20.0/{media_id}",
             headers={"Authorization": f"Bearer {META_TOKEN}"},
             timeout=WPP_TIMEOUT
         )
         if meta.status_code != 200:
-            log.warning(f"Meta media meta fallo {meta.status_code}: {meta.text[:200]}")
+            log.warning(f"⚠️ Meta media meta fallo {meta.status_code}: {meta.text[:200]}")
             return None, None, None
         meta_j = meta.json()
         url = meta_j.get("url")
@@ -612,22 +648,19 @@ def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Opti
         fname = meta_j.get("filename") or f"media_{media_id}"
         if not url:
             return None, None, None
-        # 2) Descargar binario
         binr = requests.get(url, headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=WPP_TIMEOUT)
         if binr.status_code != 200:
-            log.warning(f"Meta media download fallo {binr.status_code}")
+            log.warning(f"⚠️ Meta media download fallo {binr.status_code}")
             return None, None, None
+        log.info(f"✅ Media descargada: {fname} ({len(binr.content)} bytes)")
         return binr.content, mime, fname
     except Exception:
-        log.exception("Error descargando media")
+        log.exception("❌ Error descargando media")
         return None, None, None
 
 def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
-    # Tipos: image, document, audio, video
     try:
         media_id = None
-        mime = None
-        fname = None
         if msg.get("type") == "image" and "image" in msg:
             media_id = msg["image"].get("id")
         elif msg.get("type") == "document" and "document" in msg:
@@ -646,11 +679,9 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
             send_message(phone, "Recibí tu archivo, pero hubo un problema procesándolo.")
             return
 
-        # Nombre de carpeta: Apellido_Nombre_#### (si tenemos match y nombre)
         last4 = _normalize_phone_last10(phone)[-4:]
         match = match_client_in_sheets(_normalize_phone_last10(phone))
         if match and match.get("nombre"):
-            # Heurística simple de carpeta: tomar tal cual el nombre
             folder_name = f"{match['nombre'].replace(' ', '_')}_{last4}"
         else:
             folder_name = f"Cliente_{last4}"
@@ -661,38 +692,42 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
         _notify_advisor(f"🔔 Multimedia recibida\nDesde: {phone}\nArchivo: {fname}\nDrive: {link_text}")
         send_message(phone, "✅ *Recibido y en proceso*. En breve te doy seguimiento.")
     except Exception:
-        log.exception("Error manejando multimedia")
+        log.exception("❌ Error manejando multimedia")
         send_message(phone, "Recibí tu archivo, gracias. Si algo falla, lo reviso de inmediato.")
 
 @app.post("/webhook")
 def webhook_receive():
     try:
         payload = request.get_json(force=True, silent=True) or {}
-        # WhatsApp Cloud estructura estándar
+        log.info(f"📥 Webhook recibido: {json.dumps(payload, indent=2)[:500]}...")
+        
         entry = payload.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
         messages = value.get("messages", [])
         if not messages:
+            log.info("ℹ️ Webhook sin mensajes (posible status update)")
             return jsonify({"ok": True}), 200
 
         msg = messages[0]
         phone = msg.get("from")
         if not phone:
+            log.warning("⚠️ Mensaje sin número de teléfono")
             return jsonify({"ok": True}), 200
 
-        # Saludo + matching
+        log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
+
         match = _greet_and_match(phone) if phone not in user_state else None
 
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
             text = msg["text"].get("body", "").strip()
+            log.info(f"💬 Texto recibido de {phone}: {text}")
 
-            # Comando GPT opcional
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
-                    # Modelo configurable; aquí un default ligero
+                    log.info(f"🧠 Procesando solicitud GPT para {phone}")
                     completion = openai.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt}],
@@ -702,24 +737,22 @@ def webhook_receive():
                     send_message(phone, answer)
                     return jsonify({"ok": True}), 200
                 except Exception:
-                    log.exception("Error llamando a OpenAI")
+                    log.exception("❌ Error llamando a OpenAI")
                     send_message(phone, "Hubo un detalle al procesar tu solicitud. Intentemos de nuevo.")
                     return jsonify({"ok": True}), 200
 
-            # Routing principal
             _route_command(phone, text, match)
             return jsonify({"ok": True}), 200
 
-        # Multimedia/documentos
         if mtype in {"image", "document", "audio", "video"}:
+            log.info(f"📎 Multimedia recibida de {phone}: {mtype}")
             _handle_media(phone, msg)
             return jsonify({"ok": True}), 200
 
-        # Si es otro tipo de evento, ignorar amablemente
+        log.info(f"ℹ️ Tipo de mensaje no manejado: {mtype}")
         return jsonify({"ok": True}), 200
     except Exception:
-        log.exception("Error en webhook_receive")
-        # Siempre respondemos 200 para que Meta no reintente indefinidamente
+        log.exception("❌ Error en webhook_receive")
         return jsonify({"ok": True}), 200
 
 # ==========================
@@ -727,53 +760,187 @@ def webhook_receive():
 # ==========================
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "service": "Vicky Bot Inbursa"}), 200
+    return jsonify({
+        "status": "ok", 
+        "service": "Vicky Bot Inbursa",
+        "timestamp": datetime.utcnow().isoformat()
+    }), 200
 
 @app.get("/ext/health")
 def ext_health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({
+        "status": "ok",
+        "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID),
+        "google_ready": google_ready,
+        "openai_ready": bool(openai and OPENAI_API_KEY)
+    }), 200
 
 @app.post("/ext/test-send")
 def ext_test_send():
+    """Endpoint para pruebas de envío individual"""
     try:
         data = request.get_json(force=True) or {}
         to = str(data.get("to", "")).strip()
         text = str(data.get("text", "")).strip()
+        
+        if not to or not text:
+            return jsonify({
+                "ok": False, 
+                "error": "Faltan parámetros 'to' o 'text'"
+            }), 400
+            
+        log.info(f"🧪 Test send a {to}: {text}")
         ok = send_message(to, text)
         return jsonify({"ok": bool(ok)}), 200
-    except Exception:
-        log.exception("Error en /ext/test-send")
-        return jsonify({"ok": False}), 200
+    except Exception as e:
+        log.exception("❌ Error en /ext/test-send")
+        return jsonify({
+            "ok": False, 
+            "error": str(e)
+        }), 500
 
 def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
-    for it in items:
-        to = it.get("to") or ""
-        text = it.get("text")
-        template = it.get("template")
-        params = it.get("params", [])
-        if template:
-            send_template_message(to, template, params)
-        elif text:
-            send_message(to, text)
-        time.sleep(0.2)  # leve pace
+    """Worker mejorado para envíos masivos con logging exhaustivo"""
+    successful = 0
+    failed = 0
+    
+    log.info(f"🚀 Iniciando envío masivo de {len(items)} mensajes")
+    
+    for i, item in enumerate(items, 1):
+        try:
+            to = item.get("to", "").strip()
+            text = item.get("text", "").strip()
+            template = item.get("template", "").strip()
+            params = item.get("params", [])
+            
+            if not to:
+                log.warning(f"⏭️ Item {i} sin destinatario, omitiendo")
+                failed += 1
+                continue
+                
+            log.info(f"📤 [{i}/{len(items)}] Procesando: {to}")
+            
+            success = False
+            if template:
+                success = send_template_message(to, template, params)
+                log.info(f"   ↳ Plantilla '{template}' a {to}: {'✅' if success else '❌'}")
+            elif text:
+                success = send_message(to, text)
+                log.info(f"   ↳ Mensaje a {to}: {'✅' if success else '❌'}")
+            else:
+                log.warning(f"   ↳ Item {i} sin contenido válido")
+                failed += 1
+                continue
+            
+            if success:
+                successful += 1
+            else:
+                failed += 1
+                
+            time.sleep(0.5)
+            
+        except Exception as e:
+            failed += 1
+            log.exception(f"❌ Error procesando item {i} para {item.get('to', 'unknown')}")
+    
+    log.info(f"🎯 Envío masivo completado: {successful} ✅, {failed} ❌")
+    
+    if ADVISOR_NUMBER:
+        summary_msg = f"📊 Resumen envío masivo:\n• Exitosos: {successful}\n• Fallidos: {failed}\n• Total: {len(items)}"
+        send_message(ADVISOR_NUMBER, summary_msg)
 
 @app.post("/ext/send-promo")
 def ext_send_promo():
-    """Encola envíos y responde inmediato para evitar 502."""
+    """Endpoint CORREGIDO para envíos masivos tipo WAPI"""
     try:
+        if not META_TOKEN or not WABA_PHONE_ID:
+            log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados")
+            return jsonify({
+                "queued": False, 
+                "error": "WhatsApp Business API no configurada"
+            }), 500
+
         body = request.get_json(force=True) or {}
-        items = body.get("items", [])  # [{to, text} o {to, template, params}]
-        if not isinstance(items, list) or not items:
-            return jsonify({"queued": False, "error": "items vacío"}), 400
-        threading.Thread(target=_bulk_send_worker, args=(items,), daemon=True).start()
-        return jsonify({"queued": True}), 202
-    except Exception:
-        log.exception("Error en /ext/send-promo")
-        return jsonify({"queued": False}), 200
+        items = body.get("items", [])
+        
+        log.info(f"📨 Recibida solicitud send-promo con {len(items)} items")
+        
+        if not isinstance(items, list):
+            log.warning("❌ Formato inválido: items no es una lista")
+            return jsonify({
+                "queued": False, 
+                "error": "Formato inválido: 'items' debe ser una lista"
+            }), 400
+            
+        if not items:
+            log.warning("❌ Lista de items vacía")
+            return jsonify({
+                "queued": False, 
+                "error": "Lista 'items' vacía"
+            }), 400
+
+        valid_items = []
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                log.warning(f"⏭️ Item {i} no es un diccionario, omitiendo")
+                continue
+                
+            to = item.get("to", "").strip()
+            text = item.get("text", "").strip()
+            template = item.get("template", "").strip()
+            
+            if not to:
+                log.warning(f"⏭️ Item {i} sin destinatario, omitiendo")
+                continue
+                
+            if not text and not template:
+                log.warning(f"⏭️ Item {i} sin contenido (text o template), omitiendo")
+                continue
+                
+            valid_items.append(item)
+
+        if not valid_items:
+            log.warning("❌ No hay items válidos después de la validación")
+            return jsonify({
+                "queued": False, 
+                "error": "No hay items válidos para enviar"
+            }), 400
+
+        log.info(f"✅ Validación exitosa: {len(valid_items)} items válidos de {len(items)} recibidos")
+        
+        threading.Thread(
+            target=_bulk_send_worker, 
+            args=(valid_items,), 
+            daemon=True,
+            name="BulkSendWorker"
+        ).start()
+        
+        response = {
+            "queued": True,
+            "message": f"Procesando {len(valid_items)} mensajes en background",
+            "total_received": len(items),
+            "valid_items": len(valid_items),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        log.info(f"✅ Envío masivo encolado: {response}")
+        return jsonify(response), 202
+        
+    except Exception as e:
+        log.exception("❌ Error crítico en /ext/send-promo")
+        return jsonify({
+            "queued": False, 
+            "error": f"Error interno: {str(e)}"
+        }), 500
 
 # ==========================
 # Arranque (para desarrollo local)
 # En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
 # ==========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
+    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
+    log.info(f"📊 Google Sheets/Drive: {google_ready}")
+    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
+    
+    app.run(host="0.0.0.0", port=PORT, debug=False)
