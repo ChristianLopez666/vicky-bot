@@ -27,6 +27,14 @@ from typing import Any, Dict, Optional, List, Tuple
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+# TEMPORAL: Verificar carga de variables
+print("=== VERIFICACIÓN .env ===")
+print("META_TOKEN:", "SI" if os.getenv("META_TOKEN") else "NO") 
+print("WABA_PHONE_ID:", "SI" if os.getenv("WABA_PHONE_ID") else "NO")
+print("=== FIN VERIFICACIÓN ===")
+
+META_TOKEN = os.getenv("META_TOKEN")
+WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
 
 # Google
 try:
@@ -944,3 +952,4 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
