@@ -23,6 +23,54 @@ import logging
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, List, Tuple
+# app.py - Archivo principal
+
+import openai
+import os
+from flask import Flask, request, jsonify
+
+# Configurar OpenAI
+openai.api_key = os.getenv('OPENAI_API_KEY')
+
+app = Flask(__name__)
+
+# --- AGREGAR ESTA FUNCIÓN EN app.py ---
+def clasificar_intencion(mensaje_usuario):
+    """
+    Clasifica si el usuario: rechaza, pregunta o quiere cotizar
+    """
+    prompt = f"""
+    Clasifica este mensaje del cliente en una sola palabra:
+    - "rechazo": si dice no le interesa, ya tiene seguro, no gracias
+    - "duda": si hace preguntas sobre seguros, coberturas, precios
+    - "cotizacion": si proporciona datos o quiere cotizar
+    
+    Mensaje: "{mensaje_usuario}"
+    """
+    
+    try:
+        respuesta = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
+        )
+        return respuesta.choices[0].message.content.strip().lower()
+    except Exception as e:
+        print(f"Error con OpenAI: {e}")
+        return "duda"  # Fallback seguro
+# --- FIN DE LA FUNCIÓN ---
+
+# --- TEST TEMPORAL (luego lo quitas) ---
+if __name__ == "__main__":
+    test_mensajes = [
+        "ya tengo seguro con otra compañía",
+        "quiero cotizar un seguro para mi auto", 
+        "¿qué cubre la responsabilidad civil?"
+    ]
+    
+    for mensaje in test_mensajes:
+        intencion = clasificar_intencion(mensaje)
+        print(f"Mensaje: '{mensaje}' -> Intención: {intencion}")
 
 import requests
 from flask import Flask, request, jsonify
@@ -944,5 +992,6 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
 
