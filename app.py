@@ -1,4 +1,4 @@
-# app.py — Vicky SECOM (Versión 100% Funcional con GPT Integrado)
+# app.py — Vicky SECOM (Versión 100% Funcional + RAG Integrado)
 # Python 3.11+
 # ------------------------------------------------------------
 # CORRECCIONES APLICADAS:
@@ -8,7 +8,7 @@
 # 4. ✅ Logging exhaustivo para diagnóstico
 # 5. ✅ Manejo mejorado de errores
 # 6. ✅ Worker para envíos masivos
-# 7. ✅ GPT INTEGRADO PARA CONVERSACIONES NATURALES
+# 7. ✅ MÓDULO RAG INTEGRADO para consultas de manuales
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -33,17 +33,25 @@ from dotenv import load_dotenv
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseUpload
+    from googleapiclient.http import MediaIoBaseDownload
 except Exception:
     service_account = None
     build = None
-    MediaIoBaseUpload = None
+    MediaIoBaseDownload = None
 
 # GPT opcional
 try:
-    import openai
+    from openai import OpenAI
 except Exception:
-    openai = None
+    OpenAI = None
+
+# RAG dependencies
+try:
+    import numpy as np
+    from rank_bm25 import BM25Okapi
+except Exception:
+    np = None
+    BM25Okapi = None
 
 # ==========================
 # Carga entorno + Logging
@@ -60,6 +68,7 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
 SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto")
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
+DRIVE_MANUALES_FOLDER = os.getenv("DRIVE_MANUALES_FOLDER", "Manuales Vicky")
 
 PORT = int(os.getenv("PORT", "5000"))
 
@@ -71,12 +80,310 @@ logging.basicConfig(
 )
 log = logging.getLogger("vicky-secom")
 
-if OPENAI_API_KEY and openai:
-    try:
-        openai.api_key = OPENAI_API_KEY
-        log.info("✅ OpenAI configurado correctamente")
-    except Exception:
-        log.warning("❌ OpenAI configurado pero no disponible")
+# ==========================
+# MÓDULO RAG INTEGRADO
+# ==========================
+class DriveReader:
+    def __init__(self, credentials_json, folder_name=DRIVE_MANUALES_FOLDER):
+        self.credentials = service_account.Credentials.from_service_account_info(credentials_json)
+        self.service = build('drive', 'v3', credentials=self.credentials)
+        self.folder_name = folder_name
+        self.folder_id = self._find_folder_id()
+        
+    def _find_folder_id(self):
+        """Localiza la carpeta Manuales Vicky por nombre"""
+        response = self.service.files().list(
+            q=f"name='{self.folder_name}' and mimeType='application/vnd.google-apps.folder'",
+            spaces='drive',
+            fields='files(id, name)'
+        ).execute()
+        
+        if not response.get('files'):
+            raise Exception(f"Carpeta '{self.folder_name}' no encontrada en Drive")
+            
+        return response['files'][0]['id']
+    
+    def list_manual_files(self):
+        """Lista todos los archivos en la carpeta con metadatos"""
+        response = self.service.files().list(
+            q=f"'{self.folder_id}' in parents and trashed=false",
+            fields='files(id, name, mimeType, modifiedTime, size)',
+            orderBy='modifiedTime desc'
+        ).execute()
+        
+        return [
+            {
+                'id': file['id'],
+                'name': file['name'],
+                'mimeType': file['mimeType'],
+                'modifiedTime': file['modifiedTime'],
+                'size': file.get('size', '0')
+            }
+            for file in response.get('files', [])
+        ]
+    
+    def extract_text_from_file(self, file_id, mime_type, file_name):
+        """Extrae texto de PDFs y Google Docs"""
+        try:
+            if mime_type == 'application/pdf':
+                return self._extract_pdf_text(file_id)
+            elif mime_type == 'application/vnd.google-apps.document':
+                return self._extract_google_doc_text(file_id)
+            else:
+                log.warning(f"Formato no soportado: {mime_type} para {file_name}")
+                return ""
+        except Exception as e:
+            log.error(f"Error extrayendo texto de {file_name}: {str(e)}")
+            return ""
+    
+    def _extract_pdf_text(self, file_id):
+        """Extrae texto de PDFs"""
+        try:
+            request = self.service.files().get_media(fileId=file_id)
+            pdf_file = io.BytesIO()
+            downloader = MediaIoBaseDownload(pdf_file, request)
+            
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+            
+            pdf_file.seek(0)
+            
+            # Extracción simple de texto de PDF (sin pdfminer)
+            text = self._extract_text_from_pdf_bytes(pdf_file.getvalue())
+            
+            # Limpieza básica
+            text = re.sub(r'\n\s*\n', '\n\n', text)
+            text = re.sub(r'^\s+|\s+$', '', text, flags=re.MULTILINE)
+            
+            return text
+        except Exception as e:
+            log.error(f"Error extrayendo PDF: {str(e)}")
+            return ""
+    
+    def _extract_text_from_pdf_bytes(self, pdf_bytes):
+        """Extracción básica de texto de PDF sin pdfminer"""
+        # Patrón simple para extraer texto entre paréntesis (common in PDFs)
+        text_pattern = re.findall(rb'\((.*?)\)', pdf_bytes)
+        text = b' '.join(text_pattern).decode('latin-1', errors='ignore')
+        
+        # Limpiar caracteres especiales
+        text = re.sub(r'\\[a-zA-Z]', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        
+        return text.strip()
+    
+    def _extract_google_doc_text(self, file_id):
+        """Exporta Google Docs como texto plano"""
+        try:
+            request = self.service.files().export_media(
+                fileId=file_id, 
+                mimeType='text/plain'
+            )
+            text_file = io.BytesIO()
+            downloader = MediaIoBaseDownload(text_file, request)
+            
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+            
+            return text_file.getvalue().decode('utf-8')
+        except Exception as e:
+            log.error(f"Error extrayendo Google Doc: {str(e)}")
+            return ""
+
+class RAGIndex:
+    def __init__(self, drive_reader, openai_api_key):
+        self.drive_reader = drive_reader
+        self.openai_client = OpenAI(api_key=openai_api_key) if OpenAI and openai_api_key else None
+        self.index_cache = None
+        self.last_refresh = 0
+        self.cache_ttl = 1800  # 30 minutos
+        
+    def chunk_text(self, text, chunk_size=800, overlap=120):
+        """Divide texto en chunks con overlap"""
+        words = text.split()
+        if not words:
+            return []
+            
+        chunks = []
+        
+        for i in range(0, len(words), chunk_size - overlap):
+            chunk = ' '.join(words[i:i + chunk_size])
+            chunks.append(chunk)
+            if i + chunk_size >= len(words):
+                break
+                
+        return chunks
+    
+    def build_index(self):
+        """Construye índice combinado BM25 + embeddings"""
+        try:
+            files = self.drive_reader.list_manual_files()
+            all_chunks = []
+            all_metadata = []
+            
+            for file in files:
+                log.info(f"Procesando: {file['name']}")
+                text = self.drive_reader.extract_text_from_file(
+                    file['id'], file['mimeType'], file['name']
+                )
+                
+                if not text:
+                    continue
+                    
+                chunks = self.chunk_text(text)
+                
+                for i, chunk in enumerate(chunks):
+                    all_chunks.append(chunk)
+                    all_metadata.append({
+                        'file_name': file['name'],
+                        'file_id': file['id'],
+                        'chunk_index': i,
+                        'modified_time': file['modifiedTime'],
+                        'text_preview': chunk[:100] + '...' if len(chunk) > 100 else chunk
+                    })
+            
+            if not all_chunks:
+                log.warning("No se encontraron chunks para indexar")
+                return None
+            
+            # BM25
+            tokenized_chunks = [chunk.split() for chunk in all_chunks]
+            bm25_index = BM25Okapi(tokenized_chunks) if BM25Okapi else None
+            
+            # Embeddings (opcional)
+            embeddings = []
+            if self.openai_client and all_chunks:
+                for chunk in all_chunks:
+                    try:
+                        response = self.openai_client.embeddings.create(
+                            model="text-embedding-3-small",
+                            input=chunk
+                        )
+                        embeddings.append(response.data[0].embedding)
+                    except Exception as e:
+                        log.error(f"Error generando embedding: {str(e)}")
+                        embeddings.append(np.zeros(1536) if np else [0] * 1536)
+            
+            self.index_cache = {
+                'chunks': all_chunks,
+                'metadata': all_metadata,
+                'bm25': bm25_index,
+                'embeddings': np.array(embeddings) if embeddings else None,
+                'build_time': time.time(),
+                'doc_count': len(files),
+                'chunk_count': len(all_chunks)
+            }
+            self.last_refresh = time.time()
+            
+            log.info(f"Índice construido con {len(all_chunks)} chunks de {len(files)} documentos")
+            return self.index_cache
+            
+        except Exception as e:
+            log.error(f"Error construyendo índice: {str(e)}")
+            return None
+    
+    def search(self, query, top_k=5):
+        """Búsqueda híbrida BM25 + embeddings"""
+        if not self.index_cache or time.time() - self.last_refresh > self.cache_ttl:
+            log.info("Refrescando índice...")
+            self.build_index()
+        
+        if not self.index_cache:
+            return []
+        
+        # BM25
+        bm25_scores = np.zeros(len(self.index_cache['chunks']))
+        if self.index_cache['bm25']:
+            tokenized_query = query.split()
+            bm25_scores = self.index_cache['bm25'].get_scores(tokenized_query)
+        
+        # Embeddings
+        cosine_sim = np.zeros(len(self.index_cache['chunks']))
+        if self.index_cache['embeddings'] is not None and self.openai_client:
+            try:
+                response = self.openai_client.embeddings.create(
+                    model="text-embedding-3-small", 
+                    input=query
+                )
+                query_embedding = np.array(response.data[0].embedding)
+                
+                dot_product = np.dot(self.index_cache['embeddings'], query_embedding)
+                norms = np.linalg.norm(self.index_cache['embeddings'], axis=1) * np.linalg.norm(query_embedding)
+                cosine_sim = dot_product / (norms + 1e-8)
+            except Exception as e:
+                log.error(f"Error en embeddings de búsqueda: {str(e)}")
+        
+        # Combinar scores
+        combined_scores = 0.7 * bm25_scores + 0.3 * cosine_sim
+        
+        top_indices = np.argsort(combined_scores)[-top_k:][::-1]
+        
+        results = []
+        for idx in top_indices:
+            if combined_scores[idx] > 0.1:  # threshold mínimo
+                results.append({
+                    'chunk': self.index_cache['chunks'][idx],
+                    'metadata': self.index_cache['metadata'][idx],
+                    'score': float(combined_scores[idx])
+                })
+        
+        return results
+    
+    def answer_with_context(self, user_query, conversation_history=None):
+        """Genera respuesta usando contexto de los manuales"""
+        try:
+            search_results = self.search(user_query, top_k=5)
+            
+            if not search_results:
+                return "🤔 No encontré información específica sobre tu pregunta en los manuales. ¿Podrías reformularla o contactar a Christian para asistencia personalizada?"
+            
+            context = ""
+            for i, result in enumerate(search_results[:3]):  # Top 3 resultados
+                context += f"[Fuente {i+1}: {result['metadata']['file_name']}]\n{result['chunk']}\n\n"
+            
+            prompt = f"""Eres Vicky, asistente de SECOM. Responde de manera CALIDA, CLARA y PRECISA usando SOLO la información del contexto.
+
+CONTEXTO DISPONIBLE:
+{context}
+
+PREGUNTA DEL USUARIO: {user_query}
+
+INSTRUCCIONES:
+- Responde en español de México, tono profesional pero amable
+- Usa EMOJIS relevantes para hacerlo más cálido ✅🤝🌟
+- Si la información no es completa, sugiere contactar al asesor
+- CITAR la fuente específica (nombre del manual) cuando uses información de ahí
+- NUNCA inventes información que no esté en el contexto
+- Sé concisa pero útil (máximo 2 párrafos)
+
+RESPUESTA:"""
+            
+            if self.openai_client:
+                response = self.openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=500
+                )
+                
+                answer = response.choices[0].message.content.strip()
+                
+                # Asegurar que se cite la fuente
+                if not any(f in answer for f in ["Fuente", "Manual", "procedimiento"]):
+                    main_source = search_results[0]['metadata']['file_name']
+                    answer += f"\n\n📚 Fuente: {main_source}"
+                    
+                return answer
+            else:
+                # Fallback sin OpenAI
+                main_source = search_results[0]['metadata']['file_name']
+                return f"📚 Según el {main_source}: {search_results[0]['chunk'][:300]}...\n\nPara más detalles, contacta a Christian."
+                
+        except Exception as e:
+            log.error(f"Error en answer_with_context: {str(e)}")
+            return "⚠️ Ocurrió un error al procesar tu consulta. Por favor, intenta de nuevo o contacta a Christian para asistencia inmediata."
 
 # ==========================
 # Google Setup (degradable)
@@ -85,6 +392,7 @@ creds = None
 sheets_svc = None
 drive_svc = None
 google_ready = False
+rag_index = None
 
 if GOOGLE_CREDENTIALS_JSON and service_account and build:
     try:
@@ -98,6 +406,18 @@ if GOOGLE_CREDENTIALS_JSON and service_account and build:
         drive_svc = build("drive", "v3", credentials=creds)
         google_ready = True
         log.info("✅ Google services listos (Sheets + Drive)")
+        
+        # Inicializar RAG si hay OpenAI
+        if OPENAI_API_KEY and OpenAI:
+            try:
+                drive_reader = DriveReader(info)
+                rag_index = RAGIndex(drive_reader, OPENAI_API_KEY)
+                # Construir índice inicial en background
+                threading.Thread(target=rag_index.build_index, daemon=True).start()
+                log.info("✅ RAG Index inicializado en background")
+            except Exception as e:
+                log.error(f"❌ Error inicializando RAG: {str(e)}")
+                rag_index = None
     except Exception:
         log.exception("❌ No fue posible inicializar Google. Modo mínimo activo.")
 else:
@@ -109,89 +429,6 @@ else:
 app = Flask(__name__)
 user_state: Dict[str, str] = {}
 user_data: Dict[str, Dict[str, Any]] = {}
-
-# ==========================
-# FUNCIONES GPT INTEGRADAS
-# ==========================
-def clasificar_intencion(mensaje_usuario: str) -> str:
-    """
-    Clasifica la intención del mensaje usando GPT
-    """
-    if not (openai and OPENAI_API_KEY):
-        log.warning("⚠️ OpenAI no disponible para clasificación")
-        return "otro"
-    
-    try:
-        prompt = f"""
-        Eres un clasificador de intenciones para un bot de seguros y créditos.
-        Clasifica este mensaje en UNA de estas opciones:
-        
-        - "seguro_auto": si menciona cotización, auto, vehículo, carro, placa, tarjeta circulación
-        - "duda_cobertura": si pregunta sobre coberturas, diferencias, amplia plus, qué cubre, explicación
-        - "prestamo_imss": si menciona préstamo IMSS, ley 73, pensión, afores
-        - "seguro_vida": si menciona vida, salud, médico, gastos médicos
-        - "tarjeta_credito": si menciona tarjeta, crédito, plástico
-        - "empresarial": si menciona negocio, empresa, empresarial, pyme
-        - "financiamiento": si menciona financiamiento, crédito simple, práctico
-        - "contactar": si quiere hablar con agente, Christian, humano, asesor
-        - "rechazo": si dice no le interesa, ya tiene, no gracias, no quiero
-        - "otro": si no encaja en las anteriores
-        
-        Mensaje: "{mensaje_usuario}"
-        
-        Responde SOLO con la opción correspondiente.
-        """
-        
-        respuesta = openai.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=50
-        )
-        intencion = respuesta.choices[0].message.content.strip().lower()
-        log.info(f"🧠 GPT clasificó: '{mensaje_usuario}' -> {intencion}")
-        return intencion
-    except Exception as e:
-        log.error(f"❌ Error en clasificar_intencion: {e}")
-        return "otro"
-
-def generar_respuesta_gpt(mensaje_usuario: str, contexto: str = "") -> str:
-    """
-    Genera una respuesta natural y servicial usando GPT
-    """
-    if not (openai and OPENAI_API_KEY):
-        return "Te ayudo con gusto. ¿En qué producto estás interesado?"
-    
-    try:
-        prompt = f"""
-        Eres Vicky, una asistente virtual amable, efectiva y servicial que trabaja para Inbursa.
-        Tu personalidad es cálida, profesional y siempre buscas ayudar a los clientes.
-        
-        Contexto: {contexto}
-        
-        Mensaje del cliente: "{mensaje_usuario}"
-        
-        Instrucciones:
-        - Responde de manera natural y conversacional
-        - Sé amable, servicial y profesional
-        - Si es una duda compleja, sugiere contactar al asesor
-        - Si es sobre cotizaciones, guía al flujo correspondiente
-        - Mantén un tono cálido pero profesional
-        - Usa emojis apropiados para hacer la conversación más amena
-        
-        Responde como si estuvieras teniendo una conversación natural:
-        """
-        
-        respuesta = openai.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=150
-        )
-        return respuesta.choices[0].message.content.strip()
-    except Exception as e:
-        log.error(f"❌ Error en generar_respuesta_gpt: {e}")
-        return "¡Claro! Te ayudo con eso. ¿Podrías contarme más detalles para poder asistirte mejor? 😊"
 
 # ==========================
 # Utilidades generales
@@ -644,7 +881,7 @@ def _retry_after_days(phone: str, days: int) -> None:
         log.exception("Error en reintento programado")
 
 # ==========================
-# Router helpers (MODIFICADO CON GPT)
+# Router helpers CON RAG INTEGRADO
 # ==========================
 def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     last10 = _normalize_phone_last10(phone)
@@ -657,93 +894,55 @@ def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
 
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = text.strip().lower()
-    log.info(f"🔍 Procesando mensaje: '{text}' -> normalizado: '{t}'")
     
-    # Si el mensaje es claro (números o palabras clave), usar lógica existente
+    # DETECCIÓN DE CONSULTAS PARA RAG
+    rag_keywords = ['cobertura', 'coberturas', 'qué cubre', 'que cubre', 'incluye', 'beneficios', 'condiciones', 
+                   'póliza', 'poliza', 'endoso', 'deducible', 'asegurado', 'cláusula', 'clausula', 'vigencia',
+                   'siniestro', 'reclamación', 'reclamacion', 'procedimiento', 'manual', 'documentación']
+    
+    is_rag_query = any(keyword in t for keyword in rag_keywords)
+    
+    if is_rag_query and rag_index:
+        log.info(f"🧠 Consulta RAG detectada: {text}")
+        respuesta = rag_index.answer_with_context(text)
+        send_message(phone, respuesta)
+        return
+    
     if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
-        log.info("🎯 Comando detectado: IMSS")
         imss_start(phone, match)
     elif t in ("2", "auto", "seguros de auto", "seguro auto"):
-        log.info("🎯 Comando detectado: Seguro Auto")
         auto_start(phone, match)
     elif t in ("3", "vida", "salud", "seguro de vida", "seguro de salud"):
-        log.info("🎯 Comando detectado: Seguro Vida/Salud")
         send_message(phone, "🧬 *Seguros de Vida/Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.")
         _notify_advisor(f"🔔 Vida/Salud — Solicitud de contacto\nWhatsApp: {phone}")
         send_main_menu(phone)
     elif t in ("4", "vrim", "tarjeta médica", "tarjeta medica"):
-        log.info("🎯 Comando detectado: VRIM")
         send_message(phone, "🩺 *VRIM* — Membresía médica. Notificaré al asesor para darte detalles.")
         _notify_advisor(f"🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}")
         send_main_menu(phone)
     elif t in ("5", "empresarial", "pyme", "crédito empresarial", "credito empresarial"):
-        log.info("🎯 Comando detectado: Empresarial")
         emp_start(phone, match)
     elif t in ("6", "financiamiento práctico", "financiamiento practico", "crédito simple", "credito simple"):
-        log.info("🎯 Comando detectado: Financiamiento")
         fp_start(phone, match)
     elif t in ("7", "contactar", "asesor", "contactar con christian"):
-        log.info("🎯 Comando detectado: Contactar")
         _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
         send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
         send_main_menu(phone)
     elif t in ("menu", "menú", "inicio", "hola"):
-        log.info("🎯 Comando detectado: Menú")
         user_state[phone] = ""
         send_main_menu(phone)
     else:
-        # Si no es un comando claro, usar GPT para clasificar
-        log.info("🤖 Usando GPT para clasificar mensaje natural")
-        intencion = clasificar_intencion(text)
-        
-        if intencion == "rechazo":
-            log.info("🛑 Manejo de rechazo con GPT")
-            respuesta_rechazo = (
-                "Entiendo perfectamente, no hay problema 😊\n\n"
-                "Si en el futuro llegas a considerar una nueva opción o simplemente quieres comparar, "
-                "con tu número de placa o tarjeta de circulación puedo apoyarte.\n\n"
-                "Incluso, si tienes tu póliza actual a la mano y me compartes su fecha de vencimiento, "
-                "con gusto puedo enviarte —antes de que venza— una propuesta personalizada que podría "
-                "ofrecerte mejor tarifa y coberturas.\n\n"
-                "¡Quedo a tu disposición! 💙"
-            )
-            send_message(phone, respuesta_rechazo)
-            
-        elif intencion == "seguro_auto":
-            log.info("🚗 GPT detectó: Seguro Auto")
-            auto_start(phone, match)
-            
-        elif intencion == "prestamo_imss":
-            log.info("🏥 GPT detectó: Préstamo IMSS")
-            imss_start(phone, match)
-            
-        elif intencion == "empresarial":
-            log.info("🏢 GPT detectó: Empresarial")
-            emp_start(phone, match)
-            
-        elif intencion == "financiamiento":
-            log.info("💰 GPT detectó: Financiamiento")
-            fp_start(phone, match)
-            
-        elif intencion == "duda_cobertura":
-            log.info("🤔 GPT detectó: Duda de cobertura")
-            respuesta = generar_respuesta_gpt(
-                text, 
-                "El cliente pregunta sobre diferencias entre coberturas de seguros. Responde de manera amable y sugiere contactar al asesor para detalles específicos."
-            )
-            send_message(phone, respuesta)
-            _notify_advisor(f"🔔 Duda técnica — Cliente pregunta: '{text}'\nWhatsApp: {phone}")
-            
-        elif intencion == "contactar":
-            log.info("👨‍💼 GPT detectó: Contactar asesor")
-            _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nMensaje: '{text}'\nWhatsApp: {phone}")
-            send_message(phone, "✅ ¡Listo! 🎯\n\nYa avisé a Christian para que te contacte y te dé atención personalizada. 📞\n\nMientras tanto, ¿hay algo más en lo que pueda ayudarte? 😊")
-            
+        st = user_state.get(phone, "")
+        if st.startswith("imss_"):
+            _imss_next(phone, text)
+        elif st.startswith("emp_"):
+            _emp_next(phone, text)
+        elif st.startswith("fp_"):
+            _fp_next(phone, text)
+        elif st.startswith("auto_"):
+            _auto_next(phone, text)
         else:
-            # Respuesta conversacional natural para otros mensajes
-            log.info("💬 GPT: Respuesta conversacional natural")
-            respuesta = generar_respuesta_gpt(text, "El cliente está interactuando de manera natural. Responde de forma amable y servicial.")
-            send_message(phone, respuesta)
+            send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
 
 # ==========================
 # Webhook — verificación
@@ -860,11 +1059,11 @@ def webhook_receive():
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
 
-            if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
+            if text.lower().startswith("sgpt:") and rag_index and rag_index.openai_client:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
                     log.info(f"🧠 Procesando solicitud GPT para {phone}")
-                    completion = openai.chat.completions.create(
+                    completion = rag_index.openai_client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.4,
@@ -892,7 +1091,7 @@ def webhook_receive():
         return jsonify({"ok": True}), 200
 
 # ==========================
-# Endpoints auxiliares
+# Endpoints auxiliares MEJORADOS
 # ==========================
 @app.get("/health")
 def health():
@@ -904,11 +1103,22 @@ def health():
 
 @app.get("/ext/health")
 def ext_health():
+    rag_status = "active" if rag_index and rag_index.index_cache else "inactive"
+    rag_details = {}
+    if rag_index and rag_index.index_cache:
+        rag_details = {
+            "documents_indexed": rag_index.index_cache.get('doc_count', 0),
+            "chunks_indexed": rag_index.index_cache.get('chunk_count', 0),
+            "last_refresh": rag_index.last_refresh
+        }
+    
     return jsonify({
         "status": "ok",
         "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID),
         "google_ready": google_ready,
-        "openai_ready": bool(openai and OPENAI_API_KEY)
+        "openai_ready": bool(rag_index and rag_index.openai_client),
+        "rag_status": rag_status,
+        "rag_details": rag_details
     }), 200
 
 @app.post("/ext/test-send")
@@ -933,6 +1143,42 @@ def ext_test_send():
         return jsonify({
             "ok": False, 
             "error": str(e)
+        }), 500
+
+# ==========================
+# NUEVO ENDPOINT RAG
+# ==========================
+@app.post("/ext/reindex")
+def force_reindex():
+    """Forzar reindexación manual del RAG"""
+    try:
+        if not rag_index:
+            return jsonify({
+                "status": "error", 
+                "message": "RAG no está inicializado"
+            }), 400
+            
+        log.info("🔄 Forzando reindexación RAG...")
+        result = rag_index.build_index()
+        
+        if result:
+            return jsonify({
+                "status": "success", 
+                "message": "Índice reconstruido exitosamente",
+                "documents": result.get('doc_count', 0),
+                "chunks": result.get('chunk_count', 0)
+            })
+        else:
+            return jsonify({
+                "status": "error", 
+                "message": "Error construyendo índice"
+            }), 500
+            
+    except Exception as e:
+        log.error(f"❌ Error en reindexación: {str(e)}")
+        return jsonify({
+            "status": "error", 
+            "message": str(e)
         }), 500
 
 def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
@@ -1077,9 +1323,11 @@ if __name__ == "__main__":
     log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
     log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
     log.info(f"📊 Google Sheets/Drive: {google_ready}")
-    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
+    log.info(f"🧠 OpenAI: {bool(rag_index and rag_index.openai_client)}")
+    log.info(f"📚 RAG Index: {bool(rag_index and rag_index.index_cache)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
 
 
