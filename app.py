@@ -1,4 +1,4 @@
-# app.py — Vicky SECOM (Versión 100% Funcional Corregida)
+# app.py — Vicky SECOM (Versión 100% Funcional Corregida) con GPT Integrado
 # Python 3.11+
 # ------------------------------------------------------------
 # CORRECCIONES APLICADAS:
@@ -8,6 +8,7 @@
 # 4. ✅ Logging exhaustivo para diagnóstico
 # 5. ✅ Manejo mejorado de errores
 # 6. ✅ Worker para envíos masivos
+# 7. ✅ INTEGRACIÓN GPT PARA CLASIFICACIÓN DE MENSAJES
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -23,54 +24,6 @@ import logging
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, List, Tuple
-# app.py - Archivo principal
-
-import openai
-import os
-from flask import Flask, request, jsonify
-
-# Configurar OpenAI
-openai.api_key = os.getenv('OPENAI_API_KEY')
-
-app = Flask(__name__)
-
-# --- AGREGAR ESTA FUNCIÓN EN app.py ---
-def clasificar_intencion(mensaje_usuario):
-    """
-    Clasifica si el usuario: rechaza, pregunta o quiere cotizar
-    """
-    prompt = f"""
-    Clasifica este mensaje del cliente en una sola palabra:
-    - "rechazo": si dice no le interesa, ya tiene seguro, no gracias
-    - "duda": si hace preguntas sobre seguros, coberturas, precios
-    - "cotizacion": si proporciona datos o quiere cotizar
-    
-    Mensaje: "{mensaje_usuario}"
-    """
-    
-    try:
-        respuesta = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-        return respuesta.choices[0].message.content.strip().lower()
-    except Exception as e:
-        print(f"Error con OpenAI: {e}")
-        return "duda"  # Fallback seguro
-# --- FIN DE LA FUNCIÓN ---
-
-# --- TEST TEMPORAL (luego lo quitas) ---
-if __name__ == "__main__":
-    test_mensajes = [
-        "ya tengo seguro con otra compañía",
-        "quiero cotizar un seguro para mi auto", 
-        "¿qué cubre la responsabilidad civil?"
-    ]
-    
-    for mensaje in test_mensajes:
-        intencion = clasificar_intencion(mensaje)
-        print(f"Mensaje: '{mensaje}' -> Intención: {intencion}")
 
 import requests
 from flask import Flask, request, jsonify
@@ -156,6 +109,48 @@ else:
 app = Flask(__name__)
 user_state: Dict[str, str] = {}
 user_data: Dict[str, Dict[str, Any]] = {}
+
+# ==========================
+# FUNCIÓN GPT PARA CLASIFICACIÓN (BLOQUE AGREGADO)
+# ==========================
+def clasificar_intencion(mensaje_usuario: str) -> str:
+    """
+    Clasifica la intención del mensaje usando GPT
+    """
+    if not (openai and OPENAI_API_KEY):
+        return "otro"
+    
+    try:
+        prompt = f"""
+        Eres un clasificador de intenciones para un bot de seguros y créditos.
+        Clasifica este mensaje en UNA de estas opciones:
+        
+        - "seguro_auto": si menciona cotización, auto, vehículo, carro, placa, tarjeta circulación
+        - "duda_cobertura": si pregunta sobre coberturas, diferencias, amplia plus, qué cubre, explicación
+        - "prestamo_imss": si menciona préstamo IMSS, ley 73, pensión, afores
+        - "seguro_vida": si menciona vida, salud, médico, gastos médicos
+        - "tarjeta_credito": si menciona tarjeta, crédito, plástico
+        - "empresarial": si menciona negocio, empresa, empresarial, pyme
+        - "financiamiento": si menciona financiamiento, crédito simple, práctico
+        - "contactar": si quiere hablar con agente, Christian, humano, asesor
+        - "rechazo": si dice no le interesa, ya tiene, no gracias, no quiero
+        - "otro": si no encaja en las anteriores
+        
+        Mensaje: "{mensaje_usuario}"
+        
+        Responde SOLO con la opción correspondiente.
+        """
+        
+        respuesta = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=50
+        )
+        return respuesta.choices[0].message.content.strip().lower()
+    except Exception as e:
+        log.error(f"❌ Error en clasificar_intencion: {e}")
+        return "otro"
 
 # ==========================
 # Utilidades generales
@@ -608,7 +603,7 @@ def _retry_after_days(phone: str, days: int) -> None:
         log.exception("Error en reintento programado")
 
 # ==========================
-# Router helpers
+# Router helpers (MODIFICADO CON GPT)
 # ==========================
 def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     last10 = _normalize_phone_last10(phone)
@@ -621,6 +616,8 @@ def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
 
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = text.strip().lower()
+    
+    # Si el mensaje es claro (números o palabras clave), usar lógica existente
     if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
         imss_start(phone, match)
     elif t in ("2", "auto", "seguros de auto", "seguro auto"):
@@ -645,17 +642,57 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         user_state[phone] = ""
         send_main_menu(phone)
     else:
-        st = user_state.get(phone, "")
-        if st.startswith("imss_"):
-            _imss_next(phone, text)
-        elif st.startswith("emp_"):
-            _emp_next(phone, text)
-        elif st.startswith("fp_"):
-            _fp_next(phone, text)
-        elif st.startswith("auto_"):
-            _auto_next(phone, text)
+        # Si no es un comando claro, usar GPT para clasificar
+        intencion = clasificar_intencion(text)
+        log.info(f"🧠 GPT clasificó '{text}' como: {intencion}")
+        
+        if intencion == "rechazo":
+            # Manejar rechazo con el mensaje que acordamos
+            respuesta_rechazo = (
+                "Entiendo perfectamente, no hay problema. Si en el futuro llegas a considerar una nueva opción "
+                "o simplemente quieres comparar, con tu número de placa o tarjeta de circulación puedo apoyarte.\n\n"
+                "Incluso, si tienes tu póliza actual a la mano y me compartes su fecha de vencimiento, con gusto "
+                "puedo enviarte —antes de que venza— una propuesta personalizada que podría ofrecerte mejor tarifa y coberturas.\n\n"
+                "¡Quedo a tu disposición! 😊"
+            )
+            send_message(phone, respuesta_rechazo)
+            
+        elif intencion == "seguro_auto":
+            auto_start(phone, match)
+            
+        elif intencion == "prestamo_imss":
+            imss_start(phone, match)
+            
+        elif intencion == "empresarial":
+            emp_start(phone, match)
+            
+        elif intencion == "financiamiento":
+            fp_start(phone, match)
+            
+        elif intencion == "duda_cobertura":
+            # Para dudas técnicas, redirigir al asesor
+            send_message(phone, "🤔 *Consulta sobre coberturas* — Para darte la información más precisa sobre diferencias entre coberturas, voy a notificar a nuestro especialista para que te contacte.")
+            _notify_advisor(f"🔔 Duda técnica — Cliente pregunta: '{text}'\nWhatsApp: {phone}")
+            send_main_menu(phone)
+            
+        elif intencion == "contactar":
+            _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
+            send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
+            send_main_menu(phone)
+            
         else:
-            send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
+            # Si GPT no clasifica o es "otro", usar la lógica de estado existente
+            st = user_state.get(phone, "")
+            if st.startswith("imss_"):
+                _imss_next(phone, text)
+            elif st.startswith("emp_"):
+                _emp_next(phone, text)
+            elif st.startswith("fp_"):
+                _fp_next(phone, text)
+            elif st.startswith("auto_"):
+                _auto_next(phone, text)
+            else:
+                send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
 
 # ==========================
 # Webhook — verificación
@@ -992,6 +1029,7 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
 
 
