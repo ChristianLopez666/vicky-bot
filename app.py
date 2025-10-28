@@ -1,4 +1,4 @@
-# app.py — Vicky SECOM (Versión 100% Funcional Corregida) con GPT Integrado
+# app.py — Vicky SECOM (Versión 100% Funcional con GPT Integrado)
 # Python 3.11+
 # ------------------------------------------------------------
 # CORRECCIONES APLICADAS:
@@ -8,7 +8,7 @@
 # 4. ✅ Logging exhaustivo para diagnóstico
 # 5. ✅ Manejo mejorado de errores
 # 6. ✅ Worker para envíos masivos
-# 7. ✅ INTEGRACIÓN GPT PARA CLASIFICACIÓN DE MENSAJES
+# 7. ✅ GPT INTEGRADO PARA CONVERSACIONES NATURALES
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -74,9 +74,9 @@ log = logging.getLogger("vicky-secom")
 if OPENAI_API_KEY and openai:
     try:
         openai.api_key = OPENAI_API_KEY
-        log.info("OpenAI configurado correctamente")
+        log.info("✅ OpenAI configurado correctamente")
     except Exception:
-        log.warning("OpenAI configurado pero no disponible")
+        log.warning("❌ OpenAI configurado pero no disponible")
 
 # ==========================
 # Google Setup (degradable)
@@ -111,13 +111,14 @@ user_state: Dict[str, str] = {}
 user_data: Dict[str, Dict[str, Any]] = {}
 
 # ==========================
-# FUNCIÓN GPT PARA CLASIFICACIÓN (BLOQUE AGREGADO)
+# FUNCIONES GPT INTEGRADAS
 # ==========================
 def clasificar_intencion(mensaje_usuario: str) -> str:
     """
     Clasifica la intención del mensaje usando GPT
     """
     if not (openai and OPENAI_API_KEY):
+        log.warning("⚠️ OpenAI no disponible para clasificación")
         return "otro"
     
     try:
@@ -147,10 +148,50 @@ def clasificar_intencion(mensaje_usuario: str) -> str:
             temperature=0.1,
             max_tokens=50
         )
-        return respuesta.choices[0].message.content.strip().lower()
+        intencion = respuesta.choices[0].message.content.strip().lower()
+        log.info(f"🧠 GPT clasificó: '{mensaje_usuario}' -> {intencion}")
+        return intencion
     except Exception as e:
         log.error(f"❌ Error en clasificar_intencion: {e}")
         return "otro"
+
+def generar_respuesta_gpt(mensaje_usuario: str, contexto: str = "") -> str:
+    """
+    Genera una respuesta natural y servicial usando GPT
+    """
+    if not (openai and OPENAI_API_KEY):
+        return "Te ayudo con gusto. ¿En qué producto estás interesado?"
+    
+    try:
+        prompt = f"""
+        Eres Vicky, una asistente virtual amable, efectiva y servicial que trabaja para Inbursa.
+        Tu personalidad es cálida, profesional y siempre buscas ayudar a los clientes.
+        
+        Contexto: {contexto}
+        
+        Mensaje del cliente: "{mensaje_usuario}"
+        
+        Instrucciones:
+        - Responde de manera natural y conversacional
+        - Sé amable, servicial y profesional
+        - Si es una duda compleja, sugiere contactar al asesor
+        - Si es sobre cotizaciones, guía al flujo correspondiente
+        - Mantén un tono cálido pero profesional
+        - Usa emojis apropiados para hacer la conversación más amena
+        
+        Responde como si estuvieras teniendo una conversación natural:
+        """
+        
+        respuesta = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=150
+        )
+        return respuesta.choices[0].message.content.strip()
+    except Exception as e:
+        log.error(f"❌ Error en generar_respuesta_gpt: {e}")
+        return "¡Claro! Te ayudo con eso. ¿Podrías contarme más detalles para poder asistirte mejor? 😊"
 
 # ==========================
 # Utilidades generales
@@ -616,83 +657,93 @@ def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
 
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = text.strip().lower()
+    log.info(f"🔍 Procesando mensaje: '{text}' -> normalizado: '{t}'")
     
     # Si el mensaje es claro (números o palabras clave), usar lógica existente
     if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
+        log.info("🎯 Comando detectado: IMSS")
         imss_start(phone, match)
     elif t in ("2", "auto", "seguros de auto", "seguro auto"):
+        log.info("🎯 Comando detectado: Seguro Auto")
         auto_start(phone, match)
     elif t in ("3", "vida", "salud", "seguro de vida", "seguro de salud"):
+        log.info("🎯 Comando detectado: Seguro Vida/Salud")
         send_message(phone, "🧬 *Seguros de Vida/Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.")
         _notify_advisor(f"🔔 Vida/Salud — Solicitud de contacto\nWhatsApp: {phone}")
         send_main_menu(phone)
     elif t in ("4", "vrim", "tarjeta médica", "tarjeta medica"):
+        log.info("🎯 Comando detectado: VRIM")
         send_message(phone, "🩺 *VRIM* — Membresía médica. Notificaré al asesor para darte detalles.")
         _notify_advisor(f"🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}")
         send_main_menu(phone)
     elif t in ("5", "empresarial", "pyme", "crédito empresarial", "credito empresarial"):
+        log.info("🎯 Comando detectado: Empresarial")
         emp_start(phone, match)
     elif t in ("6", "financiamiento práctico", "financiamiento practico", "crédito simple", "credito simple"):
+        log.info("🎯 Comando detectado: Financiamiento")
         fp_start(phone, match)
     elif t in ("7", "contactar", "asesor", "contactar con christian"):
+        log.info("🎯 Comando detectado: Contactar")
         _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
         send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
         send_main_menu(phone)
     elif t in ("menu", "menú", "inicio", "hola"):
+        log.info("🎯 Comando detectado: Menú")
         user_state[phone] = ""
         send_main_menu(phone)
     else:
         # Si no es un comando claro, usar GPT para clasificar
+        log.info("🤖 Usando GPT para clasificar mensaje natural")
         intencion = clasificar_intencion(text)
-        log.info(f"🧠 GPT clasificó '{text}' como: {intencion}")
         
         if intencion == "rechazo":
-            # Manejar rechazo con el mensaje que acordamos
+            log.info("🛑 Manejo de rechazo con GPT")
             respuesta_rechazo = (
-                "Entiendo perfectamente, no hay problema. Si en el futuro llegas a considerar una nueva opción "
-                "o simplemente quieres comparar, con tu número de placa o tarjeta de circulación puedo apoyarte.\n\n"
-                "Incluso, si tienes tu póliza actual a la mano y me compartes su fecha de vencimiento, con gusto "
-                "puedo enviarte —antes de que venza— una propuesta personalizada que podría ofrecerte mejor tarifa y coberturas.\n\n"
-                "¡Quedo a tu disposición! 😊"
+                "Entiendo perfectamente, no hay problema 😊\n\n"
+                "Si en el futuro llegas a considerar una nueva opción o simplemente quieres comparar, "
+                "con tu número de placa o tarjeta de circulación puedo apoyarte.\n\n"
+                "Incluso, si tienes tu póliza actual a la mano y me compartes su fecha de vencimiento, "
+                "con gusto puedo enviarte —antes de que venza— una propuesta personalizada que podría "
+                "ofrecerte mejor tarifa y coberturas.\n\n"
+                "¡Quedo a tu disposición! 💙"
             )
             send_message(phone, respuesta_rechazo)
             
         elif intencion == "seguro_auto":
+            log.info("🚗 GPT detectó: Seguro Auto")
             auto_start(phone, match)
             
         elif intencion == "prestamo_imss":
+            log.info("🏥 GPT detectó: Préstamo IMSS")
             imss_start(phone, match)
             
         elif intencion == "empresarial":
+            log.info("🏢 GPT detectó: Empresarial")
             emp_start(phone, match)
             
         elif intencion == "financiamiento":
+            log.info("💰 GPT detectó: Financiamiento")
             fp_start(phone, match)
             
         elif intencion == "duda_cobertura":
-            # Para dudas técnicas, redirigir al asesor
-            send_message(phone, "🤔 *Consulta sobre coberturas* — Para darte la información más precisa sobre diferencias entre coberturas, voy a notificar a nuestro especialista para que te contacte.")
+            log.info("🤔 GPT detectó: Duda de cobertura")
+            respuesta = generar_respuesta_gpt(
+                text, 
+                "El cliente pregunta sobre diferencias entre coberturas de seguros. Responde de manera amable y sugiere contactar al asesor para detalles específicos."
+            )
+            send_message(phone, respuesta)
             _notify_advisor(f"🔔 Duda técnica — Cliente pregunta: '{text}'\nWhatsApp: {phone}")
-            send_main_menu(phone)
             
         elif intencion == "contactar":
-            _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
-            send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
-            send_main_menu(phone)
+            log.info("👨‍💼 GPT detectó: Contactar asesor")
+            _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nMensaje: '{text}'\nWhatsApp: {phone}")
+            send_message(phone, "✅ ¡Listo! 🎯\n\nYa avisé a Christian para que te contacte y te dé atención personalizada. 📞\n\nMientras tanto, ¿hay algo más en lo que pueda ayudarte? 😊")
             
         else:
-            # Si GPT no clasifica o es "otro", usar la lógica de estado existente
-            st = user_state.get(phone, "")
-            if st.startswith("imss_"):
-                _imss_next(phone, text)
-            elif st.startswith("emp_"):
-                _emp_next(phone, text)
-            elif st.startswith("fp_"):
-                _fp_next(phone, text)
-            elif st.startswith("auto_"):
-                _auto_next(phone, text)
-            else:
-                send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
+            # Respuesta conversacional natural para otros mensajes
+            log.info("💬 GPT: Respuesta conversacional natural")
+            respuesta = generar_respuesta_gpt(text, "El cliente está interactuando de manera natural. Responde de forma amable y servicial.")
+            send_message(phone, respuesta)
 
 # ==========================
 # Webhook — verificación
@@ -1029,6 +1080,7 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
 
 
