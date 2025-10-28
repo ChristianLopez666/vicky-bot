@@ -9,6 +9,8 @@
 # 5. ✅ Manejo mejorado de errores
 # 6. ✅ Worker para envíos masivos
 # 7. ✅ MÓDULO RAG INTEGRADO para consultas de manuales
+# 8. ✅ Corrección de bucle en estado auto_intro
+# 9. ✅ Detección inteligente de consultas para RAG
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -33,25 +35,18 @@ from dotenv import load_dotenv
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
+    from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 except Exception:
     service_account = None
     build = None
     MediaIoBaseDownload = None
+    MediaIoBaseUpload = None
 
 # GPT opcional
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
-
-# RAG dependencies
-try:
-    import numpy as np
-    from rank_bm25 import BM25Okapi
-except Exception:
-    np = None
-    BM25Okapi = None
 
 # ==========================
 # Carga entorno + Logging
@@ -92,35 +87,47 @@ class DriveReader:
         
     def _find_folder_id(self):
         """Localiza la carpeta Manuales Vicky por nombre"""
-        response = self.service.files().list(
-            q=f"name='{self.folder_name}' and mimeType='application/vnd.google-apps.folder'",
-            spaces='drive',
-            fields='files(id, name)'
-        ).execute()
-        
-        if not response.get('files'):
-            raise Exception(f"Carpeta '{self.folder_name}' no encontrada en Drive")
+        try:
+            response = self.service.files().list(
+                q=f"name='{self.folder_name}' and mimeType='application/vnd.google-apps.folder'",
+                spaces='drive',
+                fields='files(id, name)'
+            ).execute()
             
-        return response['files'][0]['id']
+            if not response.get('files'):
+                log.warning(f"Carpeta '{self.folder_name}' no encontrada en Drive")
+                return None
+                
+            return response['files'][0]['id']
+        except Exception as e:
+            log.error(f"Error buscando carpeta {self.folder_name}: {str(e)}")
+            return None
     
     def list_manual_files(self):
         """Lista todos los archivos en la carpeta con metadatos"""
-        response = self.service.files().list(
-            q=f"'{self.folder_id}' in parents and trashed=false",
-            fields='files(id, name, mimeType, modifiedTime, size)',
-            orderBy='modifiedTime desc'
-        ).execute()
-        
-        return [
-            {
-                'id': file['id'],
-                'name': file['name'],
-                'mimeType': file['mimeType'],
-                'modifiedTime': file['modifiedTime'],
-                'size': file.get('size', '0')
-            }
-            for file in response.get('files', [])
-        ]
+        if not self.folder_id:
+            return []
+            
+        try:
+            response = self.service.files().list(
+                q=f"'{self.folder_id}' in parents and trashed=false",
+                fields='files(id, name, mimeType, modifiedTime, size)',
+                orderBy='modifiedTime desc'
+            ).execute()
+            
+            return [
+                {
+                    'id': file['id'],
+                    'name': file['name'],
+                    'mimeType': file['mimeType'],
+                    'modifiedTime': file['modifiedTime'],
+                    'size': file.get('size', '0')
+                }
+                for file in response.get('files', [])
+            ]
+        except Exception as e:
+            log.error(f"Error listando archivos: {str(e)}")
+            return []
     
     def extract_text_from_file(self, file_id, mime_type, file_name):
         """Extrae texto de PDFs y Google Docs"""
@@ -162,16 +169,19 @@ class DriveReader:
             return ""
     
     def _extract_text_from_pdf_bytes(self, pdf_bytes):
-        """Extracción básica de texto de PDF sin pdfminer"""
-        # Patrón simple para extraer texto entre paréntesis (common in PDFs)
-        text_pattern = re.findall(rb'\((.*?)\)', pdf_bytes)
-        text = b' '.join(text_pattern).decode('latin-1', errors='ignore')
-        
-        # Limpiar caracteres especiales
-        text = re.sub(r'\\[a-zA-Z]', ' ', text)
-        text = re.sub(r'\s+', ' ', text)
-        
-        return text.strip()
+        """Extracción básica de texto de PDF"""
+        try:
+            # Patrón simple para extraer texto entre paréntesis (common in PDFs)
+            text_pattern = re.findall(rb'\((.*?)\)', pdf_bytes)
+            text = b' '.join(text_pattern).decode('latin-1', errors='ignore')
+            
+            # Limpiar caracteres especiales
+            text = re.sub(r'\\[a-zA-Z]', ' ', text)
+            text = re.sub(r'\s+', ' ', text)
+            
+            return text.strip()
+        except Exception:
+            return "No se pudo extraer texto del PDF"
     
     def _extract_google_doc_text(self, file_id):
         """Exporta Google Docs como texto plano"""
@@ -217,9 +227,13 @@ class RAGIndex:
         return chunks
     
     def build_index(self):
-        """Construye índice combinado BM25 + embeddings"""
+        """Construye índice de documentos"""
         try:
             files = self.drive_reader.list_manual_files()
+            if not files:
+                log.warning("No se encontraron archivos en la carpeta de manuales")
+                return None
+                
             all_chunks = []
             all_metadata = []
             
@@ -248,29 +262,9 @@ class RAGIndex:
                 log.warning("No se encontraron chunks para indexar")
                 return None
             
-            # BM25
-            tokenized_chunks = [chunk.split() for chunk in all_chunks]
-            bm25_index = BM25Okapi(tokenized_chunks) if BM25Okapi else None
-            
-            # Embeddings (opcional)
-            embeddings = []
-            if self.openai_client and all_chunks:
-                for chunk in all_chunks:
-                    try:
-                        response = self.openai_client.embeddings.create(
-                            model="text-embedding-3-small",
-                            input=chunk
-                        )
-                        embeddings.append(response.data[0].embedding)
-                    except Exception as e:
-                        log.error(f"Error generando embedding: {str(e)}")
-                        embeddings.append(np.zeros(1536) if np else [0] * 1536)
-            
             self.index_cache = {
                 'chunks': all_chunks,
                 'metadata': all_metadata,
-                'bm25': bm25_index,
-                'embeddings': np.array(embeddings) if embeddings else None,
                 'build_time': time.time(),
                 'doc_count': len(files),
                 'chunk_count': len(all_chunks)
@@ -284,8 +278,8 @@ class RAGIndex:
             log.error(f"Error construyendo índice: {str(e)}")
             return None
     
-    def search(self, query, top_k=5):
-        """Búsqueda híbrida BM25 + embeddings"""
+    def search_simple(self, query, top_k=5):
+        """Búsqueda simple por palabras clave"""
         if not self.index_cache or time.time() - self.last_refresh > self.cache_ttl:
             log.info("Refrescando índice...")
             self.build_index()
@@ -293,57 +287,38 @@ class RAGIndex:
         if not self.index_cache:
             return []
         
-        # BM25
-        bm25_scores = np.zeros(len(self.index_cache['chunks']))
-        if self.index_cache['bm25']:
-            tokenized_query = query.split()
-            bm25_scores = self.index_cache['bm25'].get_scores(tokenized_query)
-        
-        # Embeddings
-        cosine_sim = np.zeros(len(self.index_cache['chunks']))
-        if self.index_cache['embeddings'] is not None and self.openai_client:
-            try:
-                response = self.openai_client.embeddings.create(
-                    model="text-embedding-3-small", 
-                    input=query
-                )
-                query_embedding = np.array(response.data[0].embedding)
-                
-                dot_product = np.dot(self.index_cache['embeddings'], query_embedding)
-                norms = np.linalg.norm(self.index_cache['embeddings'], axis=1) * np.linalg.norm(query_embedding)
-                cosine_sim = dot_product / (norms + 1e-8)
-            except Exception as e:
-                log.error(f"Error en embeddings de búsqueda: {str(e)}")
-        
-        # Combinar scores
-        combined_scores = 0.7 * bm25_scores + 0.3 * cosine_sim
-        
-        top_indices = np.argsort(combined_scores)[-top_k:][::-1]
-        
+        query_words = query.lower().split()
         results = []
-        for idx in top_indices:
-            if combined_scores[idx] > 0.1:  # threshold mínimo
+        
+        for i, chunk in enumerate(self.index_cache['chunks']):
+            chunk_lower = chunk.lower()
+            score = sum(1 for word in query_words if word in chunk_lower)
+            
+            if score > 0:
                 results.append({
-                    'chunk': self.index_cache['chunks'][idx],
-                    'metadata': self.index_cache['metadata'][idx],
-                    'score': float(combined_scores[idx])
+                    'chunk': chunk,
+                    'metadata': self.index_cache['metadata'][i],
+                    'score': score
                 })
         
-        return results
+        # Ordenar por score y tomar los mejores
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results[:top_k]
     
-    def answer_with_context(self, user_query, conversation_history=None):
+    def answer_with_context(self, user_query):
         """Genera respuesta usando contexto de los manuales"""
         try:
-            search_results = self.search(user_query, top_k=5)
+            search_results = self.search_simple(user_query, top_k=3)
             
             if not search_results:
                 return "🤔 No encontré información específica sobre tu pregunta en los manuales. ¿Podrías reformularla o contactar a Christian para asistencia personalizada?"
             
             context = ""
-            for i, result in enumerate(search_results[:3]):  # Top 3 resultados
-                context += f"[Fuente {i+1}: {result['metadata']['file_name']}]\n{result['chunk']}\n\n"
+            for i, result in enumerate(search_results):
+                context += f"[De: {result['metadata']['file_name']}]\n{result['chunk']}\n\n"
             
-            prompt = f"""Eres Vicky, asistente de SECOM. Responde de manera CALIDA, CLARA y PRECISA usando SOLO la información del contexto.
+            if self.openai_client:
+                prompt = f"""Eres Vicky, asistente de SECOM. Responde de manera CALIDA, CLARA y PRECISA usando SOLO la información del contexto.
 
 CONTEXTO DISPONIBLE:
 {context}
@@ -359,8 +334,7 @@ INSTRUCCIONES:
 - Sé concisa pero útil (máximo 2 párrafos)
 
 RESPUESTA:"""
-            
-            if self.openai_client:
+                
                 response = self.openai_client.chat.completions.create(
                     model="gpt-3.5-turbo",
                     messages=[{"role": "user", "content": prompt}],
@@ -371,15 +345,17 @@ RESPUESTA:"""
                 answer = response.choices[0].message.content.strip()
                 
                 # Asegurar que se cite la fuente
-                if not any(f in answer for f in ["Fuente", "Manual", "procedimiento"]):
+                if not any(f in answer for f in ["Fuente", "Manual", "procedimiento", "según"]):
                     main_source = search_results[0]['metadata']['file_name']
                     answer += f"\n\n📚 Fuente: {main_source}"
                     
                 return answer
             else:
-                # Fallback sin OpenAI
-                main_source = search_results[0]['metadata']['file_name']
-                return f"📚 Según el {main_source}: {search_results[0]['chunk'][:300]}...\n\nPara más detalles, contacta a Christian."
+                # Fallback sin OpenAI - usar el chunk más relevante
+                main_result = search_results[0]
+                source = main_result['metadata']['file_name']
+                text = main_result['chunk'][:400] + "..." if len(main_result['chunk']) > 400 else main_result['chunk']
+                return f"📚 Según {source}:\n\n{text}\n\nPara información más detallada, contacta a Christian 📞"
                 
         except Exception as e:
             log.error(f"Error en answer_with_context: {str(e)}")
@@ -849,6 +825,20 @@ def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
 def _auto_next(phone: str, text: str) -> None:
     st = user_state.get(phone, "")
     if st == "auto_intro":
+        # DETECCIÓN DE CONSULTAS PARA RAG - CORREGIDO
+        rag_keywords = ['cobertura', 'coberturas', 'qué cubre', 'que cubre', 'incluye', 'beneficios', 'condiciones', 
+                       'póliza', 'poliza', 'endoso', 'deducible', 'asegurado', 'cláusula', 'clausula', 'vigencia',
+                       'siniestro', 'reclamación', 'reclamacion', 'procedimiento', 'manual', 'documentación',
+                       'diferencia', 'amplia', 'limitada', 'plus', 'básica', 'basica', 'tiempo', 'pagar', 'cuanto']
+        
+        is_rag_query = any(keyword in text.lower() for keyword in rag_keywords)
+        
+        if is_rag_query and rag_index:
+            log.info(f"🧠 Consulta RAG detectada en auto_intro: {text}")
+            respuesta = rag_index.answer_with_context(text)
+            send_message(phone, respuesta)
+            return
+            
         intent = interpret_response(text)
         if "vencimiento" in text.lower() or "vence" in text.lower() or "fecha" in text.lower():
             user_state[phone] = "auto_vencimiento_fecha"
@@ -881,7 +871,7 @@ def _retry_after_days(phone: str, days: int) -> None:
         log.exception("Error en reintento programado")
 
 # ==========================
-# Router helpers CON RAG INTEGRADO
+# Router helpers CON RAG INTEGRADO - CORREGIDO
 # ==========================
 def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     last10 = _normalize_phone_last10(phone)
@@ -895,19 +885,23 @@ def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = text.strip().lower()
     
-    # DETECCIÓN DE CONSULTAS PARA RAG
+    # DETECCIÓN DE CONSULTAS PARA RAG - MEJORADA
     rag_keywords = ['cobertura', 'coberturas', 'qué cubre', 'que cubre', 'incluye', 'beneficios', 'condiciones', 
                    'póliza', 'poliza', 'endoso', 'deducible', 'asegurado', 'cláusula', 'clausula', 'vigencia',
-                   'siniestro', 'reclamación', 'reclamacion', 'procedimiento', 'manual', 'documentación']
+                   'siniestro', 'reclamación', 'reclamacion', 'procedimiento', 'manual', 'documentación',
+                   'diferencia', 'amplia', 'limitada', 'plus', 'básica', 'basica', 'tiempo', 'pagar', 'cuanto',
+                   'explicas', 'explícame', 'información', 'informacion', 'detalles', 'características']
     
     is_rag_query = any(keyword in t for keyword in rag_keywords)
     
+    # PRIORIDAD: Si es consulta RAG, procesar inmediatamente
     if is_rag_query and rag_index:
         log.info(f"🧠 Consulta RAG detectada: {text}")
         respuesta = rag_index.answer_with_context(text)
         send_message(phone, respuesta)
         return
     
+    # Comandos normales del menú
     if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
         imss_start(phone, match)
     elif t in ("2", "auto", "seguros de auto", "seguro auto"):
@@ -942,6 +936,7 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         elif st.startswith("auto_"):
             _auto_next(phone, text)
         else:
+            # Si no hay estado y no es comando reconocido, ofrecer menú
             send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
 
 # ==========================
@@ -1327,8 +1322,6 @@ if __name__ == "__main__":
     log.info(f"📚 RAG Index: {bool(rag_index and rag_index.index_cache)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
-
 
 
 
