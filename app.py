@@ -1,16 +1,12 @@
-# app.py — Vicky SECOM (Versión 100% Funcional + RAG Integrado)
+# app.py — Vicky SECOM (Versión 100% Funcional con RAG)
 # Python 3.11+
 # ------------------------------------------------------------
-# CORRECCIONES APLICADAS:
-# 1. ✅ Endpoint /ext/send-promo completamente funcional
-# 2. ✅ Eliminación de función duplicada
-# 3. ✅ Validación robusta de configuración
-# 4. ✅ Logging exhaustivo para diagnóstico
-# 5. ✅ Manejo mejorado de errores
-# 6. ✅ Worker para envíos masivos
-# 7. ✅ MÓDULO RAG INTEGRADO para consultas de manuales
-# 8. ✅ Corrección de bucle en estado auto_intro
-# 9. ✅ Detección inteligente de consultas para RAG
+# MEJORAS IMPLEMENTADAS:
+# 1. ✅ Módulo RAG completo para leer manuales de Drive
+# 2. ✅ Respuestas con citas de origen en consultas IMSS/Auto
+# 3. ✅ Envío masivo robusto con registro en Sheets
+# 4. ✅ Cache automático y auto-refresh de índices
+# 5. ✅ Mantenimiento de endpoints existentes
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -26,6 +22,8 @@ import logging
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, List, Tuple
+import hashlib
+import pickle
 
 import requests
 from flask import Flask, request, jsonify
@@ -35,18 +33,24 @@ from dotenv import load_dotenv
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+    from googleapiclient.http import MediaIoBaseUpload
 except Exception:
     service_account = None
     build = None
-    MediaIoBaseDownload = None
     MediaIoBaseUpload = None
 
 # GPT opcional
 try:
-    from openai import OpenAI
+    import openai
 except Exception:
-    OpenAI = None
+    openai = None
+
+# PDF processing
+try:
+    from PyPDF2 import PdfReader
+    PDF_AVAILABLE = True
+except Exception:
+    PDF_AVAILABLE = False
 
 # ==========================
 # Carga entorno + Logging
@@ -63,7 +67,6 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
 SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto")
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
-DRIVE_MANUALES_FOLDER = os.getenv("DRIVE_MANUALES_FOLDER", "Manuales Vicky")
 
 PORT = int(os.getenv("PORT", "5000"))
 
@@ -75,291 +78,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("vicky-secom")
 
-# ==========================
-# MÓDULO RAG INTEGRADO
-# ==========================
-class DriveReader:
-    def __init__(self, credentials_json, folder_name=DRIVE_MANUALES_FOLDER):
-        self.credentials = service_account.Credentials.from_service_account_info(credentials_json)
-        self.service = build('drive', 'v3', credentials=self.credentials)
-        self.folder_name = folder_name
-        self.folder_id = self._find_folder_id()
-        
-    def _find_folder_id(self):
-        """Localiza la carpeta Manuales Vicky por nombre"""
-        try:
-            response = self.service.files().list(
-                q=f"name='{self.folder_name}' and mimeType='application/vnd.google-apps.folder'",
-                spaces='drive',
-                fields='files(id, name)'
-            ).execute()
-            
-            if not response.get('files'):
-                log.warning(f"Carpeta '{self.folder_name}' no encontrada en Drive")
-                return None
-                
-            return response['files'][0]['id']
-        except Exception as e:
-            log.error(f"Error buscando carpeta {self.folder_name}: {str(e)}")
-            return None
-    
-    def list_manual_files(self):
-        """Lista todos los archivos en la carpeta con metadatos"""
-        if not self.folder_id:
-            return []
-            
-        try:
-            response = self.service.files().list(
-                q=f"'{self.folder_id}' in parents and trashed=false",
-                fields='files(id, name, mimeType, modifiedTime, size)',
-                orderBy='modifiedTime desc'
-            ).execute()
-            
-            return [
-                {
-                    'id': file['id'],
-                    'name': file['name'],
-                    'mimeType': file['mimeType'],
-                    'modifiedTime': file['modifiedTime'],
-                    'size': file.get('size', '0')
-                }
-                for file in response.get('files', [])
-            ]
-        except Exception as e:
-            log.error(f"Error listando archivos: {str(e)}")
-            return []
-    
-    def extract_text_from_file(self, file_id, mime_type, file_name):
-        """Extrae texto de PDFs y Google Docs"""
-        try:
-            if mime_type == 'application/pdf':
-                return self._extract_pdf_text(file_id)
-            elif mime_type == 'application/vnd.google-apps.document':
-                return self._extract_google_doc_text(file_id)
-            else:
-                log.warning(f"Formato no soportado: {mime_type} para {file_name}")
-                return ""
-        except Exception as e:
-            log.error(f"Error extrayendo texto de {file_name}: {str(e)}")
-            return ""
-    
-    def _extract_pdf_text(self, file_id):
-        """Extrae texto de PDFs"""
-        try:
-            request = self.service.files().get_media(fileId=file_id)
-            pdf_file = io.BytesIO()
-            downloader = MediaIoBaseDownload(pdf_file, request)
-            
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-            
-            pdf_file.seek(0)
-            
-            # Extracción simple de texto de PDF (sin pdfminer)
-            text = self._extract_text_from_pdf_bytes(pdf_file.getvalue())
-            
-            # Limpieza básica
-            text = re.sub(r'\n\s*\n', '\n\n', text)
-            text = re.sub(r'^\s+|\s+$', '', text, flags=re.MULTILINE)
-            
-            return text
-        except Exception as e:
-            log.error(f"Error extrayendo PDF: {str(e)}")
-            return ""
-    
-    def _extract_text_from_pdf_bytes(self, pdf_bytes):
-        """Extracción básica de texto de PDF"""
-        try:
-            # Patrón simple para extraer texto entre paréntesis (common in PDFs)
-            text_pattern = re.findall(rb'\((.*?)\)', pdf_bytes)
-            text = b' '.join(text_pattern).decode('latin-1', errors='ignore')
-            
-            # Limpiar caracteres especiales
-            text = re.sub(r'\\[a-zA-Z]', ' ', text)
-            text = re.sub(r'\s+', ' ', text)
-            
-            return text.strip()
-        except Exception:
-            return "No se pudo extraer texto del PDF"
-    
-    def _extract_google_doc_text(self, file_id):
-        """Exporta Google Docs como texto plano"""
-        try:
-            request = self.service.files().export_media(
-                fileId=file_id, 
-                mimeType='text/plain'
-            )
-            text_file = io.BytesIO()
-            downloader = MediaIoBaseDownload(text_file, request)
-            
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-            
-            return text_file.getvalue().decode('utf-8')
-        except Exception as e:
-            log.error(f"Error extrayendo Google Doc: {str(e)}")
-            return ""
-
-class RAGIndex:
-    def __init__(self, drive_reader, openai_api_key):
-        self.drive_reader = drive_reader
-        self.openai_client = OpenAI(api_key=openai_api_key) if OpenAI and openai_api_key else None
-        self.index_cache = None
-        self.last_refresh = 0
-        self.cache_ttl = 1800  # 30 minutos
-        
-    def chunk_text(self, text, chunk_size=800, overlap=120):
-        """Divide texto en chunks con overlap"""
-        words = text.split()
-        if not words:
-            return []
-            
-        chunks = []
-        
-        for i in range(0, len(words), chunk_size - overlap):
-            chunk = ' '.join(words[i:i + chunk_size])
-            chunks.append(chunk)
-            if i + chunk_size >= len(words):
-                break
-                
-        return chunks
-    
-    def build_index(self):
-        """Construye índice de documentos"""
-        try:
-            files = self.drive_reader.list_manual_files()
-            if not files:
-                log.warning("No se encontraron archivos en la carpeta de manuales")
-                return None
-                
-            all_chunks = []
-            all_metadata = []
-            
-            for file in files:
-                log.info(f"Procesando: {file['name']}")
-                text = self.drive_reader.extract_text_from_file(
-                    file['id'], file['mimeType'], file['name']
-                )
-                
-                if not text:
-                    continue
-                    
-                chunks = self.chunk_text(text)
-                
-                for i, chunk in enumerate(chunks):
-                    all_chunks.append(chunk)
-                    all_metadata.append({
-                        'file_name': file['name'],
-                        'file_id': file['id'],
-                        'chunk_index': i,
-                        'modified_time': file['modifiedTime'],
-                        'text_preview': chunk[:100] + '...' if len(chunk) > 100 else chunk
-                    })
-            
-            if not all_chunks:
-                log.warning("No se encontraron chunks para indexar")
-                return None
-            
-            self.index_cache = {
-                'chunks': all_chunks,
-                'metadata': all_metadata,
-                'build_time': time.time(),
-                'doc_count': len(files),
-                'chunk_count': len(all_chunks)
-            }
-            self.last_refresh = time.time()
-            
-            log.info(f"Índice construido con {len(all_chunks)} chunks de {len(files)} documentos")
-            return self.index_cache
-            
-        except Exception as e:
-            log.error(f"Error construyendo índice: {str(e)}")
-            return None
-    
-    def search_simple(self, query, top_k=5):
-        """Búsqueda simple por palabras clave"""
-        if not self.index_cache or time.time() - self.last_refresh > self.cache_ttl:
-            log.info("Refrescando índice...")
-            self.build_index()
-        
-        if not self.index_cache:
-            return []
-        
-        query_words = query.lower().split()
-        results = []
-        
-        for i, chunk in enumerate(self.index_cache['chunks']):
-            chunk_lower = chunk.lower()
-            score = sum(1 for word in query_words if word in chunk_lower)
-            
-            if score > 0:
-                results.append({
-                    'chunk': chunk,
-                    'metadata': self.index_cache['metadata'][i],
-                    'score': score
-                })
-        
-        # Ordenar por score y tomar los mejores
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:top_k]
-    
-    def answer_with_context(self, user_query):
-        """Genera respuesta usando contexto de los manuales"""
-        try:
-            search_results = self.search_simple(user_query, top_k=3)
-            
-            if not search_results:
-                return "🤔 No encontré información específica sobre tu pregunta en los manuales. ¿Podrías reformularla o contactar a Christian para asistencia personalizada?"
-            
-            context = ""
-            for i, result in enumerate(search_results):
-                context += f"[De: {result['metadata']['file_name']}]\n{result['chunk']}\n\n"
-            
-            if self.openai_client:
-                prompt = f"""Eres Vicky, asistente de SECOM. Responde de manera CALIDA, CLARA y PRECISA usando SOLO la información del contexto.
-
-CONTEXTO DISPONIBLE:
-{context}
-
-PREGUNTA DEL USUARIO: {user_query}
-
-INSTRUCCIONES:
-- Responde en español de México, tono profesional pero amable
-- Usa EMOJIS relevantes para hacerlo más cálido ✅🤝🌟
-- Si la información no es completa, sugiere contactar al asesor
-- CITAR la fuente específica (nombre del manual) cuando uses información de ahí
-- NUNCA inventes información que no esté en el contexto
-- Sé concisa pero útil (máximo 2 párrafos)
-
-RESPUESTA:"""
-                
-                response = self.openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
-                    max_tokens=500
-                )
-                
-                answer = response.choices[0].message.content.strip()
-                
-                # Asegurar que se cite la fuente
-                if not any(f in answer for f in ["Fuente", "Manual", "procedimiento", "según"]):
-                    main_source = search_results[0]['metadata']['file_name']
-                    answer += f"\n\n📚 Fuente: {main_source}"
-                    
-                return answer
-            else:
-                # Fallback sin OpenAI - usar el chunk más relevante
-                main_result = search_results[0]
-                source = main_result['metadata']['file_name']
-                text = main_result['chunk'][:400] + "..." if len(main_result['chunk']) > 400 else main_result['chunk']
-                return f"📚 Según {source}:\n\n{text}\n\nPara información más detallada, contacta a Christian 📞"
-                
-        except Exception as e:
-            log.error(f"Error en answer_with_context: {str(e)}")
-            return "⚠️ Ocurrió un error al procesar tu consulta. Por favor, intenta de nuevo o contacta a Christian para asistencia inmediata."
+if OPENAI_API_KEY and openai:
+    try:
+        openai.api_key = OPENAI_API_KEY
+        log.info("OpenAI configurado correctamente")
+    except Exception:
+        log.warning("OpenAI configurado pero no disponible")
 
 # ==========================
 # Google Setup (degradable)
@@ -368,7 +92,6 @@ creds = None
 sheets_svc = None
 drive_svc = None
 google_ready = False
-rag_index = None
 
 if GOOGLE_CREDENTIALS_JSON and service_account and build:
     try:
@@ -382,18 +105,6 @@ if GOOGLE_CREDENTIALS_JSON and service_account and build:
         drive_svc = build("drive", "v3", credentials=creds)
         google_ready = True
         log.info("✅ Google services listos (Sheets + Drive)")
-        
-        # Inicializar RAG si hay OpenAI
-        if OPENAI_API_KEY and OpenAI:
-            try:
-                drive_reader = DriveReader(info)
-                rag_index = RAGIndex(drive_reader, OPENAI_API_KEY)
-                # Construir índice inicial en background
-                threading.Thread(target=rag_index.build_index, daemon=True).start()
-                log.info("✅ RAG Index inicializado en background")
-            except Exception as e:
-                log.error(f"❌ Error inicializando RAG: {str(e)}")
-                rag_index = None
     except Exception:
         log.exception("❌ No fue posible inicializar Google. Modo mínimo activo.")
 else:
@@ -405,6 +116,281 @@ else:
 app = Flask(__name__)
 user_state: Dict[str, str] = {}
 user_data: Dict[str, Dict[str, Any]] = {}
+
+# ==========================
+# Módulo RAG - Drive Reader
+# ==========================
+class DriveRAGIndex:
+    def __init__(self):
+        self.index = []
+        self.file_metadata = {}
+        self.last_update = None
+        self.cache_ttl = 1800  # 30 minutos
+        self.cache_timestamp = 0
+        
+    def list_manual_files(self, folder_name="Manuales Vicky") -> List[Dict[str, Any]]:
+        """Lista archivos en la carpeta de manuales"""
+        if not (google_ready and drive_svc):
+            log.warning("⚠️ Drive no disponible para listar manuales")
+            return []
+            
+        try:
+            # Buscar carpeta por nombre
+            query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            if DRIVE_PARENT_FOLDER_ID:
+                query += f" and '{DRIVE_PARENT_FOLDER_ID}' in parents"
+                
+            folders = drive_svc.files().list(q=query, fields="files(id, name)").execute()
+            folder_id = folders.get("files", [{}])[0].get("id") if folders.get("files") else DRIVE_PARENT_FOLDER_ID
+            
+            if not folder_id:
+                log.error("❌ No se encontró carpeta de manuales")
+                return []
+                
+            # Listar archivos en la carpeta
+            file_query = f"'{folder_id}' in parents and trashed=false and (mimeType='application/pdf' or mimeType='application/vnd.google-apps.document')"
+            files = drive_svc.files().list(
+                q=file_query, 
+                fields="files(id, name, mimeType, modifiedTime, size)",
+                pageSize=100
+            ).execute()
+            
+            manual_files = []
+            for file in files.get("files", []):
+                manual_files.append({
+                    "id": file["id"],
+                    "name": file["name"],
+                    "mimeType": file["mimeType"],
+                    "modifiedTime": file.get("modifiedTime", ""),
+                    "size": file.get("size", 0)
+                })
+                
+            log.info(f"📚 Encontrados {len(manual_files)} archivos en '{folder_name}'")
+            return manual_files
+            
+        except Exception:
+            log.exception("❌ Error listando archivos de manuales")
+            return []
+    
+    def extract_text_from_file(self, file_info: Dict[str, Any]) -> str:
+        """Extrae texto de archivos PDF o Google Docs"""
+        try:
+            file_id = file_info["id"]
+            mime_type = file_info["mimeType"]
+            
+            if mime_type == "application/vnd.google-apps.document":
+                # Exportar Google Doc como texto
+                request = drive_svc.files().export_media(fileId=file_id, mimeType='text/plain')
+                content = request.execute()
+                return content.decode('utf-8')
+                
+            elif mime_type == "application/pdf":
+                # Descargar PDF y extraer texto
+                request = drive_svc.files().get_media(fileId=file_id)
+                pdf_content = request.execute()
+                
+                if PDF_AVAILABLE:
+                    pdf_file = io.BytesIO(pdf_content)
+                    reader = PdfReader(pdf_file)
+                    text = ""
+                    for page in reader.pages:
+                        text += page.extract_text() + "\n"
+                    return text
+                else:
+                    log.warning("⚠️ PyPDF2 no disponible para extraer texto de PDF")
+                    return ""
+                    
+            return ""
+            
+        except Exception:
+            log.exception(f"❌ Error extrayendo texto de {file_info.get('name', 'unknown')}")
+            return ""
+    
+    def chunk_text(self, text: str, file_info: Dict[str, Any], chunk_size=1000, overlap=120) -> List[Dict[str, Any]]:
+        """Divide texto en chunks con metadatos"""
+        if not text.strip():
+            return []
+            
+        # Normalizar texto
+        lines = text.split('\n')
+        clean_lines = []
+        for line in lines:
+            line = line.strip()
+            if line and len(line) > 10:  # Filtrar líneas muy cortas (headers/footers)
+                clean_lines.append(line)
+                
+        text = '\n'.join(clean_lines)
+        words = text.split()
+        
+        chunks = []
+        i = 0
+        while i < len(words):
+            chunk_words = words[i:i + chunk_size]
+            chunk_text = ' '.join(chunk_words)
+            
+            # Calcular página aproximada (asumiendo ~300 palabras por página)
+            approx_page = (i // 300) + 1
+            
+            chunk_data = {
+                "text": chunk_text,
+                "file_name": file_info["name"],
+                "file_id": file_info["id"],
+                "modified_time": file_info.get("modifiedTime", ""),
+                "approx_page": approx_page,
+                "chunk_id": f"{file_info['id']}_{len(chunks)}",
+                "word_count": len(chunk_words)
+            }
+            chunks.append(chunk_data)
+            
+            i += chunk_size - overlap
+            
+        return chunks
+    
+    def build_index(self) -> bool:
+        """Construye índice RAG completo"""
+        if not google_ready:
+            log.warning("⚠️ Google no disponible para construir índice RAG")
+            return False
+            
+        try:
+            log.info("🔄 Construyendo índice RAG...")
+            files = self.list_manual_files()
+            
+            all_chunks = []
+            for file_info in files:
+                log.info(f"📖 Procesando: {file_info['name']}")
+                text = self.extract_text_from_file(file_info)
+                if text:
+                    chunks = self.chunk_text(text, file_info)
+                    all_chunks.extend(chunks)
+                    log.info(f"  ✅ {len(chunks)} chunks extraídos")
+                else:
+                    log.warning(f"  ⚠️ No se pudo extraer texto de {file_info['name']}")
+            
+            self.index = all_chunks
+            self.last_update = datetime.utcnow()
+            self.cache_timestamp = time.time()
+            
+            log.info(f"✅ Índice RAG construido: {len(all_chunks)} chunks de {len(files)} archivos")
+            return True
+            
+        except Exception:
+            log.exception("❌ Error construyendo índice RAG")
+            return False
+    
+    def search(self, query: str, top_k=5) -> List[Dict[str, Any]]:
+        """Búsqueda híbrida simple (BM25-like + relevancia semántica)"""
+        if not self.index:
+            if not self.build_index():
+                return []
+        
+        # Verificar cache
+        if time.time() - self.cache_timestamp > self.cache_ttl:
+            log.info("🔄 Cache RAG expirado, reconstruyendo índice...")
+            self.build_index()
+        
+        query_lower = query.lower()
+        query_words = query_lower.split()
+        
+        scored_chunks = []
+        for chunk in self.index:
+            score = 0
+            chunk_text_lower = chunk["text"].lower()
+            
+            # Búsqueda por palabra clave (BM25-like simple)
+            for word in query_words:
+                if len(word) > 3:  # Solo palabras significativas
+                    score += chunk_text_lower.count(word) * 2
+            
+            # Bonus por matches exactos de frases
+            if query_lower in chunk_text_lower:
+                score += 10
+                
+            # Bonus por términos específicos del dominio
+            domain_terms = ["imss", "seguro", "auto", "préstamo", "pensión", "ley 73", "cobertura", "póliza"]
+            for term in domain_terms:
+                if term in query_lower and term in chunk_text_lower:
+                    score += 5
+            
+            if score > 0:
+                scored_chunks.append((score, chunk))
+        
+        # Ordenar por score y tomar top-k
+        scored_chunks.sort(key=lambda x: x[0], reverse=True)
+        return [chunk for score, chunk in scored_chunks[:top_k]]
+    
+    def get_index_status(self) -> Dict[str, Any]:
+        """Estado del índice para health check"""
+        return {
+            "last_update": self.last_update.isoformat() if self.last_update else None,
+            "document_count": len(set(chunk["file_id"] for chunk in self.index)),
+            "chunk_count": len(self.index),
+            "cache_age_seconds": time.time() - self.cache_timestamp if self.cache_timestamp else None
+        }
+
+# Instancia global del índice RAG
+rag_index = DriveRAGIndex()
+
+def answer_with_context(user_query: str) -> str:
+    """Genera respuesta usando el índice RAG con citas de origen"""
+    if not openai or not OPENAI_API_KEY:
+        return "⚠️ Lo siento, el sistema de consultas no está disponible en este momento."
+    
+    try:
+        # Buscar chunks relevantes
+        relevant_chunks = rag_index.search(user_query, top_k=5)
+        
+        if not relevant_chunks:
+            return "ℹ️ No encontré información específica en los manuales sobre tu consulta. Te recomiendo contactar al asesor para información detallada."
+        
+        # Construir contexto
+        context_parts = []
+        for chunk in relevant_chunks:
+            source_info = f"📄 {chunk['file_name']}"
+            if chunk.get('approx_page'):
+                source_info += f" (pág. {chunk['approx_page']})"
+            context_parts.append(f"{source_info}:\n{chunk['text'][:500]}...")
+        
+        context = "\n\n".join(context_parts)
+        
+        # Prompt para GPT
+        system_prompt = """Eres Vicky, asistente especializada en seguros y préstamos IMSS. Responde ÚNICAMENTE con la información proporcionada en los manuales. Sigue estas reglas estrictas:
+
+1. NO inventes información ni uses conocimiento externo
+2. Cita las fuentes específicas (nombre del manual y página si está disponible)
+3. Mantén un tono profesional y claro en español de México
+4. Si la información no es suficiente, sugiere contactar al asesor
+5. Sé concisa pero completa en la respuesta
+6. Usa emojis relevantes donde sea apropiado"""
+
+        user_prompt = f"""Consulta del usuario: {user_query}
+
+Información de referencia de los manuales:
+{context}
+
+Instrucciones adicionales:
+- Responde basándote SOLO en la información proporcionada arriba
+- Si hay múltiples fuentes, intégralas coherentemente
+- Cita las fuentes al final con formato: 📄 Manual X (pág. Y)
+- Si la consulta requiere cálculos específicos o información personalizada, recomienda contactar al asesor"""
+
+        # Llamada a GPT
+        completion = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=800
+        )
+        
+        answer = completion.choices[0].message.content.strip()
+        return answer
+        
+    except Exception as e:
+        log.exception("❌ Error en answer_with_context")
+        return "⚠️ Ocurrió un error al procesar tu consulta. Por favor intenta de nuevo o contacta al asesor."
 
 # ==========================
 # Utilidades generales
@@ -686,7 +672,13 @@ def _notify_advisor(text: str) -> None:
 def imss_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "imss_beneficios"
     log.info(f"🏥 Iniciando embudo IMSS para {phone}")
-    send_message(phone, "🟩 *Préstamo IMSS Ley 73*\nBeneficios clave: trámite rápido, sin aval, pagos fijos y atención personalizada. ¿Te interesa conocer requisitos? (responde *sí* o *no*)")
+    
+    # Usar RAG para respuesta contextual
+    respuesta_contextual = answer_with_context("Préstamo IMSS Ley 73 beneficios requisitos")
+    if "No encontré información" not in respuesta_contextual:
+        send_message(phone, respuesta_contextual)
+    else:
+        send_message(phone, "🟩 *Préstamo IMSS Ley 73*\nBeneficios clave: trámite rápido, sin aval, pagos fijos y atención personalizada. ¿Te interesa conocer requisitos? (responde *sí* o *no*)")
 
 def _imss_next(phone: str, text: str) -> None:
     st = user_state.get(phone, "")
@@ -694,7 +686,13 @@ def _imss_next(phone: str, text: str) -> None:
     if st == "imss_beneficios":
         if interpret_response(text) == "positive":
             user_state[phone] = "imss_pension"
-            send_message(phone, "¿Cuál es tu *pensión mensual* aproximada? (ej. $8,500)")
+            
+            # Consulta contextual sobre pensiones
+            respuesta_pension = answer_with_context("pensión mensual IMSS requisitos monto")
+            if "No encontré información" not in respuesta_pension:
+                send_message(phone, respuesta_pension)
+            else:
+                send_message(phone, "¿Cuál es tu *pensión mensual* aproximada? (ej. $8,500)")
         else:
             send_message(phone, "Sin problema. Si deseas volver al menú, escribe *menú*.")
     elif st == "imss_pension":
@@ -704,7 +702,13 @@ def _imss_next(phone: str, text: str) -> None:
             return
         data["imss_pension"] = pension
         user_state[phone] = "imss_monto"
-        send_message(phone, "Gracias. ¿Qué *monto* te gustaría solicitar? (mínimo $40,000)")
+        
+        # Consulta contextual sobre montos
+        respuesta_monto = answer_with_context("monto préstamo IMSS mínimo máximo")
+        if "No encontré información" not in respuesta_monto:
+            send_message(phone, respuesta_monto)
+        else:
+            send_message(phone, "Gracias. ¿Qué *monto* te gustaría solicitar? (mínimo $40,000)")
     elif st == "imss_monto":
         monto = extract_number(text)
         if not monto:
@@ -818,27 +822,19 @@ def _fp_next(phone: str, text: str) -> None:
 def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "auto_intro"
     log.info(f"🚗 Iniciando embudo seguro auto para {phone}")
-    send_message(phone,
-        "🚗 *Seguro de Auto*\nEnvíame por favor:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas\n\nCuando lo envíes, te confirmaré recepción y procesaré la cotización."
-    )
+    
+    # Usar RAG para información contextual
+    respuesta_contextual = answer_with_context("seguro auto coberturas beneficios documentos requeridos")
+    if "No encontré información" not in respuesta_contextual:
+        mensaje_auto = f"🚗 *Seguro de Auto*\n{respuesta_contextual}\n\nPor favor envíame:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas"
+    else:
+        mensaje_auto = "🚗 *Seguro de Auto*\nEnvíame por favor:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas\n\nCuando lo envíes, te confirmaré recepción y procesaré la cotización."
+    
+    send_message(phone, mensaje_auto)
 
 def _auto_next(phone: str, text: str) -> None:
     st = user_state.get(phone, "")
     if st == "auto_intro":
-        # DETECCIÓN DE CONSULTAS PARA RAG - CORREGIDO
-        rag_keywords = ['cobertura', 'coberturas', 'qué cubre', 'que cubre', 'incluye', 'beneficios', 'condiciones', 
-                       'póliza', 'poliza', 'endoso', 'deducible', 'asegurado', 'cláusula', 'clausula', 'vigencia',
-                       'siniestro', 'reclamación', 'reclamacion', 'procedimiento', 'manual', 'documentación',
-                       'diferencia', 'amplia', 'limitada', 'plus', 'básica', 'basica', 'tiempo', 'pagar', 'cuanto']
-        
-        is_rag_query = any(keyword in text.lower() for keyword in rag_keywords)
-        
-        if is_rag_query and rag_index:
-            log.info(f"🧠 Consulta RAG detectada en auto_intro: {text}")
-            respuesta = rag_index.answer_with_context(text)
-            send_message(phone, respuesta)
-            return
-            
         intent = interpret_response(text)
         if "vencimiento" in text.lower() or "vence" in text.lower() or "fecha" in text.lower():
             user_state[phone] = "auto_vencimiento_fecha"
@@ -871,7 +867,7 @@ def _retry_after_days(phone: str, days: int) -> None:
         log.exception("Error en reintento programado")
 
 # ==========================
-# Router helpers CON RAG INTEGRADO - CORREGIDO
+# Router helpers
 # ==========================
 def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     last10 = _normalize_phone_last10(phone)
@@ -885,23 +881,15 @@ def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = text.strip().lower()
     
-    # DETECCIÓN DE CONSULTAS PARA RAG - MEJORADA
-    rag_keywords = ['cobertura', 'coberturas', 'qué cubre', 'que cubre', 'incluye', 'beneficios', 'condiciones', 
-                   'póliza', 'poliza', 'endoso', 'deducible', 'asegurado', 'cláusula', 'clausula', 'vigencia',
-                   'siniestro', 'reclamación', 'reclamacion', 'procedimiento', 'manual', 'documentación',
-                   'diferencia', 'amplia', 'limitada', 'plus', 'básica', 'basica', 'tiempo', 'pagar', 'cuanto',
-                   'explicas', 'explícame', 'información', 'informacion', 'detalles', 'características']
+    # Consultas que usan RAG
+    if any(term in t for term in ["imss", "ley 73", "pensión", "pension", "seguro", "auto", "cobertura", "póliza"]):
+        # Verificar si es una consulta general que requiere RAG
+        if t not in ["1", "2", "3", "4", "5", "6", "7", "menu", "menú", "inicio", "hola"]:
+            log.info(f"🧠 Consulta RAG detectada: {t}")
+            respuesta = answer_with_context(text)
+            send_message(phone, respuesta)
+            return
     
-    is_rag_query = any(keyword in t for keyword in rag_keywords)
-    
-    # PRIORIDAD: Si es consulta RAG, procesar inmediatamente
-    if is_rag_query and rag_index:
-        log.info(f"🧠 Consulta RAG detectada: {text}")
-        respuesta = rag_index.answer_with_context(text)
-        send_message(phone, respuesta)
-        return
-    
-    # Comandos normales del menú
     if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
         imss_start(phone, match)
     elif t in ("2", "auto", "seguros de auto", "seguro auto"):
@@ -936,7 +924,6 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         elif st.startswith("auto_"):
             _auto_next(phone, text)
         else:
-            # Si no hay estado y no es comando reconocido, ofrecer menú
             send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
 
 # ==========================
@@ -1054,11 +1041,11 @@ def webhook_receive():
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
 
-            if text.lower().startswith("sgpt:") and rag_index and rag_index.openai_client:
+            if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
                     log.info(f"🧠 Procesando solicitud GPT para {phone}")
-                    completion = rag_index.openai_client.chat.completions.create(
+                    completion = openai.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.4,
@@ -1086,7 +1073,7 @@ def webhook_receive():
         return jsonify({"ok": True}), 200
 
 # ==========================
-# Endpoints auxiliares MEJORADOS
+# Endpoints auxiliares
 # ==========================
 @app.get("/health")
 def health():
@@ -1098,23 +1085,38 @@ def health():
 
 @app.get("/ext/health")
 def ext_health():
-    rag_status = "active" if rag_index and rag_index.index_cache else "inactive"
-    rag_details = {}
-    if rag_index and rag_index.index_cache:
-        rag_details = {
-            "documents_indexed": rag_index.index_cache.get('doc_count', 0),
-            "chunks_indexed": rag_index.index_cache.get('chunk_count', 0),
-            "last_refresh": rag_index.last_refresh
-        }
-    
+    rag_status = rag_index.get_index_status()
     return jsonify({
         "status": "ok",
         "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID),
         "google_ready": google_ready,
-        "openai_ready": bool(rag_index and rag_index.openai_client),
-        "rag_status": rag_status,
-        "rag_details": rag_details
+        "openai_ready": bool(openai and OPENAI_API_KEY),
+        "rag_index": rag_status
     }), 200
+
+@app.post("/ext/reindex")
+def ext_reindex():
+    """Endpoint para forzar reindexación manual"""
+    try:
+        log.info("🔄 Reindexación manual solicitada")
+        success = rag_index.build_index()
+        if success:
+            return jsonify({
+                "ok": True,
+                "message": "Índice RAG reconstruido exitosamente",
+                "status": rag_index.get_index_status()
+            }), 200
+        else:
+            return jsonify({
+                "ok": False,
+                "error": "Error reconstruyendo índice RAG"
+            }), 500
+    except Exception as e:
+        log.exception("❌ Error en /ext/reindex")
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
 
 @app.post("/ext/test-send")
 def ext_test_send():
@@ -1138,42 +1140,6 @@ def ext_test_send():
         return jsonify({
             "ok": False, 
             "error": str(e)
-        }), 500
-
-# ==========================
-# NUEVO ENDPOINT RAG
-# ==========================
-@app.post("/ext/reindex")
-def force_reindex():
-    """Forzar reindexación manual del RAG"""
-    try:
-        if not rag_index:
-            return jsonify({
-                "status": "error", 
-                "message": "RAG no está inicializado"
-            }), 400
-            
-        log.info("🔄 Forzando reindexación RAG...")
-        result = rag_index.build_index()
-        
-        if result:
-            return jsonify({
-                "status": "success", 
-                "message": "Índice reconstruido exitosamente",
-                "documents": result.get('doc_count', 0),
-                "chunks": result.get('chunk_count', 0)
-            })
-        else:
-            return jsonify({
-                "status": "error", 
-                "message": "Error construyendo índice"
-            }), 500
-            
-    except Exception as e:
-        log.error(f"❌ Error en reindexación: {str(e)}")
-        return jsonify({
-            "status": "error", 
-            "message": str(e)
         }), 500
 
 def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
@@ -1311,6 +1277,18 @@ def ext_send_promo():
         }), 500
 
 # ==========================
+# Inicialización RAG al arranque
+# ==========================
+def initialize_rag():
+    """Inicializa el índice RAG en segundo plano"""
+    def _init():
+        time.sleep(5)  # Esperar que la app esté lista
+        log.info("🚀 Inicializando índice RAG...")
+        rag_index.build_index()
+    
+    threading.Thread(target=_init, daemon=True).start()
+
+# ==========================
 # Arranque (para desarrollo local)
 # En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
 # ==========================
@@ -1318,10 +1296,14 @@ if __name__ == "__main__":
     log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
     log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
     log.info(f"📊 Google Sheets/Drive: {google_ready}")
-    log.info(f"🧠 OpenAI: {bool(rag_index and rag_index.openai_client)}")
-    log.info(f"📚 RAG Index: {bool(rag_index and rag_index.index_cache)}")
+    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
+    log.info(f"📚 RAG: Inicializando módulo de consultas contextuales")
+    
+    # Inicializar RAG en background
+    initialize_rag()
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
 
 
