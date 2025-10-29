@@ -375,18 +375,34 @@ Instrucciones adicionales:
 - Cita las fuentes al final con formato: 📄 Manual X (pág. Y)
 - Si la consulta requiere cálculos específicos o información personalizada, recomienda contactar al asesor"""
 
-        # Llamada a GPT
-        completion = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.3,
-            max_tokens=800
-        )
+        # Llamada a GPT - CORREGIDA para compatibilidad con versiones
+        try:
+            # Para OpenAI v1.x+
+            from openai import OpenAI
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=800
+            )
+            answer = completion.choices[0].message.content.strip()
+        except:
+            # Fallback para versiones antiguas
+            completion = openai.ChatCompletion.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=800
+            )
+            answer = completion.choices[0].message.content
         
-        answer = completion.choices[0].message.content.strip()
         return answer
         
     except Exception as e:
@@ -495,8 +511,11 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
     
     components = []
     if isinstance(params, dict):
-        for k, v in params.items():
-            components.append({"type": "body", "parameters": [{"type": "text", "text": str(v)}]})
+        # CORREGIDO: Un solo componente body con todos los parámetros
+        components.append({
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(v)} for v in params.values()]
+        })
     elif isinstance(params, list):
         components.append({
             "type": "body",
@@ -852,20 +871,13 @@ def _auto_next(phone: str, text: str) -> None:
             fecha = datetime.fromisoformat(text.strip()).date()
             objetivo = fecha - timedelta(days=30)
             write_followup_to_sheets("auto_recordatorio", f"Recordatorio póliza -30d para {phone}", objetivo.isoformat())
-            threading.Thread(target=_retry_after_days, args=(phone, 7), daemon=True).start()
+            # COMENTADO: Recordatorios largos no funcionan en Render
+            # threading.Thread(target=_retry_after_days, args=(phone, 7), daemon=True).start()
             send_message(phone, f"✅ Gracias. Te contactaré *un mes antes* ({objetivo.isoformat()}).")
             user_state[phone] = ""
             send_main_menu(phone)
         except Exception:
             send_message(phone, "Formato inválido. Usa AAAA-MM-DD. Ejemplo: 2025-12-31")
-
-def _retry_after_days(phone: str, days: int) -> None:
-    try:
-        time.sleep(days * 24 * 60 * 60)
-        send_message(phone, "⏰ Seguimos a tus órdenes. ¿Deseas que coticemos tu seguro de auto cuando se acerque el vencimiento?")
-        write_followup_to_sheets("auto_reintento", f"Reintento +{days}d enviado a {phone}", datetime.utcnow().isoformat())
-    except Exception:
-        log.exception("Error en reintento programado")
 
 # ==========================
 # Router helpers
@@ -876,7 +888,10 @@ def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     if match and match.get("nombre"):
         send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
     else:
-        send_message(phone, "Hola 👋 Soy *Vicky*. Estuy para ayudarte.")
+        # CORREGIDO: Typo "Estuy" → "Estoy"
+        send_message(phone, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
+    # CORREGIDO: Enviar menú siempre después del saludo
+    send_main_menu(phone)
     return match
 
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
@@ -1046,12 +1061,24 @@ def webhook_receive():
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
                     log.info(f"🧠 Procesando solicitud GPT para {phone}")
-                    completion = openai.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.4,
-                    )
-                    answer = completion.choices[0].message.content.strip()
+                    # CORREGIDO: Compatibilidad con versiones de OpenAI
+                    try:
+                        from openai import OpenAI
+                        client = OpenAI(api_key=OPENAI_API_KEY)
+                        completion = client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.4,
+                        )
+                        answer = completion.choices[0].message.content.strip()
+                    except:
+                        completion = openai.ChatCompletion.create(
+                            model="gpt-4o-mini",
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.4,
+                        )
+                        answer = completion.choices[0].message.content
+                    
                     send_message(phone, answer)
                     return jsonify({"ok": True}), 200
                 except Exception:
@@ -1304,6 +1331,7 @@ if __name__ == "__main__":
     initialize_rag()
     
     app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)), debug=False)
+
 
 
 
