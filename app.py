@@ -23,7 +23,6 @@ import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, List, Tuple
 import hashlib
-import pickle
 
 import requests
 from flask import Flask, request, jsonify
@@ -51,6 +50,8 @@ try:
     PDF_AVAILABLE = True
 except Exception:
     PDF_AVAILABLE = False
+    log = logging.getLogger("vicky-secom")
+    log.warning("⚠️ PyPDF2 no disponible - PDFs no se procesarán")
 
 # ==========================
 # Carga entorno + Logging
@@ -875,7 +876,7 @@ def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     if match and match.get("nombre"):
         send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
     else:
-        send_message(phone, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
+        send_message(phone, "Hola 👋 Soy *Vicky*. Estuy para ayudarte.")
     return match
 
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
@@ -1303,6 +1304,7 @@ if __name__ == "__main__":
     initialize_rag()
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
 
 
