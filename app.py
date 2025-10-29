@@ -1,14 +1,9 @@
-# app.py — Vicky Bot SECOM (100% funcional para Render)
+# app.py — Vicky Bot SECOM (Render-ready)
 # Python 3.10+
-# gunicorn: gunicorn app:app --bind 0.0.0.0:$PORT
-# Requisitos de entorno (.env):
-# META_TOKEN, WABA_PHONE_ID, VERIFY_TOKEN, ADVISOR_NUMBER, OPENAI_API_KEY,
-# GOOGLE_SHEET_ID, GOOGLE_SHEET_NAME="Prospectos SECOM Auto",
-# GOOGLE_CREDENTIALS_JSON, MANUALES_VICKY_FOLDER_ID, NOTIFICAR_ASESOR=true
+# Ejecuta en Render: gunicorn app:app --bind 0.0.0.0:$PORT
 
 import os
 import re
-import io
 import json
 import time
 import logging
@@ -20,35 +15,33 @@ import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-# Google Sheets (gspread + oauth2client) y Google Drive (google-api-python-client)
+# Google (sin oauth2client): usa google-auth + gspread + google-api-python-client
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload  # (no se usa para subir en este archivo)
 
-# OpenAI (fallback)
-try:
-    import openai
-except Exception:
-    openai = None
+# OpenAI SDK 1.x
+from openai import OpenAI
 
 # =========================
-# Carga de entorno + Log
+# Entorno y logging
 # =========================
 load_dotenv()
 
-META_TOKEN = os.getenv("META_TOKEN")
-WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+META_TOKEN = os.getenv("META_TOKEN", "").strip()
+WABA_PHONE_ID = os.getenv("WABA_PHONE_ID", "").strip()
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "").strip()
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "").strip()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo-1106")
 
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Prospectos SECOM Auto").strip()
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 MANUALES_VICKY_FOLDER_ID = os.getenv("MANUALES_VICKY_FOLDER_ID", "").strip()
-NOTIFICAR_ASESOR = os.getenv("NOTIFICAR_ASESOR", "true").lower() == "true"
 
+NOTIFICAR_ASESOR = os.getenv("NOTIFICAR_ASESOR", "true").lower() == "true"
 PORT = int(os.getenv("PORT", "5000"))
 
 logging.basicConfig(
@@ -59,17 +52,21 @@ logging.basicConfig(
 log = logging.getLogger("vicky-secom")
 
 # =========================
-# Servicios externos
+# Clientes externos
 # =========================
-# WhatsApp API
+# WhatsApp
 WPP_API_URL = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages" if WABA_PHONE_ID else None
 WPP_TIMEOUT = 15
 
-# OpenAI
-if openai and OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+# OpenAI 1.x
+client_oa: Optional[OpenAI] = None
+if OPENAI_API_KEY:
+    try:
+        client_oa = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        log.exception("No se pudo inicializar OpenAI")
 
-# Google: Sheets y Drive en modo solo lectura (manuales)
+# Google Sheets + Drive (solo lectura)
 sheets_client = None
 drive_client = None
 google_ready = False
@@ -80,23 +77,23 @@ try:
             "https://www.googleapis.com/auth/spreadsheets.readonly",
             "https://www.googleapis.com/auth/drive.readonly",
         ]
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes=scopes)
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
         sheets_client = gspread.authorize(creds)
         drive_client = build("drive", "v3", credentials=creds)
         google_ready = True
-        log.info("✅ Google listo (Sheets read-only + Drive read-only)")
+        log.info("Google listo (Sheets RO + Drive RO)")
     else:
-        log.warning("⚠️ GOOGLE_CREDENTIALS_JSON no configurado. Modo sin Google.")
+        log.warning("GOOGLE_CREDENTIALS_JSON ausente. Google deshabilitado.")
 except Exception:
-    log.exception("❌ Error inicializando Google")
+    log.exception("Error inicializando Google")
 
 # =========================
-# App y estado en memoria
+# Estado en memoria
 # =========================
 app = Flask(__name__)
-user_state: Dict[str, str] = {}          # estado del embudo por número
-user_ctx: Dict[str, Dict[str, Any]] = {} # datos temporales por número
-last_sent: Dict[str, str] = {}           # antirepetición de mensajes
+user_state: Dict[str, str] = {}
+user_ctx: Dict[str, Dict[str, Any]] = {}
+last_sent: Dict[str, str] = {}
 
 # =========================
 # Utilidades
@@ -107,7 +104,7 @@ def _normalize_last10(phone: str) -> str:
 
 def _send_wpp_payload(payload: Dict[str, Any]) -> bool:
     if not (META_TOKEN and WPP_API_URL):
-        log.error("❌ WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID).")
+        log.error("WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID).")
         return False
     headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
     for attempt in range(3):
@@ -118,13 +115,12 @@ def _send_wpp_payload(payload: Dict[str, Any]) -> bool:
             if r.status_code in (429,) or 500 <= r.status_code < 600:
                 time.sleep(2 ** attempt)
                 continue
-            log.warning(f"⚠️ WhatsApp error {r.status_code}: {r.text[:200]}")
+            log.warning(f"WhatsApp {r.status_code}: {r.text[:200]}")
             return False
         except requests.exceptions.Timeout:
-            log.warning("⏰ Timeout WhatsApp, reintentando...")
             time.sleep(2 ** attempt)
         except Exception:
-            log.exception("❌ Error enviando a WhatsApp")
+            log.exception("Error enviando a WhatsApp")
             return False
     return False
 
@@ -132,9 +128,7 @@ def send_message(to: str, text: str) -> bool:
     text = (text or "").strip()
     if not text:
         return False
-    # evita duplicados exactos consecutivos al mismo destino
     if last_sent.get(to) == text:
-        log.info(f"↪️ Evitado duplicado a {to}")
         return True
     payload = {
         "messaging_product": "whatsapp",
@@ -152,12 +146,12 @@ def notify_advisor(text: str) -> None:
         try:
             send_message(ADVISOR_NUMBER, text)
         except Exception:
-            log.exception("❌ Error notificando al asesor")
+            log.exception("Error notificando al asesor")
 
 def interpret_yesno(text: str) -> str:
     t = (text or "").lower()
     pos = ["sí", "si", "claro", "ok", "vale", "de acuerdo", "afirmativo", "correcto"]
-    neg = ["no", "nop", "nel", "negativo", "no quiero", "no gracias", "no interesa"]
+    neg = ["no", "nop", "negativo", "no gracias", "no quiero", "nel"]
     if any(w in t for w in pos):
         return "yes"
     if any(w in t for w in neg):
@@ -193,7 +187,6 @@ def sheet_match_by_last10(last10: str) -> Optional[Dict[str, Any]]:
             joined = " | ".join(row)
             digits = re.sub(r"\D", "", joined)
             if last10 and last10 in digits:
-                # heurística simple de nombre: primer campo sin dígitos
                 nombre = ""
                 for c in row:
                     if c and not re.search(r"\d", c):
@@ -202,37 +195,30 @@ def sheet_match_by_last10(last10: str) -> Optional[Dict[str, Any]]:
                 return {"row": i, "nombre": nombre, "raw": row}
         return None
     except Exception:
-        log.exception("❌ Error leyendo Google Sheets")
+        log.exception("Error leyendo Google Sheets")
         return None
 
 def list_drive_manuals(folder_id: str) -> List[Dict[str, str]]:
     if not (google_ready and drive_client and folder_id):
         return []
     try:
-        q = (
-            f"'{folder_id}' in parents and "
-            f"mimeType='application/pdf' and trashed=false"
-        )
-        resp = drive_client.files().list(
-            q=q,
-            fields="files(id, name, webViewLink)"
-        ).execute()
+        q = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
+        resp = drive_client.files().list(q=q, fields="files(id, name, webViewLink)").execute()
         files = resp.get("files", [])
-        # Asegurar webViewLink
-        results = []
+        out = []
         for f in files:
-            if "webViewLink" not in f or not f["webViewLink"]:
-                # Obtener webViewLink si no venía
+            link = f.get("webViewLink", "")
+            if not link:
                 meta = drive_client.files().get(fileId=f["id"], fields="webViewLink").execute()
-                f["webViewLink"] = meta.get("webViewLink", "")
-            results.append({"id": f["id"], "name": f["name"], "webViewLink": f.get("webViewLink", "")})
-        return results
+                link = meta.get("webViewLink", "")
+            out.append({"id": f["id"], "name": f["name"], "webViewLink": link})
+        return out
     except Exception:
-        log.exception("❌ Error listando manuales en Drive")
+        log.exception("Error listando manuales en Drive")
         return []
 
 # =========================
-# Menú principal y helpers
+# Menú y flujos
 # =========================
 MAIN_MENU = (
     "🟦 *Vicky Bot — Inbursa*\n"
@@ -259,9 +245,6 @@ def greet_with_match(phone: str) -> Optional[Dict[str, Any]]:
         send_message(phone, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
     return match
 
-# =========================
-# Flujos específicos
-# =========================
 def flow_imss_info(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "imss_q1"
     send_message(phone, "🟩 *Asesoría IMSS*\n¿Deseas conocer requisitos y cálculo aproximado? (sí/no)")
@@ -276,8 +259,8 @@ def flow_imss_next(phone: str, text: str) -> None:
             user_state[phone] = "imss_pension"
             send_message(phone, "¿Cuál es tu *pensión mensual* aproximada? (ej. 8,500)")
         elif yn == "no":
-            send_message(phone, "Entendido. Escribe *menú* para ver más opciones.")
             user_state[phone] = ""
+            send_message(phone, "Entendido. Escribe *menú* para ver más opciones.")
         else:
             send_message(phone, "¿Me confirmas con *sí* o *no*?")
     elif st == "imss_pension":
@@ -303,7 +286,7 @@ def flow_imss_next(phone: str, text: str) -> None:
     elif st == "imss_ciudad":
         ctx["imss_ciudad"] = (text or "").strip()
         user_state[phone] = "imss_nomina"
-        send_message(phone, "¿Tienes *nómina Inbursa*? (sí/no)\n*Nota:* No es obligatoria; otorga *beneficios adicionales*.")
+        send_message(phone, "¿Tienes *nómina Inbursa*? (sí/no)\n*No es obligatoria; otorga beneficios adicionales.*")
     elif st == "imss_nomina":
         yn = interpret_yesno(text)
         ctx["imss_nomina"] = ("sí" if yn == "yes" else "no")
@@ -342,7 +325,6 @@ def flow_auto_next(phone: str, text: str) -> None:
             date = datetime.fromisoformat(text.strip()).date()
             objetivo = date - timedelta(days=30)
             send_message(phone, f"✅ Gracias. Te contactaré *un mes antes* ({objetivo.isoformat()}).")
-            # reintento +7 días si no hay respuesta (en background)
             def _reminder():
                 try:
                     time.sleep(7 * 24 * 60 * 60)
@@ -366,7 +348,6 @@ def flow_vrim(phone: str) -> None:
     send_main_menu(phone)
 
 def flow_prestamo_imss(phone: str, match: Optional[Dict[str, Any]]) -> None:
-    # Alias de la opción 5, pero con mensaje directo de préstamo
     user_state[phone] = "imss_monto_directo"
     send_message(phone, "🟩 *Préstamo IMSS (Ley 73)*\nIndica el *monto* deseado (entre $10,000 y $650,000).")
 
@@ -460,13 +441,11 @@ def flow_contacto(phone: str) -> None:
 def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = (text or "").strip().lower()
 
-    # comandos de menú
     if t in ("menu", "menú", "inicio", "hola"):
         user_state[phone] = ""
         send_main_menu(phone)
         return
 
-    # opciones
     if t in ("1", "asesoría imss", "asesoria imss", "imss", "pensión", "pension"):
         flow_imss_info(phone, match)
         return
@@ -489,10 +468,8 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
         flow_contacto(phone)
         return
 
-    # rutas por estado (embudos activos)
     st = user_state.get(phone, "")
     if st.startswith("imss_"):
-        # puede venir de info (1) o préstamo (5)
         if st in {"imss_q1", "imss_pension", "imss_monto", "imss_nombre", "imss_ciudad", "imss_nomina"}:
             flow_imss_next(phone, text)
         else:
@@ -505,25 +482,22 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
         flow_empresarial_next(phone, text)
         return
 
-    # fallback con GPT sólo si está configurado
-    if openai and OPENAI_API_KEY:
+    # Fallback GPT (OpenAI 1.x)
+    if client_oa:
         def _gpt_reply():
             try:
                 prompt = (
                     "Eres Vicky, una asistente amable y profesional. "
                     "Responde en español, breve y con emojis si corresponde. "
-                    "El usuario escribió: " + (text or "")
+                    f"Mensaje del usuario: {text or ''}"
                 )
-                res = openai.chat.completions.create(
-                    model="gpt-4o-mini",
+                res = client_oa.chat.completions.create(
+                    model=OPENAI_MODEL,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.4,
                 )
                 answer = (res.choices[0].message.content or "").strip()
-                if answer:
-                    send_message(phone, answer)
-                else:
-                    send_main_menu(phone)
+                send_message(phone, answer or "¿Te puedo ayudar con algo más? Escribe *menú*.")
             except Exception:
                 send_main_menu(phone)
         threading.Thread(target=_gpt_reply, daemon=True).start()
@@ -540,10 +514,9 @@ def webhook_verify():
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge", "")
         if mode == "subscribe" and token == VERIFY_TOKEN:
-            log.info("✅ Webhook verificado")
             return challenge, 200
     except Exception:
-        log.exception("❌ Error verificando webhook")
+        log.exception("Error verificando webhook")
     return "Error", 403
 
 def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
@@ -586,23 +559,20 @@ def webhook_receive():
         if not phone:
             return jsonify({"ok": True}), 200
 
-        # saludo + matching si es la primera interacción de la sesión
         if phone not in user_state:
             greet_with_match(phone)
             user_state[phone] = ""
 
         mtype = msg.get("type")
 
-        # Texto
         if mtype == "text" and "text" in msg:
             text = (msg["text"].get("body") or "").strip()
-            # Comando especial: sgpt:
-            if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
+            if text.lower().startswith("sgpt:") and client_oa:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 def _gpt_direct():
                     try:
-                        res = openai.chat.completions.create(
-                            model="gpt-4o-mini",
+                        res = client_oa.chat.completions.create(
+                            model=OPENAI_MODEL,
                             messages=[{"role": "user", "content": prompt}],
                             temperature=0.3,
                         )
@@ -616,14 +586,13 @@ def webhook_receive():
             route_command(phone, text, None)
             return jsonify({"ok": True}), 200
 
-        # Multimedia (solo confirma recepción; el guardado en Drive no es requerido por este alcance)
         if mtype in {"image", "audio", "video", "document"}:
             send_message(phone, "📎 *Recibido*. Gracias, lo reviso y te confirmo en breve.")
             return jsonify({"ok": True}), 200
 
         return jsonify({"ok": True}), 200
     except Exception:
-        log.exception("❌ Error en webhook_receive")
+        log.exception("Error en webhook_receive")
         return jsonify({"ok": True}), 200
 
 # =========================
@@ -636,7 +605,7 @@ def ext_health():
         "timestamp": datetime.utcnow().isoformat(),
         "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID),
         "google_ready": google_ready,
-        "openai_ready": bool(openai and OPENAI_API_KEY),
+        "openai_ready": bool(client_oa is not None),
         "sheet_name": GOOGLE_SHEET_NAME,
         "manuales_folder": bool(MANUALES_VICKY_FOLDER_ID),
     }), 200
@@ -652,7 +621,7 @@ def ext_test_send():
         ok = send_message(to, text)
         return jsonify({"ok": bool(ok)}), 200
     except Exception as e:
-        log.exception("❌ Error en /ext/test-send")
+        log.exception("Error en /ext/test-send")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.get("/ext/manuales")
@@ -671,8 +640,10 @@ def health():
 # Arranque local
 # =========================
 if __name__ == "__main__":
-    log.info(f"🚀 Vicky SECOM en puerto {PORT}")
-    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
-    log.info(f"📊 Google listo: {google_ready}")
-    log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
+    log.info(f"Vicky SECOM en puerto {PORT}")
+    log.info(f"WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
+    log.info(f"Google listo: {google_ready}")
+    log.info(f"OpenAI listo: {bool(client_oa is not None)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
+
