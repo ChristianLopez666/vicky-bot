@@ -63,6 +63,7 @@ client_oa: Optional[OpenAI] = None
 if OPENAI_API_KEY:
     try:
         client_oa = OpenAI(api_key=OPENAI_API_KEY)
+        log.info("OpenAI listo")
     except Exception:
         log.exception("No se pudo inicializar OpenAI")
 
@@ -93,7 +94,10 @@ except Exception:
 app = Flask(__name__)
 user_state: Dict[str, str] = {}
 user_ctx: Dict[str, Dict[str, Any]] = {}
-last_sent: Dict[str, str] = {}
+last_sent: Dict[str, str] = {}          # evita repetir el mismo texto inmediato al mismo destinatario
+last_notify_at: Dict[str, datetime] = {}  # evita re-notificar al asesor por el mismo número dentro de 24h
+
+NOTIFY_WINDOW_HOURS = 24
 
 # =========================
 # Utilidades
@@ -187,12 +191,20 @@ def sheet_match_by_last10(last10: str) -> Optional[Dict[str, Any]]:
             joined = " | ".join(row)
             digits = re.sub(r"\D", "", joined)
             if last10 and last10 in digits:
+                # Nombre: primer campo no-numérico
                 nombre = ""
                 for c in row:
                     if c and not re.search(r"\d", c):
                         nombre = c.strip()
                         break
-                return {"row": i, "nombre": nombre, "raw": row}
+                # Construye ficha breve
+                cols_preview = " | ".join([c.strip() for c in row[:6]])  # primeras columnas como vista rápida
+                return {
+                    "row": i,
+                    "nombre": nombre,
+                    "raw": row,
+                    "preview": cols_preview,
+                }
         return None
     except Exception:
         log.exception("Error leyendo Google Sheets")
@@ -239,11 +251,48 @@ def send_main_menu(phone: str) -> None:
 def greet_with_match(phone: str) -> Optional[Dict[str, Any]]:
     last10 = _normalize_last10(phone)
     match = sheet_match_by_last10(last10)
+
+    # Saludo personalizado
     if match and match.get("nombre"):
         send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
     else:
         send_message(phone, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
+
+    # Guardar en contexto
+    ctx = ensure_ctx(phone)
+    ctx["match"] = match
     return match
+
+def _should_notify(phone: str) -> bool:
+    """True si han pasado >= 24h desde la última notificación de este número."""
+    last = last_notify_at.get(phone)
+    if not last:
+        return True
+    return (datetime.utcnow() - last) >= timedelta(hours=NOTIFY_WINDOW_HOURS)
+
+def _notify_if_match(phone: str, match: Optional[Dict[str, Any]]) -> None:
+    """Notifica al asesor una sola vez cada 24h si el número está en SECOM."""
+    if not (NOTIFICAR_ASESOR and match):
+        return
+    if not _should_notify(phone):
+        return
+    nombre = match.get("nombre") or "(sin nombre)"
+    row = match.get("row", "?")
+    preview = match.get("preview", "")
+    last10 = _normalize_last10(phone)
+    log.info(f"[notify] asesor={ADVISOR_NUMBER} phone={phone} last10={last10} nombre={nombre} row={row}")
+    ficha = (
+        "🟢 *SECOM — Prospecto detectado*\n"
+        f"• WhatsApp: {phone}\n"
+        f"• Nombre: {nombre}\n"
+        f"• Fila: {row}\n"
+        f"• Extracto: {preview}\n"
+        "—\n"
+        "Mensaje inicial: contacto entrante por WhatsApp.\n"
+        "(*No se repetirá esta alerta en 24h para este número*)"
+    )
+    notify_advisor(ficha)
+    last_notify_at[phone] = datetime.utcnow()
 
 def flow_imss_info(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "imss_q1"
@@ -559,9 +608,22 @@ def webhook_receive():
         if not phone:
             return jsonify({"ok": True}), 200
 
-        if phone not in user_state:
-            greet_with_match(phone)
+        # Saludo + match + notificación (una vez cada 24h)
+        first_time = phone not in user_state
+        match = None
+        if first_time:
+            match = greet_with_match(phone)
             user_state[phone] = ""
+        else:
+            # Asegura que el match exista en contexto o recalcúlalo
+            ctx = ensure_ctx(phone)
+            match = ctx.get("match")
+            if match is None:
+                match = greet_with_match(phone)  # reusa saludo si no había contexto
+
+        # Notifica al asesor si el número está en SECOM y respeta ventana 24h
+        if match:
+            _notify_if_match(phone, match)
 
         mtype = msg.get("type")
 
@@ -583,7 +645,7 @@ def webhook_receive():
                 threading.Thread(target=_gpt_direct, daemon=True).start()
                 return jsonify({"ok": True}), 200
 
-            route_command(phone, text, None)
+            route_command(phone, text, match)
             return jsonify({"ok": True}), 200
 
         if mtype in {"image", "audio", "video", "document"}:
@@ -645,5 +707,7 @@ if __name__ == "__main__":
     log.info(f"Google listo: {google_ready}")
     log.info(f"OpenAI listo: {bool(client_oa is not None)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
+
 
 
