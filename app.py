@@ -11,6 +11,7 @@ import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, List, Tuple
 
+import io
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -19,6 +20,7 @@ from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from PyPDF2 import PdfReader  # <- para RAG light (PDF)
 
 # OpenAI SDK 1.x
 from openai import OpenAI
@@ -63,7 +65,6 @@ client_oa: Optional[OpenAI] = None
 if OPENAI_API_KEY:
     try:
         client_oa = OpenAI(api_key=OPENAI_API_KEY)
-        log.info("OpenAI listo")
     except Exception:
         log.exception("No se pudo inicializar OpenAI")
 
@@ -94,10 +95,11 @@ except Exception:
 app = Flask(__name__)
 user_state: Dict[str, str] = {}
 user_ctx: Dict[str, Dict[str, Any]] = {}
-last_sent: Dict[str, str] = {}          # evita repetir el mismo texto inmediato al mismo destinatario
-last_notify_at: Dict[str, datetime] = {}  # evita re-notificar al asesor por el mismo número dentro de 24h
+last_sent: Dict[str, str] = {}
 
-NOTIFY_WINDOW_HOURS = 24
+# Saludo solo 1 vez por ventana (24h)
+greeted_at: Dict[str, datetime] = {}
+GREET_WINDOW_HOURS = 24
 
 # =========================
 # Utilidades
@@ -191,20 +193,12 @@ def sheet_match_by_last10(last10: str) -> Optional[Dict[str, Any]]:
             joined = " | ".join(row)
             digits = re.sub(r"\D", "", joined)
             if last10 and last10 in digits:
-                # Nombre: primer campo no-numérico
                 nombre = ""
                 for c in row:
                     if c and not re.search(r"\d", c):
                         nombre = c.strip()
                         break
-                # Construye ficha breve
-                cols_preview = " | ".join([c.strip() for c in row[:6]])  # primeras columnas como vista rápida
-                return {
-                    "row": i,
-                    "nombre": nombre,
-                    "raw": row,
-                    "preview": cols_preview,
-                }
+                return {"row": i, "nombre": nombre, "raw": row}
         return None
     except Exception:
         log.exception("Error leyendo Google Sheets")
@@ -230,6 +224,106 @@ def list_drive_manuals(folder_id: str) -> List[Dict[str, str]]:
         return []
 
 # =========================
+# RAG light (Auto) — lectura PDF desde Drive
+# =========================
+_manual_auto_cache = {"text": None, "file_id": None, "loaded_at": None}
+
+def _find_auto_manual_file_id() -> Optional[str]:
+    if not (google_ready and drive_client and MANUALES_VICKY_FOLDER_ID):
+        return None
+    try:
+        q = (
+            f"'{MANUALES_VICKY_FOLDER_ID}' in parents and "
+            "mimeType='application/pdf' and trashed=false"
+        )
+        resp = drive_client.files().list(q=q, fields="files(id, name)", pageSize=50).execute()
+        files = resp.get("files", [])
+        # Prioriza nombres que sugieran auto/coberturas
+        for f in files:
+            name = (f.get("name") or "").lower()
+            if "auto" in name or "cobertura" in name:
+                return f["id"]
+        return files[0]["id"] if files else None
+    except Exception:
+        log.exception("Error buscando manual Auto")
+        return None
+
+def _download_pdf_text(file_id: str) -> Optional[str]:
+    try:
+        from googleapiclient.http import MediaIoBaseDownload
+        req = drive_client.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, req)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        fh.seek(0)
+        reader = PdfReader(fh)
+        pages = []
+        for p in reader.pages:
+            try:
+                pages.append(p.extract_text() or "")
+            except Exception:
+                pages.append("")
+        text = "\n".join(pages)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip() or None
+    except Exception:
+        log.exception("No se pudo extraer texto PDF (Auto)")
+        return None
+
+def ensure_auto_manual_text(force_reload: bool = False) -> Optional[str]:
+    if not client_oa:
+        return None
+    if not force_reload and _manual_auto_cache.get("text"):
+        return _manual_auto_cache["text"]
+    fid = _find_auto_manual_file_id()
+    if not fid:
+        return None
+    text = _download_pdf_text(fid)
+    if text:
+        _manual_auto_cache.update({"text": text, "file_id": fid, "loaded_at": datetime.utcnow()})
+        log.info("[rag-auto] Manual cacheado")
+    return text
+
+def answer_auto_from_manual(question: str) -> Optional[str]:
+    if not client_oa:
+        return None
+    manual_text = ensure_auto_manual_text()
+    if not manual_text:
+        return None
+    # Heurística: filtra párrafos relevantes
+    keys = ["amplia plus", "amplia", "cobertura", "asistencia", "cristales", "auto de reemplazo", "deducible"]
+    parts = []
+    for ln in manual_text.split("\n"):
+        low = ln.lower()
+        if any(k in low for k in keys):
+            parts.append(ln.strip())
+            if len(" ".join(parts)) > 8000:
+                break
+    focus = "\n".join(parts) if parts else manual_text[:9000]
+    try:
+        prompt = (
+            "Responde SOLO con base en el texto del manual (auto). "
+            "Sé preciso, en español, y usa viñetas si ayuda. "
+            "Si no aparece en el manual, di: 'No está indicado en el manual'.\n\n"
+            f"Pregunta: {question}\n\n"
+            f"Manual (extracto):\n{focus}\n\n"
+            "==\nRespuesta:"
+        )
+        res = client_oa.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        ans = (res.choices[0].message.content or "").strip()
+        return ans[:1500] if ans else None
+    except Exception:
+        log.exception("Error RAG-auto")
+        return None
+
+# =========================
 # Menú y flujos
 # =========================
 MAIN_MENU = (
@@ -248,51 +342,30 @@ MAIN_MENU = (
 def send_main_menu(phone: str) -> None:
     send_message(phone, MAIN_MENU)
 
-def greet_with_match(phone: str) -> Optional[Dict[str, Any]]:
+def greet_with_match(phone: str, *, do_greet: bool = True) -> Optional[Dict[str, Any]]:
+    """
+    Saluda solo si no se saludó en la última ventana (24h).
+    Guarda el match en contexto para reutilizarlo.
+    """
     last10 = _normalize_last10(phone)
     match = sheet_match_by_last10(last10)
 
-    # Saludo personalizado
-    if match and match.get("nombre"):
-        send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
-    else:
-        send_message(phone, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
+    now = datetime.utcnow()
+    must_greet = do_greet and (
+        phone not in greeted_at or (now - greeted_at.get(phone, now)) >= timedelta(hours=GREET_WINDOW_HOURS)
+    )
 
-    # Guardar en contexto
+    if must_greet:
+        if match and match.get("nombre"):
+            send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
+        else:
+            send_message(phone, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
+        greeted_at[phone] = now
+
+    # guarda en contexto
     ctx = ensure_ctx(phone)
     ctx["match"] = match
     return match
-
-def _should_notify(phone: str) -> bool:
-    """True si han pasado >= 24h desde la última notificación de este número."""
-    last = last_notify_at.get(phone)
-    if not last:
-        return True
-    return (datetime.utcnow() - last) >= timedelta(hours=NOTIFY_WINDOW_HOURS)
-
-def _notify_if_match(phone: str, match: Optional[Dict[str, Any]]) -> None:
-    """Notifica al asesor una sola vez cada 24h si el número está en SECOM."""
-    if not (NOTIFICAR_ASESOR and match):
-        return
-    if not _should_notify(phone):
-        return
-    nombre = match.get("nombre") or "(sin nombre)"
-    row = match.get("row", "?")
-    preview = match.get("preview", "")
-    last10 = _normalize_last10(phone)
-    log.info(f"[notify] asesor={ADVISOR_NUMBER} phone={phone} last10={last10} nombre={nombre} row={row}")
-    ficha = (
-        "🟢 *SECOM — Prospecto detectado*\n"
-        f"• WhatsApp: {phone}\n"
-        f"• Nombre: {nombre}\n"
-        f"• Fila: {row}\n"
-        f"• Extracto: {preview}\n"
-        "—\n"
-        "Mensaje inicial: contacto entrante por WhatsApp.\n"
-        "(*No se repetirá esta alerta en 24h para este número*)"
-    )
-    notify_advisor(ficha)
-    last_notify_at[phone] = datetime.utcnow()
 
 def flow_imss_info(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "imss_q1"
@@ -368,7 +441,7 @@ def flow_auto_next(phone: str, text: str) -> None:
             user_state[phone] = "auto_vto"
             flow_auto_next(phone, text)
         else:
-            send_message(phone, "Perfecto. Envía documentos o escribe la fecha de vencimiento (AAAA-MM-DD).")
+            send_message(phone, "Perfecto. Envía documentos o escribe la fecha de vencimiento (AAAAA-MM-DD).")
     elif st == "auto_vto":
         try:
             date = datetime.fromisoformat(text.strip()).date()
@@ -490,6 +563,14 @@ def flow_contacto(phone: str) -> None:
 def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = (text or "").strip().lower()
 
+    # --- RAG light para preguntas de AUTO (coberturas) ---
+    if any(k in t for k in ["amplia plus", "amplia+", "cobertura", "coberturas", "cristales", "asistencia", "auto de reemplazo"]):
+        rag_ans = answer_auto_from_manual(text or t)
+        if rag_ans:
+            send_message(phone, rag_ans)
+            return
+    # -----------------------------------------------------
+
     if t in ("menu", "menú", "inicio", "hola"):
         user_state[phone] = ""
         send_main_menu(phone)
@@ -608,22 +689,15 @@ def webhook_receive():
         if not phone:
             return jsonify({"ok": True}), 200
 
-        # Saludo + match + notificación (una vez cada 24h)
-        first_time = phone not in user_state
-        match = None
-        if first_time:
-            match = greet_with_match(phone)
+        # Saludo+match solo una vez por ventana
+        if phone not in user_state:
+            match = greet_with_match(phone, do_greet=True)
             user_state[phone] = ""
         else:
-            # Asegura que el match exista en contexto o recalcúlalo
             ctx = ensure_ctx(phone)
             match = ctx.get("match")
             if match is None:
-                match = greet_with_match(phone)  # reusa saludo si no había contexto
-
-        # Notifica al asesor si el número está en SECOM y respeta ventana 24h
-        if match:
-            _notify_if_match(phone, match)
+                match = greet_with_match(phone, do_greet=False)
 
         mtype = msg.get("type")
 
@@ -707,6 +781,8 @@ if __name__ == "__main__":
     log.info(f"Google listo: {google_ready}")
     log.info(f"OpenAI listo: {bool(client_oa is not None)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
+
 
 
 
