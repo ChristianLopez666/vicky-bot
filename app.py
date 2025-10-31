@@ -183,25 +183,51 @@ def ensure_ctx(phone: str) -> Dict[str, Any]:
     return user_ctx[phone]
 
 # =========================
-# Google helpers
+# Google helpers - CORREGIDOS
 # =========================
 def sheet_match_by_last10(last10: str) -> Optional[Dict[str, Any]]:
     if not (google_ready and sheets_client and GOOGLE_SHEET_ID and GOOGLE_SHEET_NAME):
+        log.warning("Google no está listo para buscar en Sheets")
         return None
     try:
         sh = sheets_client.open_by_key(GOOGLE_SHEET_ID)
         ws = sh.worksheet(GOOGLE_SHEET_NAME)
         rows = ws.get_all_values()
+        
+        log.info(f"Buscando teléfono {last10} en {len(rows)} filas...")
+        
         for i, row in enumerate(rows, start=1):
+            if i == 1:  # Saltar encabezados
+                continue
+                
             joined = " | ".join(row)
             digits = re.sub(r"\D", "", joined)
+            
             if last10 and last10 in digits:
                 nombre = ""
+                telefono = ""
+                
+                # Buscar nombre en columnas que probablemente contengan nombres
                 for c in row:
-                    if c and not re.search(r"\d", c):
+                    if c and not re.search(r"\d", c) and len(c) > 3:
                         nombre = c.strip()
                         break
-                return {"row": i, "nombre": nombre, "raw": row}
+                
+                # Buscar teléfono en columnas que probablemente contengan números
+                for c in row:
+                    if c and last10 in re.sub(r"\D", "", c):
+                        telefono = c.strip()
+                        break
+                
+                log.info(f"✅ Match encontrado: {nombre} - {telefono}")
+                return {
+                    "row": i, 
+                    "nombre": nombre, 
+                    "telefono": telefono,
+                    "raw": row
+                }
+        
+        log.info(f"❌ No se encontró match para {last10}")
         return None
     except Exception:
         log.exception("Error leyendo Google Sheets")
@@ -332,11 +358,11 @@ def answer_auto_from_manual(question: str) -> Optional[str]:
 MAIN_MENU = (
     "🟦 *Vicky Bot — Inbursa*\n"
     "Elige una opción:\n"
-    "1) Asesoría en pensiones IMSS\n"
+    "1) Préstamo IMSS (Ley 73)\n"
     "2) Cotizador de seguro de auto\n"
     "3) Seguros de vida y salud\n"
     "4) Membresía médica VRIM\n"
-    "5) Préstamos a pensionados IMSS ($10,000 a $650,000)\n"
+    "5) Asesoría en pensiones IMSS\n"
     "6) Financiamiento empresarial\n"
     "7) Contactar con Christian\n\n"
     "Escribe el número u opción (ej. 'imss', 'auto', 'empresarial', 'contactar')."
@@ -608,8 +634,8 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
         send_main_menu(phone)
         return
 
-    if t in ("1", "asesoría imss", "asesoria imss", "imss", "pensión", "pension"):
-        flow_imss_info(phone, match)
+    if t in ("1", "préstamo", "prestamo", "préstamo imss", "prestamo imss", "ley 73"):
+        flow_prestamo_imss(phone, match)
         return
     if t in ("2", "auto", "seguro auto", "cotización auto", "cotizacion auto"):
         flow_auto_start(phone, match)
@@ -620,8 +646,8 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
     if t in ("4", "vrim", "membresía médica", "membresia medica"):
         flow_vrim(phone)
         return
-    if t in ("5", "préstamo", "prestamo", "préstamo imss", "prestamo imss", "ley 73"):
-        flow_prestamo_imss(phone, match)
+    if t in ("5", "asesoría imss", "asesoria imss", "imss", "pensión", "pension"):
+        flow_imss_info(phone, match)
         return
     if t in ("6", "financiamiento", "empresarial", "crédito empresarial", "credito empresarial"):
         flow_empresarial(phone, match)
@@ -667,7 +693,7 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
         send_message(phone, "No te entendí bien. Escribe *menú* para ver opciones.")
 
 # =========================
-# Webhook
+# Webhook - CORREGIDO
 # =========================
 @app.get("/webhook")
 def webhook_verify():
@@ -721,6 +747,9 @@ def webhook_receive():
         if not phone:
             return jsonify({"ok": True}), 200
 
+        # DEBUG: Log del número recibido
+        log.info(f"📱 Mensaje recibido de: {phone}")
+        
         # Saludo+match solo una vez por ventana
         if phone not in user_state:
             match = greet_with_match(phone, do_greet=True)
@@ -735,6 +764,8 @@ def webhook_receive():
 
         if mtype == "text" and "text" in msg:
             text = (msg["text"].get("body") or "").strip()
+            log.info(f"💬 Texto recibido: {text}")
+            
             if text.lower().startswith("sgpt:") and client_oa:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 def _gpt_direct():
@@ -791,7 +822,8 @@ def ext_test_send():
     except Exception as e:
         log.exception("Error en /ext/test-send")
         return jsonify({"ok": False, "error": str(e)}), 500
-        @app.route("/ext/debug-notify")
+
+@app.get("/ext/debug-notify")
 def ext_debug_notify():
     """Endpoint para probar notificaciones con diferentes números"""
     test_numbers = [
@@ -831,7 +863,3 @@ if __name__ == "__main__":
     log.info(f"Google listo: {google_ready}")
     log.info(f"OpenAI listo: {bool(client_oa is not None)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
-
-
-
