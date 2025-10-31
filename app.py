@@ -1,4 +1,4 @@
-# app.py — Vicky Bot SECOM (Render-ready)
+# app.py — Vicky Bot SECOM (Render-ready) - CORREGIDO
 # Python 3.10+
 # Ejecuta en Render: gunicorn app:app --bind 0.0.0.0:$PORT
 
@@ -20,7 +20,6 @@ from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from PyPDF2 import PdfReader  # <- para RAG light (PDF)
 
 # OpenAI SDK 1.x
@@ -66,7 +65,6 @@ client_oa: Optional[OpenAI] = None
 if OPENAI_API_KEY:
     try:
         client_oa = OpenAI(api_key=OPENAI_API_KEY)
-        log.info("OpenAI configurado correctamente")
     except Exception:
         log.exception("No se pudo inicializar OpenAI")
 
@@ -74,8 +72,6 @@ if OPENAI_API_KEY:
 sheets_client = None
 drive_client = None
 google_ready = False
-google_drive_ready = False
-
 try:
     if GOOGLE_CREDENTIALS_JSON:
         info = json.loads(GOOGLE_CREDENTIALS_JSON)
@@ -87,25 +83,11 @@ try:
         sheets_client = gspread.authorize(creds)
         drive_client = build("drive", "v3", credentials=creds)
         google_ready = True
-        
-        # Verificar que Drive funcione
-        if MANUALES_VICKY_FOLDER_ID:
-            try:
-                drive_client.files().get(fileId=MANUALES_VICKY_FOLDER_ID).execute()
-                google_drive_ready = True
-                log.info("Google Drive listo y accesible")
-            except HttpError as e:
-                log.error(f"Error accediendo a Google Drive folder: {e}")
-                google_drive_ready = False
-            except Exception as e:
-                log.error(f"Error verificando Google Drive: {e}")
-                google_drive_ready = False
-        
         log.info("Google listo (Sheets RO + Drive RO)")
     else:
         log.warning("GOOGLE_CREDENTIALS_JSON ausente. Google deshabilitado.")
-except Exception as e:
-    log.exception(f"Error inicializando Google: {e}")
+except Exception:
+    log.exception("Error inicializando Google")
 
 # =========================
 # Estado en memoria
@@ -118,35 +100,6 @@ last_sent: Dict[str, str] = {}
 # Saludo solo 1 vez por ventana (24h)
 greeted_at: Dict[str, datetime] = {}
 GREET_WINDOW_HOURS = 24
-
-# =========================
-# Sistema de limpieza de estados
-# =========================
-def cleanup_old_states():
-    """Limpia estados antiguos para prevenir memory leaks"""
-    current_time = datetime.utcnow()
-    max_age = timedelta(days=2)
-    
-    global greeted_at
-    old_phones = [k for k, v in greeted_at.items() 
-                 if current_time - v >= max_age]
-    for phone in old_phones:
-        greeted_at.pop(phone, None)
-        user_state.pop(phone, None)
-        user_ctx.pop(phone, None)
-    
-    if old_phones:
-        log.info(f"[Cleanup] Estados limpiados: {len(old_phones)} usuarios antiguos")
-
-def start_cleanup_scheduler():
-    def _cleanup_loop():
-        while True:
-            time.sleep(3600)  # 1 hora
-            cleanup_old_states()
-    threading.Thread(target=_cleanup_loop, daemon=True).start()
-
-# Iniciar scheduler de limpieza
-start_cleanup_scheduler()
 
 # =========================
 # Utilidades
@@ -195,16 +148,14 @@ def send_message(to: str, text: str) -> bool:
     return ok
 
 def notify_advisor(text: str) -> None:
+    """Envía notificación al asesor usando send_message directamente - CORREGIDO"""
     if NOTIFICAR_ASESOR and ADVISOR_NUMBER:
         try:
-            # Enviar notificación inmediata al asesor
-            success = send_message(ADVISOR_NUMBER, text)
-            if success:
-                log.info(f"✅ Notificación enviada al asesor: {text[:100]}...")
-            else:
-                log.error("❌ Falló el envío de notificación al asesor")
-        except Exception as e:
-            log.exception(f"Error notificando al asesor: {str(e)}")
+            # Usar send_message directamente como en app (4).py
+            send_message(ADVISOR_NUMBER, text)
+            log.info(f"✅ Notificación enviada al asesor: {ADVISOR_NUMBER}")
+        except Exception:
+            log.exception("Error notificando al asesor")
 
 def interpret_yesno(text: str) -> str:
     t = (text or "").lower()
@@ -228,9 +179,7 @@ def extract_number(text: str) -> Optional[float]:
 
 def ensure_ctx(phone: str) -> Dict[str, Any]:
     if phone not in user_ctx:
-        user_ctx[phone] = {"last_interaction": datetime.utcnow()}
-    else:
-        user_ctx[phone]["last_interaction"] = datetime.utcnow()
+        user_ctx[phone] = {}
     return user_ctx[phone]
 
 # =========================
@@ -278,255 +227,104 @@ def list_drive_manuals(folder_id: str) -> List[Dict[str, str]]:
         return []
 
 # =========================
-# RAG MEJORADO - Sistema de consulta a manuales
+# RAG light (Auto) — lectura PDF desde Drive
 # =========================
-_manual_auto_cache = {"text": None, "file_id": None, "loaded_at": None, "file_name": None}
+_manual_auto_cache = {"text": None, "file_id": None, "loaded_at": None}
 
-def _find_best_auto_manual() -> Optional[Dict[str, str]]:
-    """Encuentra el mejor manual de auto disponible"""
-    if not google_drive_ready:
-        log.error("Google Drive no configurado o no accesible para RAG")
+def _find_auto_manual_file_id() -> Optional[str]:
+    if not (google_ready and drive_client and MANUALES_VICKY_FOLDER_ID):
         return None
-    
     try:
-        # Buscar TODOS los PDFs en la carpeta
         q = (
             f"'{MANUALES_VICKY_FOLDER_ID}' in parents and "
             "mimeType='application/pdf' and trashed=false"
         )
-        resp = drive_client.files().list(
-            q=q, 
-            fields="files(id, name, modifiedTime)",
-            orderBy="modifiedTime desc",
-            pageSize=20
-        ).execute()
-        
+        resp = drive_client.files().list(q=q, fields="files(id, name)", pageSize=50).execute()
         files = resp.get("files", [])
-        
-        if not files:
-            log.warning("No se encontraron PDFs en la carpeta de manuales")
-            return None
-        
-        log.info(f"[RAG] Encontrados {len(files)} archivos PDF en Drive")
-        
-        # Priorizar manuales de auto por nombre
-        auto_files = []
-        other_files = []
-        
-        for file in files:
-            name = (file.get("name") or "").lower()
-            log.info(f"[RAG] Archivo encontrado: {name}")
-            if any(keyword in name for keyword in ["auto", "vehículo", "vehicular", "cobertura", "automóvil", "seguro"]):
-                auto_files.append(file)
-            else:
-                other_files.append(file)
-        
-        # Seleccionar el más relevante
-        if auto_files:
-            selected = auto_files[0]
-            # Buscar el más específico
-            for file in auto_files:
-                name = (file.get("name") or "").lower()
-                if "cobertura" in name and "auto" in name:
-                    selected = file
-                    break
-            log.info(f"[RAG] Seleccionado manual de auto: {selected.get('name')}")
-        elif other_files:
-            selected = other_files[0]
-            log.info(f"[RAG] Usando manual genérico: {selected.get('name')}")
-        else:
-            return None
-            
-        return {
-            "id": selected["id"],
-            "name": selected.get("name", "desconocido"),
-            "modified": selected.get("modifiedTime")
-        }
-        
-    except HttpError as e:
-        log.error(f"[RAG] Error de API Google Drive: {e}")
-        return None
-    except Exception as e:
-        log.exception(f"[RAG] Error buscando manuales: {str(e)}")
+        # Prioriza nombres que sugieran auto/coberturas
+        for f in files:
+            name = (f.get("name") or "").lower()
+            if "auto" in name or "cobertura" in name:
+                return f["id"]
+        return files[0]["id"] if files else None
+    except Exception:
+        log.exception("Error buscando manual Auto")
         return None
 
-def _download_pdf_text_improved(file_id: str) -> Optional[str]:
-    """Extrae texto de PDF con mejor manejo de errores"""
+def _download_pdf_text(file_id: str) -> Optional[str]:
     try:
         from googleapiclient.http import MediaIoBaseDownload
         req = drive_client.files().get_media(fileId=file_id)
         fh = io.BytesIO()
         downloader = MediaIoBaseDownload(fh, req)
         done = False
-        
         while not done:
             status, done = downloader.next_chunk()
-            
         fh.seek(0)
         reader = PdfReader(fh)
-        text_parts = []
-        
-        for i, page in enumerate(reader.pages):
+        pages = []
+        for p in reader.pages:
             try:
-                page_text = page.extract_text() or ""
-                if page_text.strip():
-                    # Limpiar y normalizar texto
-                    cleaned_text = re.sub(r'\s+', ' ', page_text).strip()
-                    if len(cleaned_text) > 50:  # Ignorar páginas casi vacías
-                        text_parts.append(cleaned_text)
-            except Exception as e:
-                log.warning(f"[RAG] Error en página {i+1}: {str(e)}")
-                continue
-        
-        full_text = "\n\n".join(text_parts)
-        log.info(f"[RAG] Texto extraído: {len(full_text)} caracteres, {len(text_parts)} páginas con contenido")
-        return full_text if full_text.strip() else None
-        
-    except Exception as e:
-        log.exception(f"[RAG] Error descargando PDF: {str(e)}")
+                pages.append(p.extract_text() or "")
+            except Exception:
+                pages.append("")
+        text = "\n".join(pages)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip() or None
+    except Exception:
+        log.exception("No se pudo extraer texto PDF (Auto)")
         return None
 
 def ensure_auto_manual_text(force_reload: bool = False) -> Optional[str]:
-    """Sistema de cache mejorado para manuales"""
-    cache = _manual_auto_cache
-    current_time = datetime.utcnow()
-    cache_max_age = timedelta(hours=12)  # Refrescar cada 12 horas
-    
-    # Verificar cache válido
-    if (not force_reload and 
-        cache.get("text") and 
-        cache.get("loaded_at") and 
-        (current_time - cache["loaded_at"]) < cache_max_age):
-        log.info("[RAG] Usando manual en cache")
-        return cache["text"]
-    
-    log.info("[RAG] Cargando manual desde Drive...")
-    
-    # Buscar mejor manual disponible
-    manual_info = _find_best_auto_manual()
-    if not manual_info:
-        log.error("[RAG] No se pudo encontrar ningún manual")
+    if not client_oa:
         return None
-    
-    # Descargar y procesar texto
-    text = _download_pdf_text_improved(manual_info["id"])
+    if not force_reload and _manual_auto_cache.get("text"):
+        return _manual_auto_cache["text"]
+    fid = _find_auto_manual_file_id()
+    if not fid:
+        return None
+    text = _download_pdf_text(fid)
     if text:
-        cache.update({
-            "text": text,
-            "file_id": manual_info["id"],
-            "file_name": manual_info["name"],
-            "loaded_at": current_time
-        })
-        log.info(f"[RAG] Manual cargado: {manual_info['name']} ({len(text)} caracteres)")
-        return text
-    else:
-        log.error(f"[RAG] Falló la extracción de texto: {manual_info['name']}")
-        return None
+        _manual_auto_cache.update({"text": text, "file_id": fid, "loaded_at": datetime.utcnow()})
+        log.info("[rag-auto] Manual cacheado")
+    return text
 
 def answer_auto_from_manual(question: str) -> Optional[str]:
-    """Sistema RAG mejorado para consultas técnicas"""
     if not client_oa:
-        log.warning("OpenAI no disponible para RAG")
         return None
-    
-    # 1. Obtener texto del manual
     manual_text = ensure_auto_manual_text()
     if not manual_text:
-        log.warning("[RAG] No hay texto de manual disponible")
         return None
-    
-    # 2. Consulta directa a OpenAI con el manual completo
+    # Heurística: filtra párrafos relevantes
+    keys = ["amplia plus", "amplia", "cobertura", "asistencia", "cristales", "auto de reemplazo", "deducible"]
+    parts = []
+    for ln in manual_text.split("\n"):
+        low = ln.lower()
+        if any(k in low for k in keys):
+            parts.append(ln.strip())
+            if len(" ".join(parts)) > 8000:
+                break
+    focus = "\n".join(parts) if parts else manual_text[:9000]
     try:
         prompt = (
-            "Eres Vicky, una especialista en seguros de auto de Inbursa. "
-            "Responde ÚNICAMENTE con base en la información del manual técnico proporcionado. "
-            "SÉ PRECISA y no inventes información.\n\n"
-            "REGLAS ESTRICTAS:\n"
-            "1. Si la información NO está en el manual, di claramente que no la encontraste\n"
-            "2. Usa viñetas (•) para listar coberturas y características\n"
-            "3. Sé específica en comparaciones entre coberturas\n"
-            "4. Si encuentras tablas comparativas, descríbelas claramente\n"
-            "5. Mantén la respuesta clara y útil\n\n"
-            f"PREGUNTA DEL CLIENTE: {question}\n\n"
-            "INFORMACIÓN DEL MANUAL TÉCNICO:\n"
-            f"{manual_text[:12000]}\n\n"  # Limitar a 12k tokens para no exceder contexto
-            "RESPUESTA BASADA EN EL MANUAL:"
+            "Responde SOLO con base en el texto del manual (auto). "
+            "Sé preciso, en español, y usa viñetas si ayuda. "
+            "Si no aparece en el manual, di: 'No está indicado en el manual'.\n\n"
+            f"Pregunta: {question}\n\n"
+            f"Manual (extracto):\n{focus}\n\n"
+            "==\nRespuesta:"
         )
-        
-        response = client_oa.chat.completions.create(
+        res = client_oa.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=800
+            temperature=0.2,
         )
-        
-        answer = (response.choices[0].message.content or "").strip()
-        
-        if answer and len(answer) > 50:  # Respuesta mínima razonable
-            log.info(f"[RAG] Respuesta generada exitosamente ({len(answer)} caracteres)")
-            return answer
-        else:
-            log.warning("[RAG] Respuesta insuficiente del modelo")
-            return None
-            
-    except Exception as e:
-        log.exception(f"[RAG] Error en consulta OpenAI: {str(e)}")
+        ans = (res.choices[0].message.content or "").strip()
+        return ans[:1500] if ans else None
+    except Exception:
+        log.exception("Error RAG-auto")
         return None
-
-# =========================
-# Respuestas de respaldo para cuando RAG falle
-# =========================
-COBERTURAS_BACKUP_RESPONSES = {
-    "amplia_plus_vs_amplia": """
-🚗 *Comparación: Cobertura Amplia Plus vs Amplia*
-
-*Cobertura Amplia Plus incluye:*
-• Responsabilidad Civil por Daños a Terceros
-• Gastos Médicos a Ocupantes
-• Muerte del Asegurado o Conductor
-• Asistencia Vial
-• Auto de Reemplazo
-• Cristales Laterales
-• Robo Total
-• Daños Materiales
-
-*Cobertura Amplia (estándar) incluye:*
-• Responsabilidad Civil por Daños a Terceros
-• Gastos Médicos a Ocupantes
-• Muerte del Asegurado
-• Asistencia Vial Básica
-• Robo Total
-• Daños Materiales
-
-*Diferencia principal:* La Amplia Plus ofrece mayor protección con auto de reemplazo, cristales laterales y mejores beneficios en asistencia.
-
-*¿Te interesa conocer precios? Un asesor puede darte una cotización exacta.*
-""",
-    
-    "coberturas_generales": """
-📋 *Coberturas de Seguro de Auto*
-
-*Coberturas Básicas:*
-• Responsabilidad Civil
-• Gastos Médicos
-• Muerte Accidental
-• Asistencia Vial
-
-*Coberturas Ampliadas:*
-• Robo Total
-• Daños Materiales
-• Auto de Reemplazo
-• Cristales
-• Equipo Especial
-
-*Coberturas Adicionales:*
-• Asistencia Legal
-• Responsabilidad Civil Ampliada
-• Defensa Penal y Fianzas
-
-Cada paquete (Básico, Amplio, Amplio Plus) incluye diferentes combinaciones. Para detalles específicos y precios, recomiendo contactar a un asesor.
-"""
-}
 
 # =========================
 # Menú y flujos
@@ -547,24 +345,30 @@ MAIN_MENU = (
 def send_main_menu(phone: str) -> None:
     send_message(phone, MAIN_MENU)
 
-def should_greet_user(phone: str) -> bool:
-    """Determina si debe saludar al usuario"""
-    current_time = datetime.utcnow()
-    last_greeting = greeted_at.get(phone)
-    
-    if last_greeting is None:
-        return True
-    
-    time_since_greeting = current_time - last_greeting
-    return time_since_greeting >= timedelta(hours=GREET_WINDOW_HOURS)
+def greet_with_match(phone: str, *, do_greet: bool = True) -> Optional[Dict[str, Any]]:
+    """
+    Saluda solo si no se saludó en la última ventana (24h).
+    Guarda el match en contexto para reutilizarlo.
+    """
+    last10 = _normalize_last10(phone)
+    match = sheet_match_by_last10(last10)
 
-def greet_user(phone: str, match: Optional[Dict[str, Any]]) -> None:
-    """Saluda al usuario una sola vez"""
-    if match and match.get("nombre"):
-        send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
-    else:
-        send_message(phone, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
-    greeted_at[phone] = datetime.utcnow()
+    now = datetime.utcnow()
+    must_greet = do_greet and (
+        phone not in greeted_at or (now - greeted_at.get(phone, now)) >= timedelta(hours=GREET_WINDOW_HOURS)
+    )
+
+    if must_greet:
+        if match and match.get("nombre"):
+            send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
+        else:
+            send_message(phone, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
+        greeted_at[phone] = now
+
+    # guarda en contexto
+    ctx = ensure_ctx(phone)
+    ctx["match"] = match
+    return match
 
 def flow_imss_info(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "imss_q1"
@@ -621,7 +425,16 @@ def flow_imss_next(phone: str, text: str) -> None:
         )
         send_message(phone, resumen)
         if NOTIFICAR_ASESOR:
-            notify_advisor(f"🔔 IMSS — Prospecto preautorizado\nWhatsApp: {phone}\n{resumen}")
+            formatted = (
+                "🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
+                f"Nombre: {ctx.get('imss_nombre','')}\n"
+                f"WhatsApp: {phone}\n"
+                f"Teléfono: {ctx.get('imss_telefono','ND')}\n"
+                f"Ciudad: {ctx.get('imss_ciudad','')}\n"
+                f"Monto solicitado: ${ctx.get('imss_monto',0):,.0f}\n"
+                f"Nómina Inbursa: {ctx.get('imss_nomina','no')}"
+            )
+            notify_advisor(formatted)
         user_state[phone] = ""
         send_main_menu(phone)
 
@@ -702,7 +515,17 @@ def flow_prestamo_imss_next(phone: str, text: str) -> None:
             f"- Nómina Inbursa: {ctx.get('imss_nomina','no')}"
         )
         send_message(phone, resumen)
-        notify_advisor(f"🔔 IMSS — Solicitud préstamo\nWhatsApp: {phone}\n{resumen}")
+        if NOTIFICAR_ASESOR:
+            formatted = (
+                "🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
+                f"Nombre: {ctx.get('imss_nombre','')}\n"
+                f"WhatsApp: {phone}\n"
+                f"Teléfono: {ctx.get('imss_telefono','ND')}\n"
+                f"Ciudad: {ctx.get('imss_ciudad','')}\n"
+                f"Monto solicitado: ${ctx.get('imss_monto',0):,.0f}\n"
+                f"Nómina Inbursa: {ctx.get('imss_nomina','no')}"
+            )
+            notify_advisor(formatted)
         user_state[phone] = ""
         send_main_menu(phone)
 
@@ -747,83 +570,38 @@ def flow_empresarial_next(phone: str, text: str) -> None:
             f"- Monto: ${ctx.get('emp_monto',0):,.0f}"
         )
         send_message(phone, resumen)
-        notify_advisor(f"🔔 Empresarial — Nueva solicitud\nWhatsApp: {phone}\n{resumen}")
+        if NOTIFICAR_ASESOR:
+            formatted = (
+                "🔔 NUEVO PROSPECTO – CRÉDITO EMPRESARIAL\n"
+                f"Nombre: {ctx.get('emp_nombre','')}\n"
+                f"Teléfono: {ctx.get('emp_telefono','ND')}\n"
+                f"Ciudad: {ctx.get('emp_ciudad','')}\n"
+                f"Monto solicitado: ${ctx.get('emp_monto',0):,.0f}\n"
+                f"Actividad: {ctx.get('emp_giro','')}\n"
+                f"WhatsApp: {phone}"
+            )
+            notify_advisor(formatted)
         user_state[phone] = ""
         send_main_menu(phone)
 
 def flow_contacto(phone: str) -> None:
     send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
-    
-    # NOTIFICACIÓN INMEDIATA Y EXPLÍCITA AL ASESOR
-    notification_text = (
-        f"🔔 CONTACTO URGENTE - Cliente solicita hablar\n"
-        f"📞 WhatsApp: {phone}\n"
-        f"⏰ Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"💬 Cliente espera tu contacto inmediato"
-    )
-    notify_advisor(notification_text)
-    
+    notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
     send_main_menu(phone)
 
 # =========================
-# Router principal MEJORADO
+# Router principal
 # =========================
 def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = (text or "").strip().lower()
-    ctx = ensure_ctx(phone)
 
-    # --- RAG MEJORADO para preguntas de AUTO (coberturas) ---
-    rag_keywords = ["amplia plus", "amplia", "cobertura", "coberturas", "cristales", 
-                   "asistencia", "auto de reemplazo", "deducible", "qué incluye",
-                   "qué cubre", "diferencia entre", "vs", "comparar", "beneficio",
-                   "ventaja", "qué más", "y qué más", "otro", "adicional", "seguro auto"]
-    
-    # Detectar si es pregunta de coberturas
-    is_coverage_question = any(k in t for k in rag_keywords)
-    is_follow_up = t in ["qué más", "y qué más", "que mas", "y que mas", "otro", "adicional"]
-    
-    # Si es pregunta de coberturas o follow-up, usar RAG
-    if is_coverage_question or is_follow_up:
-        log.info(f"[RAG] Procesando pregunta de coberturas: {text}")
-        
-        # Para follow-ups, agregar contexto de la pregunta anterior
-        if is_follow_up and "last_rag_question" in ctx:
-            question = f"{ctx['last_rag_question']} - proporciona más detalles y coberturas adicionales"
-        else:
-            question = text
-            ctx["last_rag_question"] = text  # Guardar para follow-ups
-        
-        # Intentar RAG primero
-        rag_ans = answer_auto_from_manual(question)
-        
+    # --- RAG light para preguntas de AUTO (coberturas) ---
+    if any(k in t for k in ["amplia plus", "amplia+", "cobertura", "coberturas", "cristales", "asistencia", "auto de reemplazo"]):
+        rag_ans = answer_auto_from_manual(text or t)
         if rag_ans:
             send_message(phone, rag_ans)
             return
-        else:
-            # Si RAG falla, usar respuestas de respaldo
-            log.info("[RAG] Usando respuestas de respaldo")
-            if "amplia plus" in t and "amplia" in t:
-                send_message(phone, COBERTURAS_BACKUP_RESPONSES["amplia_plus_vs_amplia"])
-            else:
-                send_message(phone, COBERTURAS_BACKUP_RESPONSES["coberturas_generales"])
-            
-            # Ofrecer contacto con asesor
-            send_message(phone, "\n¿Te gustaría que un asesor te contacte para brindarte información más precisa y precios?")
-            ctx["waiting_advisor_confirmation"] = True
-            return
     # -----------------------------------------------------
-
-    # Manejar confirmación de asesor después de fallo RAG
-    if ctx.get("waiting_advisor_confirmation"):
-        yn = interpret_yesno(text)
-        if yn == "yes":
-            flow_contacto(phone)
-            ctx["waiting_advisor_confirmation"] = False
-            return
-        else:
-            send_message(phone, "Entendido. ¿En qué más puedo ayudarte?")
-            ctx["waiting_advisor_confirmation"] = False
-            return
 
     if t in ("menu", "menú", "inicio", "hola"):
         user_state[phone] = ""
@@ -848,7 +626,7 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
     if t in ("6", "financiamiento", "empresarial", "crédito empresarial", "credito empresarial"):
         flow_empresarial(phone, match)
         return
-    if t in ("7", "contactar", "asesor", "contactar con christian", "christian"):
+    if t in ("7", "contactar", "asesor", "contactar con christian"):
         flow_contacto(phone)
         return
 
@@ -873,7 +651,6 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
                 prompt = (
                     "Eres Vicky, una asistente amable y profesional. "
                     "Responde en español, breve y con emojis si corresponde. "
-                    "Si no estás segura de la respuesta, sugiere contactar a un asesor.\n\n"
                     f"Mensaje del usuario: {text or ''}"
                 )
                 res = client_oa.chat.completions.create(
@@ -890,7 +667,7 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
         send_message(phone, "No te entendí bien. Escribe *menú* para ver opciones.")
 
 # =========================
-# Webhook MEJORADO
+# Webhook
 # =========================
 @app.get("/webhook")
 def webhook_verify():
@@ -903,6 +680,30 @@ def webhook_verify():
     except Exception:
         log.exception("Error verificando webhook")
     return "Error", 403
+
+def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    if not META_TOKEN:
+        return None, None, None
+    try:
+        meta = requests.get(
+            f"https://graph.facebook.com/v20.0/{media_id}",
+            headers={"Authorization": f"Bearer {META_TOKEN}"},
+            timeout=WPP_TIMEOUT,
+        )
+        if meta.status_code != 200:
+            return None, None, None
+        mj = meta.json()
+        url = mj.get("url")
+        mime = mj.get("mime_type")
+        fname = mj.get("filename") or f"media_{media_id}"
+        if not url:
+            return None, None, None
+        binr = requests.get(url, headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=WPP_TIMEOUT)
+        if binr.status_code != 200:
+            return None, None, None
+        return binr.content, (mime or "application/octet-stream"), fname
+    except Exception:
+        return None, None, None
 
 @app.post("/webhook")
 def webhook_receive():
@@ -920,24 +721,15 @@ def webhook_receive():
         if not phone:
             return jsonify({"ok": True}), 200
 
-        # ✅ NUEVA LÓGICA MEJORADA - GESTIÓN DE ESTADO
-        current_time = datetime.utcnow()
-        ctx = ensure_ctx(phone)
-        
-        # Obtener match de Google Sheets solo si no existe
-        if "match" not in ctx or ctx["match"] is None:
-            last10 = _normalize_last10(phone)
-            match = sheet_match_by_last10(last10)
-            ctx["match"] = match
+        # Saludo+match solo una vez por ventana
+        if phone not in user_state:
+            match = greet_with_match(phone, do_greet=True)
+            user_state[phone] = ""
         else:
-            match = ctx["match"]
-        
-        # Verificar si debemos saludar (solo una vez cada 24h)
-        if should_greet_user(phone):
-            greet_user(phone, match)
-
-        # Logging mejorado
-        log.info(f"[Webhook] Mensaje de {phone}: {msg.get('type', 'unknown')}")
+            ctx = ensure_ctx(phone)
+            match = ctx.get("match")
+            if match is None:
+                match = greet_with_match(phone, do_greet=False)
 
         mtype = msg.get("type")
 
@@ -972,25 +764,18 @@ def webhook_receive():
         return jsonify({"ok": True}), 200
 
 # =========================
-# Endpoints auxiliares MEJORADOS
+# Endpoints auxiliares
 # =========================
 @app.get("/ext/health")
 def ext_health():
-    manual_status = "loaded" if _manual_auto_cache.get("text") else "empty"
     return jsonify({
         "status": "ok",
         "timestamp": datetime.utcnow().isoformat(),
         "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID),
         "google_ready": google_ready,
-        "google_drive_ready": google_drive_ready,
         "openai_ready": bool(client_oa is not None),
-        "rag_status": manual_status,
-        "rag_file": _manual_auto_cache.get("file_name"),
-        "rag_text_length": len(_manual_auto_cache.get("text") or ""),
         "sheet_name": GOOGLE_SHEET_NAME,
         "manuales_folder": bool(MANUALES_VICKY_FOLDER_ID),
-        "users_active": len(user_ctx),
-        "cache_loaded_at": _manual_auto_cache.get("loaded_at"),
     }), 200
 
 @app.post("/ext/test-send")
@@ -1015,51 +800,9 @@ def ext_manuales():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.get("/ext/rag-reload")
-def ext_rag_reload():
-    try:
-        old_text = _manual_auto_cache.get("text")
-        ensure_auto_manual_text(force_reload=True)
-        new_text = _manual_auto_cache.get("text")
-        return jsonify({
-            "ok": True, 
-            "reloaded": True,
-            "old_length": len(old_text) if old_text else 0,
-            "new_length": len(new_text) if new_text else 0,
-            "file_name": _manual_auto_cache.get("file_name")
-        }), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.get("/ext/debug-drive")
-def ext_debug_drive():
-    """Endpoint para debuggear la conexión a Drive"""
-    try:
-        if not google_ready:
-            return jsonify({"ok": False, "error": "Google no configurado"}), 400
-        
-        # Verificar folder
-        folder_info = drive_client.files().get(fileId=MANUALES_VICKY_FOLDER_ID, fields="id,name,mimeType").execute()
-        
-        # Listar archivos
-        files = list_drive_manuals(MANUALES_VICKY_FOLDER_ID)
-        
-        return jsonify({
-            "ok": True,
-            "folder": folder_info,
-            "files_count": len(files),
-            "files": files[:5]  # Primeros 5 archivos
-        }), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "service": "Vicky Bot SECOM"}), 200
-
-@app.get("/")
-def home():
-    return jsonify({"name": "Vicky Bot SECOM", "version": "2024.10.30", "status": "running"}), 200
 
 # =========================
 # Arranque local
@@ -1068,16 +811,6 @@ if __name__ == "__main__":
     log.info(f"Vicky SECOM en puerto {PORT}")
     log.info(f"WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
     log.info(f"Google listo: {google_ready}")
-    log.info(f"Google Drive listo: {google_drive_ready}")
     log.info(f"OpenAI listo: {bool(client_oa is not None)}")
-    
-    # Precargar manual al inicio
-    if google_drive_ready and MANUALES_VICKY_FOLDER_ID:
-        log.info("Precargando manual de auto...")
-        manual_text = ensure_auto_manual_text()
-        if manual_text:
-            log.info(f"Manual precargado: {len(manual_text)} caracteres")
-        else:
-            log.warning("No se pudo cargar el manual inicial")
-    
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
