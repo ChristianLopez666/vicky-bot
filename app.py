@@ -814,3 +814,5 @@ if __name__ == "__main__":
     log.info(f"OpenAI listo: {bool(client_oa is not None)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
 
+
+
