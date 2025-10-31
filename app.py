@@ -1,4 +1,4 @@
-# app.py — Vicky Bot SECOM (Render-ready) - CORREGIDO
+# app.py — Vicky Bot SECOM (Render-ready) - VERSIÓN DEFINITIVA
 # Python 3.10+
 # Ejecuta en Render: gunicorn app:app --bind 0.0.0.0:$PORT
 
@@ -16,49 +16,51 @@ import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-# Google APIs - VERSIÓN CORREGIDA
+# Google APIs
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google.auth.exceptions import GoogleAuthError, MalformedError
 from PyPDF2 import PdfReader
 
 # OpenAI SDK 1.x
 from openai import OpenAI
 
 # =========================
-# Entorno y logging - MEJORADO
+# Entorno y logging
 # =========================
 load_dotenv()
 
-# Configuración de logging más detallada
+# Configuración de logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(funcName)s:%(lineno)d - %(message)s",
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("vicky-secom")
 
-# Variables de entorno
+# Variables de entorno - USANDO TUS VARIABLES EXACTAS
 META_TOKEN = os.getenv("META_TOKEN", "").strip()
 WABA_PHONE_ID = os.getenv("WABA_PHONE_ID", "").strip()
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "").strip()
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo-1106")
+OPENAI_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini").strip()
 
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Prospectos SECOM Auto").strip()
+# Google Sheets - VARIABLES CORRECTAS DE RENDER
+GOOGLE_SHEET_ID = os.getenv("SHEET_ID_SECOM", "").strip()
+GOOGLE_SHEET_NAME = os.getenv("SHEET_TITLE_SECOM", "Prospectos SECOM Auto").strip()
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
-MANUALES_VICKY_FOLDER_ID = os.getenv("MANUALES_VICKY_FOLDER_ID", "").strip()
+
+# Drive - VARIABLE CORRECTA
+MANUALES_VICKY_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "").strip()
 
 NOTIFICAR_ASESOR = os.getenv("NOTIFICAR_ASESOR", "true").lower() == "true"
 PORT = int(os.getenv("PORT", "5000"))
 
 # =========================
-# Clientes externos - CORREGIDO
+# Clientes externos
 # =========================
 # WhatsApp
 WPP_API_URL = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages" if WABA_PHONE_ID else None
@@ -74,115 +76,84 @@ if OPENAI_API_KEY:
         log.error(f"❌ Error inicializando OpenAI: {str(e)}")
         client_oa = None
 
-# Google Sheets + Drive - INICIALIZACIÓN CORREGIDA
+# Google Sheets + Drive
 sheets_client = None
 drive_client = None
 google_ready = False
 google_error = "No inicializado"
 
 def initialize_google_services():
-    """Inicializa los servicios de Google con manejo robusto de errores"""
+    """Inicializa los servicios de Google"""
     global sheets_client, drive_client, google_ready, google_error
     
     try:
-        # Verificar que tenemos las credenciales
+        # Verificar credenciales
         if not GOOGLE_CREDENTIALS_JSON:
-            google_error = "GOOGLE_CREDENTIALS_JSON está vacío o no definido"
+            google_error = "GOOGLE_CREDENTIALS_JSON no configurado"
             log.error(google_error)
             return False
         
-        # Parsear y validar JSON de credenciales
+        # Parsear credenciales
         try:
             credentials_info = json.loads(GOOGLE_CREDENTIALS_JSON)
             log.info("✅ Credenciales JSON parseadas correctamente")
         except json.JSONDecodeError as e:
-            google_error = f"Error parseando GOOGLE_CREDENTIALS_JSON: {str(e)}"
+            google_error = f"Error parseando JSON: {str(e)}"
             log.error(google_error)
             return False
         
-        # Definir scopes necesarios - CORREGIDOS
+        # Scopes necesarios
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets.readonly",
             "https://www.googleapis.com/auth/drive.readonly",
         ]
         
         # Crear credenciales
-        try:
-            creds = Credentials.from_service_account_info(credentials_info, scopes=scopes)
-            log.info("✅ Credenciales de servicio creadas")
-        except (GoogleAuthError, MalformedError, ValueError) as e:
-            google_error = f"Error creando credenciales: {str(e)}"
-            log.error(google_error)
-            return False
+        creds = Credentials.from_service_account_info(credentials_info, scopes=scopes)
         
-        # Inicializar cliente de Sheets
-        try:
-            sheets_client = gspread.authorize(creds)
-            log.info("✅ Cliente de Sheets autorizado")
-        except Exception as e:
-            google_error = f"Error autorizando cliente de Sheets: {str(e)}"
-            log.error(google_error)
-            return False
+        # Inicializar Sheets
+        sheets_client = gspread.authorize(creds)
+        log.info("✅ Cliente de Sheets autorizado")
         
-        # Inicializar cliente de Drive
-        try:
-            drive_client = build("drive", "v3", credentials=creds, cache_discovery=False)
-            log.info("✅ Cliente de Drive construido")
-        except Exception as e:
-            google_error = f"Error construyendo cliente de Drive: {str(e)}"
-            log.error(google_error)
-            return False
+        # Inicializar Drive
+        drive_client = build("drive", "v3", credentials=creds, cache_discovery=False)
+        log.info("✅ Cliente de Drive construido")
         
-        # Verificar permisos de Sheets
+        # Verificar Sheets
         if GOOGLE_SHEET_ID:
             try:
                 sheet = sheets_client.open_by_key(GOOGLE_SHEET_ID)
                 worksheet = sheet.worksheet(GOOGLE_SHEET_NAME)
                 test_data = worksheet.get_all_values()
-                log.info(f"✅ Conexión a Sheets verificada - {len(test_data)} filas encontradas")
-            except gspread.exceptions.APIError as e:
-                google_error = f"Error de API accediendo a Sheets: {str(e)}"
-                log.error(google_error)
-                return False
-            except gspread.exceptions.SpreadsheetNotFound:
-                google_error = f"Sheet no encontrado: {GOOGLE_SHEET_ID}"
-                log.error(google_error)
-                return False
+                log.info(f"✅ Sheets verificado - {len(test_data)} filas")
             except Exception as e:
-                google_error = f"Error verificando Sheets: {str(e)}"
+                google_error = f"Error accediendo a Sheets: {str(e)}"
                 log.error(google_error)
                 return False
+        else:
+            log.warning("⚠️ SHEET_ID_SECOM no configurado")
         
-        # Verificar permisos de Drive
+        # Verificar Drive
         if MANUALES_VICKY_FOLDER_ID:
             try:
                 drive_client.files().get(fileId=MANUALES_VICKY_FOLDER_ID).execute()
-                log.info("✅ Permisos de Drive verificados")
-            except HttpError as e:
-                if e.resp.status == 404:
-                    google_error = f"Folder de Drive no encontrado: {MANUALES_VICKY_FOLDER_ID}"
-                elif e.resp.status == 403:
-                    google_error = "Sin permisos para acceder al folder de Drive"
-                else:
-                    google_error = f"Error de Drive API: {str(e)}"
-                log.error(google_error)
-                return False
+                log.info("✅ Drive verificado")
             except Exception as e:
-                google_error = f"Error verificando Drive: {str(e)}"
-                log.error(google_error)
-                return False
+                log.warning(f"⚠️ Drive folder no accesible: {str(e)}")
+        else:
+            log.warning("⚠️ DRIVE_FOLDER_ID no configurado")
         
         google_ready = True
-        google_error = "✅ Todo correcto"
-        log.info("🚀 Google Services inicializados correctamente")
+        google_error = "✅ Servicios Google inicializados"
+        log.info("🚀 Google Services listos")
         return True
         
     except Exception as e:
-        google_error = f"Error crítico inicializando Google: {str(e)}"
+        google_error = f"Error inicializando Google: {str(e)}"
         log.error(google_error)
         return False
 
-# Inicializar Google al importar
+# Inicializar Google
 initialize_google_services()
 
 # =========================
@@ -206,7 +177,7 @@ def _normalize_last10(phone: str) -> str:
 
 def _send_wpp_payload(payload: Dict[str, Any]) -> bool:
     if not (META_TOKEN and WPP_API_URL):
-        log.error("WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID).")
+        log.error("WhatsApp no configurado")
         return False
     headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
     for attempt in range(3):
@@ -244,11 +215,10 @@ def send_message(to: str, text: str) -> bool:
     return ok
 
 def notify_advisor(text: str) -> None:
-    """Envía notificación al asesor usando send_message directamente - CORREGIDO"""
     if NOTIFICAR_ASESOR and ADVISOR_NUMBER:
         try:
             send_message(ADVISOR_NUMBER, text)
-            log.info(f"✅ Notificación enviada al asesor: {ADVISOR_NUMBER}")
+            log.info(f"✅ Notificación enviada al asesor")
         except Exception:
             log.exception("Error notificando al asesor")
 
@@ -278,53 +248,45 @@ def ensure_ctx(phone: str) -> Dict[str, Any]:
     return user_ctx[phone]
 
 # =========================
-# Google helpers - COMPLETAMENTE CORREGIDOS
+# Google helpers
 # =========================
 def sheet_match_by_last10(last10: str) -> Optional[Dict[str, Any]]:
-    """Busca en Google Sheets por los últimos 10 dígitos del teléfono - CORREGIDO"""
+    """Busca en Google Sheets por teléfono"""
     if not google_ready:
-        log.warning(f"❌ Google no está listo: {google_error}")
+        log.warning(f"Google no listo: {google_error}")
         return None
     
-    if not (sheets_client and GOOGLE_SHEET_ID and GOOGLE_SHEET_NAME):
-        log.warning("❌ Faltan configuraciones de Sheets")
+    if not (sheets_client and GOOGLE_SHEET_ID):
+        log.warning("Faltan configuraciones de Sheets")
         return None
     
     try:
-        log.info(f"🔍 Buscando teléfono {last10} en Google Sheets...")
+        log.info(f"Buscando teléfono {last10}")
         
-        # Abrir sheet
         sh = sheets_client.open_by_key(GOOGLE_SHEET_ID)
         ws = sh.worksheet(GOOGLE_SHEET_NAME)
         rows = ws.get_all_values()
         
-        log.info(f"📊 Sheet cargado - {len(rows)} filas encontradas")
+        log.info(f"Sheet cargado - {len(rows)} filas")
         
-        if not rows:
-            log.warning("❌ Sheet está vacío")
-            return None
-        
-        # Buscar en todas las filas
+        # Buscar en filas
         for i, row in enumerate(rows, start=1):
-            # Convertir toda la fila a texto y extraer números
             row_text = " | ".join(str(cell) for cell in row)
             all_digits_in_row = re.sub(r"\D", "", row_text)
             
-            # Buscar coincidencia exacta de los últimos 10 dígitos
             if last10 and last10 in all_digits_in_row:
-                log.info(f"✅ Match encontrado en fila {i}")
+                log.info(f"✅ Match en fila {i}")
                 
-                # Buscar nombre (primera columna con texto significativo)
+                # Buscar nombre
                 nombre = ""
                 for cell in row:
                     cell_str = str(cell).strip()
                     if (cell_str and len(cell_str) > 2 and 
                         not re.search(r"\d", cell_str) and
-                        cell_str.lower() not in ['nombre', 'cliente', 'prospecto', 'teléfono', 'telefono']):
+                        cell_str.lower() not in ['nombre', 'cliente', 'prospecto', 'teléfono']):
                         nombre = cell_str
                         break
                 
-                # Si no encontramos nombre, usar primera columna no vacía
                 if not nombre:
                     for cell in row:
                         if str(cell).strip():
@@ -338,101 +300,81 @@ def sheet_match_by_last10(last10: str) -> Optional[Dict[str, Any]]:
                     "raw": row
                 }
         
-        log.warning(f"❌ No se encontró match para {last10}")
+        log.warning(f"No match para {last10}")
         return None
         
-    except gspread.exceptions.APIError as e:
-        log.error(f"❌ Error de API de Google Sheets: {str(e)}")
-        return None
     except Exception as e:
-        log.exception(f"❌ Error crítico leyendo Google Sheets: {str(e)}")
+        log.error(f"Error leyendo Sheets: {str(e)}")
         return None
 
 def list_drive_manuals(folder_id: str) -> List[Dict[str, str]]:
-    """Lista archivos PDF en folder de Drive - CORREGIDO"""
-    if not google_ready:
-        log.warning(f"❌ Google no está listo: {google_error}")
-        return []
-    
-    if not (drive_client and folder_id):
-        log.warning("❌ Cliente de Drive no disponible o folder_id faltante")
+    if not google_ready or not drive_client or not folder_id:
         return []
     
     try:
         query = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
         result = drive_client.files().list(
             q=query, 
-            fields="files(id, name, webViewLink, mimeType)",
+            fields="files(id, name, webViewLink)",
             pageSize=20
         ).execute()
         
         files = result.get("files", [])
-        log.info(f"📁 Encontrados {len(files)} archivos PDF en Drive")
+        log.info(f"Encontrados {len(files)} PDFs")
         
         output = []
         for file in files:
             link = file.get("webViewLink", "")
-            # Si no hay link, intentar generarlo
             if not link:
-                try:
-                    file_meta = drive_client.files().get(
-                        fileId=file["id"], 
-                        fields="webViewLink"
-                    ).execute()
-                    link = file_meta.get("webViewLink", "")
-                except Exception:
-                    link = f"https://drive.google.com/file/d/{file['id']}/view"
+                link = f"https://drive.google.com/file/d/{file['id']}/view"
             
             output.append({
                 "id": file["id"],
                 "name": file["name"],
-                "webViewLink": link,
-                "mimeType": file.get("mimeType", "")
+                "webViewLink": link
             })
         
         return output
         
-    except HttpError as e:
-        log.error(f"❌ Error de API de Drive: {str(e)}")
-        return []
     except Exception as e:
-        log.exception(f"❌ Error listando manuales en Drive: {str(e)}")
+        log.error(f"Error listando manuales: {str(e)}")
         return []
 
 # =========================
-# RAG light (Auto) — CORREGIDO
+# RAG light (Auto)
 # =========================
 _manual_auto_cache = {"text": None, "file_id": None, "loaded_at": None}
 
 def _find_auto_manual_file_id() -> Optional[str]:
-    """Encuentra el archivo PDF del manual de auto - CORREGIDO"""
-    if not google_ready:
+    if not google_ready or not drive_client or not MANUALES_VICKY_FOLDER_ID:
         return None
     
     try:
         files = list_drive_manuals(MANUALES_VICKY_FOLDER_ID)
         if not files:
-            log.warning("❌ No se encontraron archivos PDF en el folder")
+            log.warning("No se encontraron PDFs")
             return None
         
-        # Priorizar nombres que sugieran auto/coberturas
-        auto_files = []
+        # Buscar archivo de auto
         for file in files:
             name = (file.get("name") or "").lower()
             if any(keyword in name for keyword in ["auto", "cobertura", "vehicular", "automovil"]):
-                auto_files.append(file)
+                log.info(f"Manual seleccionado: {file['name']}")
+                return file["id"]
         
-        target_file = auto_files[0] if auto_files else files[0]
-        log.info(f"✅ Manual de auto seleccionado: {target_file['name']}")
-        return target_file["id"]
+        # Usar el primero si no hay match
+        if files:
+            log.info(f"Usando primer PDF: {files[0]['name']}")
+            return files[0]["id"]
+        
+        return None
         
     except Exception as e:
-        log.exception(f"❌ Error buscando manual Auto: {str(e)}")
+        log.error(f"Error buscando manual: {str(e)}")
         return None
 
 def _download_pdf_text(file_id: str) -> Optional[str]:
-    """Descarga y extrae texto de PDF - CORREGIDO"""
-    if not google_ready:
+    if not google_ready or not drive_client:
         return None
     
     try:
@@ -445,55 +387,43 @@ def _download_pdf_text(file_id: str) -> Optional[str]:
         done = False
         while not done:
             status, done = downloader.next_chunk()
-            log.info(f"📥 Descargando PDF: {int(status.progress() * 100)}%")
         
         file_handle.seek(0)
         
-        # Extraer texto del PDF
+        # Extraer texto
         reader = PdfReader(file_handle)
         pages_text = []
         
-        for page_num, page in enumerate(reader.pages):
+        for page in reader.pages:
             try:
                 text = page.extract_text()
                 if text and text.strip():
-                    pages_text.append(f"--- Página {page_num + 1} ---\n{text.strip()}")
-            except Exception as page_error:
-                log.warning(f"Error en página {page_num + 1}: {str(page_error)}")
+                    pages_text.append(text.strip())
+            except Exception:
                 continue
         
         full_text = "\n\n".join(pages_text)
         
         if not full_text.strip():
-            log.warning("❌ PDF no contiene texto extraíble")
             return None
         
         # Limpiar texto
         full_text = re.sub(r'\s+', ' ', full_text)
-        full_text = re.sub(r'\n\s*\n', '\n\n', full_text)
-        
-        log.info(f"✅ PDF procesado: {len(full_text)} caracteres extraídos")
         return full_text.strip()
         
-    except HttpError as e:
-        log.error(f"❌ Error de Drive API descargando PDF: {str(e)}")
-        return None
     except Exception as e:
-        log.exception(f"❌ Error descargando/procesando PDF: {str(e)}")
+        log.error(f"Error procesando PDF: {str(e)}")
         return None
 
 def ensure_auto_manual_text(force_reload: bool = False) -> Optional[str]:
-    """Obtiene el texto del manual de auto, usando cache si está disponible"""
     if not client_oa:
         return None
     
-    # Verificar cache
     if not force_reload and _manual_auto_cache.get("text"):
         cache_age = datetime.utcnow() - _manual_auto_cache.get("loaded_at", datetime.utcnow())
-        if cache_age < timedelta(hours=24):  # Cache por 24 horas
+        if cache_age < timedelta(hours=24):
             return _manual_auto_cache["text"]
     
-    # Cargar nuevo
     file_id = _find_auto_manual_file_id()
     if not file_id:
         return None
@@ -505,18 +435,17 @@ def ensure_auto_manual_text(force_reload: bool = False) -> Optional[str]:
             "file_id": file_id, 
             "loaded_at": datetime.utcnow()
         })
-        log.info("✅ Manual de auto cacheado correctamente")
+        log.info("Manual cacheado")
     
     return text
 
 def answer_auto_from_manual(question: str) -> Optional[str]:
-    """Responde preguntas sobre seguros de auto usando RAG - CORREGIDO"""
     if not client_oa:
         return None
     
     manual_text = ensure_auto_manual_text()
     if not manual_text:
-        return "⚠️ No tengo acceso al manual de seguros en este momento. Por favor contacta al asesor para esta información."
+        return "⚠️ No tengo acceso al manual de seguros. Por favor contacta al asesor para información detallada."
     
     try:
         # Buscar secciones relevantes
@@ -527,42 +456,35 @@ def answer_auto_from_manual(question: str) -> Optional[str]:
             line_lower = line.lower()
             if any(keyword in line_lower for keyword in keywords):
                 relevant_sections.append(line.strip())
-            if len("\n".join(relevant_sections)) > 6000:  # Limitar tamaño
+            if len("\n".join(relevant_sections)) > 6000:
                 break
         
         context_text = "\n".join(relevant_sections) if relevant_sections else manual_text[:8000]
         
-        prompt = f"""Eres un asistente especializado en seguros de auto. Responde SOLO con base en la información del manual proporcionado.
+        prompt = f"""Responde sobre seguros de auto usando SOLO esta información:
 
-Pregunta del cliente: {question}
-
-Información del manual:
 {context_text}
 
-Instrucciones:
-- Responde de manera clara y profesional en español
-- Usa viñetas si ayuda a organizar la información  
-- Si la información no está en el manual, di claramente "No encuentro esta información específica en el manual"
-- Sé preciso con los términos de cobertura y exclusiones
+Pregunta: {question}
 
-Respuesta:"""
+Respuesta clara y concisa:"""
         
         response = client_oa.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,  # Baja temperatura para respuestas consistentes
+            temperature=0.1,
             max_tokens=800
         )
         
         answer = (response.choices[0].message.content or "").strip()
-        return answer if answer else "No pude generar una respuesta en este momento."
+        return answer if answer else "No pude encontrar información específica en el manual."
         
     except Exception as e:
-        log.exception(f"❌ Error en RAG-auto: {str(e)}")
-        return "⚠️ Ocurrió un error procesando tu consulta. Por favor intenta más tarde."
+        log.error(f"Error RAG: {str(e)}")
+        return "⚠️ Error procesando la consulta. Contacta al asesor."
 
 # =========================
-# Menú y flujos (sin cambios)
+# Menú y flujos
 # =========================
 MAIN_MENU = (
     "🟦 *Vicky Bot — SECOM*\n"
@@ -581,10 +503,6 @@ def send_main_menu(phone: str) -> None:
     send_message(phone, MAIN_MENU)
 
 def greet_with_match(phone: str, *, do_greet: bool = True) -> Optional[Dict[str, Any]]:
-    """
-    Saluda solo si no se saludó en la última ventana (24h).
-    Guarda el match en contexto para reutilizarlo.
-    """
     last10 = _normalize_last10(phone)
     match = sheet_match_by_last10(last10)
 
@@ -600,13 +518,225 @@ def greet_with_match(phone: str, *, do_greet: bool = True) -> Optional[Dict[str,
             send_message(phone, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
         greeted_at[phone] = now
 
-    # guarda en contexto
     ctx = ensure_ctx(phone)
     ctx["match"] = match
     return match
 
-# [Los flujos existentes se mantienen igual...]
-# flow_imss_info, flow_imss_next, flow_auto_start, etc.
+def flow_imss_info(phone: str, match: Optional[Dict[str, Any]]) -> None:
+    user_state[phone] = "imss_q1"
+    send_message(phone, "🟩 *Asesoría IMSS*\n¿Deseas conocer requisitos y cálculo aproximado? (sí/no)")
+
+def flow_imss_next(phone: str, text: str) -> None:
+    st = user_state.get(phone, "")
+    ctx = ensure_ctx(phone)
+
+    if st == "imss_q1":
+        yn = interpret_yesno(text)
+        if yn == "yes":
+            user_state[phone] = "imss_pension"
+            send_message(phone, "¿Cuál es tu *pensión mensual* aproximada? (ej. 8,500)")
+        elif yn == "no":
+            user_state[phone] = ""
+            send_message(phone, "Entendido. Escribe *menú* para ver más opciones.")
+        else:
+            send_message(phone, "¿Me confirmas con *sí* o *no*?")
+    elif st == "imss_pension":
+        p = extract_number(text)
+        if not p:
+            send_message(phone, "No pude leer el monto. Indica tu pensión mensual (ej. 8500).")
+            return
+        ctx["imss_pension"] = p
+        user_state[phone] = "imss_monto"
+        send_message(phone, "Gracias. ¿Qué *monto* te gustaría solicitar? (entre $10,000 y $650,000)")
+    elif st == "imss_monto":
+        m = extract_number(text)
+        if not m or m < 10000 or m > 650000:
+            send_message(phone, "Ingresa un monto entre $10,000 y $650,000.")
+            return
+        ctx["imss_monto"] = m
+        user_state[phone] = "imss_nombre"
+        send_message(phone, "¿Tu *nombre completo*?")
+    elif st == "imss_nombre":
+        ctx["imss_nombre"] = (text or "").strip()
+        user_state[phone] = "imss_ciudad"
+        send_message(phone, "¿En qué *ciudad* te encuentras?")
+    elif st == "imss_ciudad":
+        ctx["imss_ciudad"] = (text or "").strip()
+        user_state[phone] = "imss_nomina"
+        send_message(phone, "¿Tienes *nómina Inbursa*? (sí/no)\n*No es obligatoria; otorga beneficios adicionales.*")
+    elif st == "imss_nomina":
+        yn = interpret_yesno(text)
+        ctx["imss_nomina"] = ("sí" if yn == "yes" else "no")
+        resumen = (
+            "✅ *Preautorizado*. Un asesor te contactará.\n"
+            f"- Nombre: {ctx.get('imss_nombre','')}\n"
+            f"- Ciudad: {ctx.get('imss_ciudad','')}\n"
+            f"- Pensión: ${ctx.get('imss_pension',0):,.0f}\n"
+            f"- Monto deseado: ${ctx.get('imss_monto',0):,.0f}\n"
+            f"- Nómina Inbursa: {ctx.get('imss_nomina','no')}"
+        )
+        send_message(phone, resumen)
+        if NOTIFICAR_ASESOR:
+            formatted = (
+                "🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
+                f"Nombre: {ctx.get('imss_nombre','')}\n"
+                f"WhatsApp: {phone}\n"
+                f"Ciudad: {ctx.get('imss_ciudad','')}\n"
+                f"Monto solicitado: ${ctx.get('imss_monto',0):,.0f}\n"
+                f"Nómina Inbursa: {ctx.get('imss_nomina','no')}"
+            )
+            notify_advisor(formatted)
+        user_state[phone] = ""
+        send_main_menu(phone)
+
+def flow_auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
+    user_state[phone] = "auto_intro"
+    send_message(
+        phone,
+        "🚗 *Cotizador Auto*\nEnvíame:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas.\n"
+        "Si ya tienes póliza, dime la *fecha de vencimiento* (AAAA-MM-DD) para recordarte 30 días antes."
+    )
+
+def flow_auto_next(phone: str, text: str) -> None:
+    st = user_state.get(phone, "")
+    if st == "auto_intro":
+        if re.search(r"\d{4}-\d{2}-\d{2}", text or ""):
+            user_state[phone] = "auto_vto"
+            flow_auto_next(phone, text)
+        else:
+            send_message(phone, "Perfecto. Envía documentos o escribe la fecha de vencimiento (AAAA-MM-DD).")
+    elif st == "auto_vto":
+        try:
+            date = datetime.fromisoformat(text.strip()).date()
+            objetivo = date - timedelta(days=30)
+            send_message(phone, f"✅ Gracias. Te contactaré *un mes antes* ({objetivo.isoformat()}).")
+            def _reminder():
+                try:
+                    time.sleep(7 * 24 * 60 * 60)
+                    send_message(phone, "⏰ ¿Deseas que coticemos tu seguro al acercarse el vencimiento?")
+                except Exception:
+                    pass
+            threading.Thread(target=_reminder, daemon=True).start()
+            user_state[phone] = ""
+            send_main_menu(phone)
+        except Exception:
+            send_message(phone, "Formato inválido. Usa AAAA-MM-DD (ej. 2025-12-31).")
+
+def flow_vida_salud(phone: str) -> None:
+    send_message(phone, "🧬 *Seguros de Vida y Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.")
+    notify_advisor(f"🔔 Vida/Salud — Solicitud de contacto\nWhatsApp: {phone}")
+    send_main_menu(phone)
+
+def flow_vrim(phone: str) -> None:
+    send_message(phone, "🩺 *VRIM* — Membresía médica con cobertura amplia. Notificaré al asesor para darte detalles.")
+    notify_advisor(f"🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}")
+    send_main_menu(phone)
+
+def flow_prestamo_imss(phone: str, match: Optional[Dict[str, Any]]) -> None:
+    user_state[phone] = "imss_monto_directo"
+    send_message(phone, "🟩 *Préstamo IMSS (Ley 73)*\nIndica el *monto* deseado (entre $10,000 y $650,000).")
+
+def flow_prestamo_imss_next(phone: str, text: str) -> None:
+    st = user_state.get(phone, "")
+    ctx = ensure_ctx(phone)
+    if st == "imss_monto_directo":
+        m = extract_number(text)
+        if not m or m < 10000 or m > 650000:
+            send_message(phone, "Ingresa un monto entre $10,000 y $650,000.")
+            return
+        ctx["imss_monto"] = m
+        user_state[phone] = "imss_nombre_directo"
+        send_message(phone, "¿Tu *nombre completo*?")
+    elif st == "imss_nombre_directo":
+        ctx["imss_nombre"] = (text or "").strip()
+        user_state[phone] = "imss_ciudad_directo"
+        send_message(phone, "¿En qué *ciudad* te encuentras?")
+    elif st == "imss_ciudad_directo":
+        ctx["imss_ciudad"] = (text or "").strip()
+        user_state[phone] = "imss_nomina_directo"
+        send_message(phone, "¿Tienes *nómina Inbursa*? (sí/no)\n*No es obligatoria; da beneficios adicionales.*")
+    elif st == "imss_nomina_directo":
+        yn = interpret_yesno(text)
+        ctx["imss_nomina"] = ("sí" if yn == "yes" else "no")
+        resumen = (
+            "✅ *Preautorizado*. Un asesor te contactará.\n"
+            f"- Nombre: {ctx.get('imss_nombre','')}\n"
+            f"- Ciudad: {ctx.get('imss_ciudad','')}\n"
+            f"- Monto deseado: ${ctx.get('imss_monto',0):,.0f}\n"
+            f"- Nómina Inbursa: {ctx.get('imss_nomina','no')}"
+        )
+        send_message(phone, resumen)
+        if NOTIFICAR_ASESOR:
+            formatted = (
+                "🔔 NUEVO PROSPECTO – PRÉSTAMO IMSS\n"
+                f"Nombre: {ctx.get('imss_nombre','')}\n"
+                f"WhatsApp: {phone}\n"
+                f"Ciudad: {ctx.get('imss_ciudad','')}\n"
+                f"Monto solicitado: ${ctx.get('imss_monto',0):,.0f}\n"
+                f"Nómina Inbursa: {ctx.get('imss_nomina','no')}"
+            )
+            notify_advisor(formatted)
+        user_state[phone] = ""
+        send_main_menu(phone)
+
+def flow_empresarial(phone: str, match: Optional[Dict[str, Any]]) -> None:
+    user_state[phone] = "emp_confirma"
+    send_message(phone, "🟦 *Financiamiento Empresarial*\n¿Eres empresario(a) o representas una empresa? (sí/no)")
+
+def flow_empresarial_next(phone: str, text: str) -> None:
+    st = user_state.get(phone, "")
+    ctx = ensure_ctx(phone)
+    if st == "emp_confirma":
+        yn = interpret_yesno(text)
+        if yn != "yes":
+            send_message(phone, "Entendido. Si necesitas otra cosa, escribe *menú*.")
+            user_state[phone] = ""
+            return
+        user_state[phone] = "emp_giro"
+        send_message(phone, "¿A qué *se dedica* tu empresa?")
+    elif st == "emp_giro":
+        ctx["emp_giro"] = (text or "").strip()
+        user_state[phone] = "emp_monto"
+        send_message(phone, "¿Qué *monto* necesitas? (mínimo $100,000)")
+    elif st == "emp_monto":
+        m = extract_number(text)
+        if not m or m < 100000:
+            send_message(phone, "El monto mínimo es $100,000. Indica un monto igual o mayor.")
+            return
+        ctx["emp_monto"] = m
+        user_state[phone] = "emp_nombre"
+        send_message(phone, "¿Tu *nombre completo*?")
+    elif st == "emp_nombre":
+        ctx["emp_nombre"] = (text or "").strip()
+        user_state[phone] = "emp_ciudad"
+        send_message(phone, "¿Tu *ciudad*?")
+    elif st == "emp_ciudad":
+        ctx["emp_ciudad"] = (text or "").strip()
+        resumen = (
+            "✅ Gracias. Un asesor te contactará.\n"
+            f"- Nombre: {ctx.get('emp_nombre','')}\n"
+            f"- Ciudad: {ctx.get('emp_ciudad','')}\n"
+            f"- Giro: {ctx.get('emp_giro','')}\n"
+            f"- Monto: ${ctx.get('emp_monto',0):,.0f}"
+        )
+        send_message(phone, resumen)
+        if NOTIFICAR_ASESOR:
+            formatted = (
+                "🔔 NUEVO PROSPECTO – CRÉDITO EMPRESARIAL\n"
+                f"Nombre: {ctx.get('emp_nombre','')}\n"
+                f"Ciudad: {ctx.get('emp_ciudad','')}\n"
+                f"Monto solicitado: ${ctx.get('emp_monto',0):,.0f}\n"
+                f"Actividad: {ctx.get('emp_giro','')}\n"
+                f"WhatsApp: {phone}"
+            )
+            notify_advisor(formatted)
+        user_state[phone] = ""
+        send_main_menu(phone)
+
+def flow_contacto(phone: str) -> None:
+    send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
+    notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
+    send_main_menu(phone)
 
 # =========================
 # Router principal
@@ -614,17 +744,78 @@ def greet_with_match(phone: str, *, do_greet: bool = True) -> Optional[Dict[str,
 def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = (text or "").strip().lower()
 
-    # --- RAG light para preguntas de AUTO (coberturas) ---
-    if any(k in t for k in ["amplia plus", "amplia+", "cobertura", "coberturas", "cristales", "asistencia", "auto de reemplazo", "deducible"]):
+    # RAG para preguntas de auto
+    if any(k in t for k in ["amplia plus", "amplia+", "cobertura", "coberturas", "cristales", "asistencia", "auto de reemplazo"]):
         rag_ans = answer_auto_from_manual(text or t)
         if rag_ans:
             send_message(phone, rag_ans)
             return
-    
-    # [El resto del router se mantiene igual...]
+
+    if t in ("menu", "menú", "inicio", "hola"):
+        user_state[phone] = ""
+        send_main_menu(phone)
+        return
+
+    if t in ("1", "préstamo", "prestamo", "préstamo imss", "prestamo imss", "ley 73"):
+        flow_prestamo_imss(phone, match)
+        return
+    if t in ("2", "auto", "seguro auto", "cotización auto", "cotizacion auto"):
+        flow_auto_start(phone, match)
+        return
+    if t in ("3", "vida", "salud", "seguro de vida", "seguro de salud"):
+        flow_vida_salud(phone)
+        return
+    if t in ("4", "vrim", "membresía médica", "membresia medica"):
+        flow_vrim(phone)
+        return
+    if t in ("5", "asesoría imss", "asesoria imss", "imss", "pensión", "pension"):
+        flow_imss_info(phone, match)
+        return
+    if t in ("6", "financiamiento", "empresarial", "crédito empresarial", "credito empresarial"):
+        flow_empresarial(phone, match)
+        return
+    if t in ("7", "contactar", "asesor", "contactar con christian"):
+        flow_contacto(phone)
+        return
+
+    st = user_state.get(phone, "")
+    if st.startswith("imss_"):
+        if st in {"imss_q1", "imss_pension", "imss_monto", "imss_nombre", "imss_ciudad", "imss_nomina"}:
+            flow_imss_next(phone, text)
+        else:
+            flow_prestamo_imss_next(phone, text)
+        return
+    if st.startswith("auto_"):
+        flow_auto_next(phone, text)
+        return
+    if st.startswith("emp_"):
+        flow_empresarial_next(phone, text)
+        return
+
+    # Fallback GPT
+    if client_oa:
+        def _gpt_reply():
+            try:
+                prompt = (
+                    "Eres Vicky, una asistente amable y profesional. "
+                    "Responde en español, breve y con emojis si corresponde. "
+                    f"Mensaje del usuario: {text or ''}"
+                )
+                res = client_oa.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.4,
+                )
+                answer = (res.choices[0].message.content or "").strip()
+                send_message(phone, answer or "¿Te puedo ayudar con algo más? Escribe *menú*.")
+            except Exception:
+                send_main_menu(phone)
+        threading.Thread(target=_gpt_reply, daemon=True).start()
+    else:
+        send_message(phone, "No te entendí bien. Escribe *menú* para ver opciones.")
 
 # =========================
-# Webhook y endpoints - CORREGIDOS
+# Webhook
 # =========================
 @app.get("/webhook")
 def webhook_verify():
@@ -633,7 +824,6 @@ def webhook_verify():
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge", "")
         if mode == "subscribe" and token == VERIFY_TOKEN:
-            log.info("✅ Webhook verificado correctamente")
             return challenge, 200
     except Exception:
         log.exception("Error verificando webhook")
@@ -657,7 +847,6 @@ def webhook_receive():
 
         log.info(f"📱 Mensaje recibido de: {phone}")
         
-        # Saludo+match solo una vez por ventana
         if phone not in user_state:
             match = greet_with_match(phone, do_greet=True)
             user_state[phone] = ""
@@ -673,22 +862,6 @@ def webhook_receive():
             text = (msg["text"].get("body") or "").strip()
             log.info(f"💬 Texto recibido: {text}")
             
-            if text.lower().startswith("sgpt:") and client_oa:
-                prompt = text.split("sgpt:", 1)[1].strip()
-                def _gpt_direct():
-                    try:
-                        res = client_oa.chat.completions.create(
-                            model=OPENAI_MODEL,
-                            messages=[{"role": "user", "content": prompt}],
-                            temperature=0.3,
-                        )
-                        ans = (res.choices[0].message.content or "").strip()
-                        send_message(phone, ans or "Listo.")
-                    except Exception:
-                        send_message(phone, "Hubo un detalle al procesar tu solicitud.")
-                threading.Thread(target=_gpt_direct, daemon=True).start()
-                return jsonify({"ok": True}), 200
-
             route_command(phone, text, match)
             return jsonify({"ok": True}), 200
 
@@ -702,7 +875,7 @@ def webhook_receive():
         return jsonify({"ok": True}), 200
 
 # =========================
-# Endpoints de diagnóstico MEJORADOS
+# Endpoints auxiliares
 # =========================
 @app.get("/ext/health")
 def ext_health():
@@ -713,133 +886,28 @@ def ext_health():
         "google_ready": google_ready,
         "google_error": google_error,
         "openai_ready": bool(client_oa is not None),
-        "sheet_name": GOOGLE_SHEET_NAME,
-        "manuales_folder": bool(MANUALES_VICKY_FOLDER_ID),
-        "environment": os.getenv("RENDER", "development")
+        "sheet_configured": bool(GOOGLE_SHEET_ID),
+        "drive_configured": bool(MANUALES_VICKY_FOLDER_ID),
+        "variables_usadas": {
+            "SHEET_ID_SECOM": GOOGLE_SHEET_ID[:10] + "..." if GOOGLE_SHEET_ID else "No",
+            "SHEET_TITLE_SECOM": GOOGLE_SHEET_NAME,
+            "DRIVE_FOLDER_ID": MANUALES_VICKY_FOLDER_ID[:10] + "..." if MANUALES_VICKY_FOLDER_ID else "No"
+        }
     }), 200
-
-@app.get("/ext/diagnostico-google")
-def ext_diagnostico_google():
-    """Diagnóstico completo de Google Drive/Sheets - MEJORADO"""
-    diagnostico = {
-        "google_ready": google_ready,
-        "google_error": google_error,
-        "paso_1_credenciales": {
-            "tiene_credenciales_json": bool(GOOGLE_CREDENTIALS_JSON),
-            "longitud_credenciales": len(GOOGLE_CREDENTIALS_JSON) if GOOGLE_CREDENTIALS_JSON else 0,
-            "es_json_valido": False
-        },
-        "paso_2_clientes": {
-            "sheets_client": sheets_client is not None,
-            "drive_client": drive_client is not None
-        },
-        "paso_3_configuracion": {
-            "GOOGLE_SHEET_ID": bool(GOOGLE_SHEET_ID),
-            "GOOGLE_SHEET_NAME": GOOGLE_SHEET_NAME,
-            "MANUALES_VICKY_FOLDER_ID": bool(MANUALES_VICKY_FOLDER_ID)
-        },
-        "paso_4_prueba_sheets": "no_iniciado",
-        "paso_5_prueba_drive": "no_iniciado",
-        "paso_6_prueba_busqueda": "no_iniciado"
-    }
-    
-    # Validar JSON de credenciales
-    try:
-        if GOOGLE_CREDENTIALS_JSON:
-            json.loads(GOOGLE_CREDENTIALS_JSON)
-            diagnostico["paso_1_credenciales"]["es_json_valido"] = True
-    except Exception as e:
-        diagnostico["paso_1_credenciales"]["es_json_valido"] = False
-        diagnostico["paso_1_credenciales"]["error_json"] = str(e)
-    
-    # Probar Sheets
-    if sheets_client and GOOGLE_SHEET_ID:
-        try:
-            sh = sheets_client.open_by_key(GOOGLE_SHEET_ID)
-            ws = sh.worksheet(GOOGLE_SHEET_NAME)
-            rows = ws.get_all_values()
-            diagnostico["paso_4_prueba_sheets"] = f"✅ OK - {len(rows)} filas"
-            
-            # Probar búsqueda
-            test_phone = "5216681620521"
-            last10 = _normalize_last10(test_phone)
-            match = sheet_match_by_last10(last10)
-            diagnostico["paso_6_prueba_busqueda"] = f"✅ OK - Match: {bool(match)}"
-            
-        except Exception as e:
-            diagnostico["paso_4_prueba_sheets"] = f"❌ ERROR: {str(e)}"
-    
-    # Probar Drive
-    if drive_client and MANUALES_VICKY_FOLDER_ID:
-        try:
-            files = list_drive_manuals(MANUALES_VICKY_FOLDER_ID)
-            diagnostico["paso_5_prueba_drive"] = f"✅ OK - {len(files)} archivos"
-        except Exception as e:
-            diagnostico["paso_5_prueba_drive"] = f"❌ ERROR: {str(e)}"
-    
-    return jsonify(diagnostico)
-
-@app.get("/ext/reiniciar-google")
-def ext_reiniciar_google():
-    """Endpoint para reiniciar los servicios de Google"""
-    try:
-        global google_ready, google_error
-        success = initialize_google_services()
-        return jsonify({
-            "ok": success,
-            "google_ready": google_ready,
-            "google_error": google_error
-        }), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.get("/ext/manuales")
-def ext_manuales():
-    """Lista manuales disponibles en Drive"""
-    try:
-        files = list_drive_manuals(MANUALES_VICKY_FOLDER_ID)
-        return jsonify({
-            "ok": True, 
-            "count": len(files),
-            "files": files
-        }), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.get("/ext/test-rag")
-def ext_test_rag():
-    """Prueba el sistema RAG con una pregunta de ejemplo"""
-    try:
-        question = "¿Qué diferencia hay entre cobertura amplia y amplia plus?"
-        answer = answer_auto_from_manual(question)
-        return jsonify({
-            "ok": True,
-            "question": question,
-            "answer": answer,
-            "manual_loaded": bool(_manual_auto_cache.get("text"))
-        }), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.get("/health")
 def health():
-    return jsonify({
-        "status": "ok", 
-        "service": "Vicky Bot SECOM",
-        "version": "2.0.0",
-        "timestamp": datetime.utcnow().isoformat()
-    }), 200
+    return jsonify({"status": "ok", "service": "Vicky Bot SECOM"}), 200
 
 # =========================
 # Arranque local
 # =========================
 if __name__ == "__main__":
-    log.info("🚀 Iniciando Vicky Bot SECOM...")
-    log.info(f"📍 Puerto: {PORT}")
+    log.info(f"🚀 Vicky SECOM en puerto {PORT}")
     log.info(f"📱 WhatsApp: {bool(META_TOKEN and WABA_PHONE_ID)}")
     log.info(f"🔧 Google: {google_ready} - {google_error}")
     log.info(f"🤖 OpenAI: {bool(client_oa)}")
     log.info(f"📊 Sheets: {GOOGLE_SHEET_NAME}")
     log.info(f"📁 Drive: {bool(MANUALES_VICKY_FOLDER_ID)}")
-    
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
