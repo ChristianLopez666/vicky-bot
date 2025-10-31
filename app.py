@@ -809,6 +809,46 @@ def ext_health():
         "manuales_folder": bool(MANUALES_VICKY_FOLDER_ID),
     }), 200
 
+@app.get("/ext/diagnostico-google")
+def ext_diagnostico_google():
+    """Diagnóstico completo de Google Drive/Sheets"""
+    diagnostico = {
+        "paso_1_credenciales_basicas": {
+            "google_ready": google_ready,
+            "sheets_client": sheets_client is not None,
+            "drive_client": drive_client is not None
+        },
+        "paso_2_variables_entorno": {
+            "GOOGLE_SHEET_ID": bool(GOOGLE_SHEET_ID),
+            "GOOGLE_SHEET_NAME": bool(GOOGLE_SHEET_NAME),
+            "GOOGLE_CREDENTIALS_JSON": bool(GOOGLE_CREDENTIALS_JSON),
+            "MANUALES_VICKY_FOLDER_ID": bool(MANUALES_VICKY_FOLDER_ID)
+        },
+        "paso_3_prueba_sheets": "no_iniciado",
+        "paso_4_prueba_drive": "no_iniciado"
+    }
+    
+    # Paso 3: Probar Sheets
+    if sheets_client and GOOGLE_SHEET_ID:
+        try:
+            sh = sheets_client.open_by_key(GOOGLE_SHEET_ID)
+            ws = sh.worksheet(GOOGLE_SHEET_NAME)
+            rows = ws.get_all_values()
+            diagnostico["paso_3_prueba_sheets"] = f"✅ OK - {len(rows)} filas encontradas"
+        except Exception as e:
+            diagnostico["paso_3_prueba_sheets"] = f"❌ ERROR: {str(e)}"
+    
+    # Paso 4: Probar Drive
+    if drive_client and MANUALES_VICKY_FOLDER_ID:
+        try:
+            q = f"'{MANUALES_VICKY_FOLDER_ID}' in parents and mimeType='application/pdf'"
+            files = drive_client.files().list(q=q).execute()
+            diagnostico["paso_4_prueba_drive"] = f"✅ OK - {len(files.get('files', []))} PDFs encontrados"
+        except Exception as e:
+            diagnostico["paso_4_prueba_drive"] = f"❌ ERROR: {str(e)}"
+    
+    return jsonify(diagnostico)
+
 @app.post("/ext/test-send")
 def ext_test_send():
     try:
@@ -827,10 +867,10 @@ def ext_test_send():
 def ext_debug_notify():
     """Endpoint para probar notificaciones con diferentes números"""
     test_numbers = [
-        "5216682478005",  # Tu número actual
-        "5216681922865",  # El número de tu captura
-        "6682478005",     # Sin código de país
-        "6681922865"      # Sin código de país
+        "5216682478005",
+        "5216681922865", 
+        "6682478005",
+        "6681922865"
     ]
     
     results = {}
@@ -838,7 +878,7 @@ def ext_debug_notify():
         test_msg = f"🔧 TEST: Notificación a {num} - {datetime.now().strftime('%H:%M:%S')}"
         success = send_message(num, test_msg)
         results[num] = success
-        time.sleep(2)  # Espera entre envíos
+        time.sleep(2)
     
     return jsonify({"ok": True, "results": results})
 
@@ -863,3 +903,4 @@ if __name__ == "__main__":
     log.info(f"Google listo: {google_ready}")
     log.info(f"OpenAI listo: {bool(client_oa is not None)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
