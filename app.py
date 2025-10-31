@@ -791,6 +791,24 @@ def ext_test_send():
     except Exception as e:
         log.exception("Error en /ext/test-send")
         return jsonify({"ok": False, "error": str(e)}), 500
+        @app.route("/ext/debug-notify")
+def ext_debug_notify():
+    """Endpoint para probar notificaciones con diferentes números"""
+    test_numbers = [
+        "5216682478005",  # Tu número actual
+        "5216681922865",  # El número de tu captura
+        "6682478005",     # Sin código de país
+        "6681922865"      # Sin código de país
+    ]
+    
+    results = {}
+    for num in test_numbers:
+        test_msg = f"🔧 TEST: Notificación a {num} - {datetime.now().strftime('%H:%M:%S')}"
+        success = send_message(num, test_msg)
+        results[num] = success
+        time.sleep(2)  # Espera entre envíos
+    
+    return jsonify({"ok": True, "results": results})
 
 @app.get("/ext/manuales")
 def ext_manuales():
@@ -813,6 +831,7 @@ if __name__ == "__main__":
     log.info(f"Google listo: {google_ready}")
     log.info(f"OpenAI listo: {bool(client_oa is not None)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
 
 
