@@ -151,7 +151,6 @@ def notify_advisor(text: str) -> None:
     """Envía notificación al asesor usando send_message directamente - CORREGIDO"""
     if NOTIFICAR_ASESOR and ADVISOR_NUMBER:
         try:
-            # Usar send_message directamente como en app (4).py
             send_message(ADVISOR_NUMBER, text)
             log.info(f"✅ Notificación enviada al asesor: {ADVISOR_NUMBER}")
         except Exception:
@@ -183,54 +182,60 @@ def ensure_ctx(phone: str) -> Dict[str, Any]:
     return user_ctx[phone]
 
 # =========================
-# Google helpers - CORREGIDOS
+# Google helpers - MEJORADOS
 # =========================
 def sheet_match_by_last10(last10: str) -> Optional[Dict[str, Any]]:
+    """Busca en Google Sheets por los últimos 10 dígitos del teléfono - CORREGIDO"""
     if not (google_ready and sheets_client and GOOGLE_SHEET_ID and GOOGLE_SHEET_NAME):
         log.warning("Google no está listo para buscar en Sheets")
         return None
+    
     try:
         sh = sheets_client.open_by_key(GOOGLE_SHEET_ID)
         ws = sh.worksheet(GOOGLE_SHEET_NAME)
         rows = ws.get_all_values()
         
-        log.info(f"Buscando teléfono {last10} en {len(rows)} filas...")
+        log.info(f"🔍 Buscando teléfono {last10} en {len(rows)} filas...")
         
+        # Buscar en todas las filas
         for i, row in enumerate(rows, start=1):
-            if i == 1:  # Saltar encabezados
-                continue
-                
-            joined = " | ".join(row)
-            digits = re.sub(r"\D", "", joined)
+            # Convertir toda la fila a texto y extraer números
+            row_text = " | ".join(str(cell) for cell in row)
+            all_digits_in_row = re.sub(r"\D", "", row_text)
             
-            if last10 and last10 in digits:
+            # Buscar coincidencia exacta de los últimos 10 dígitos
+            if last10 and last10 in all_digits_in_row:
+                log.info(f"✅ Match encontrado en fila {i}")
+                
+                # Buscar nombre (primera columna con texto significativo)
                 nombre = ""
-                telefono = ""
-                
-                # Buscar nombre en columnas que probablemente contengan nombres
-                for c in row:
-                    if c and not re.search(r"\d", c) and len(c) > 3:
-                        nombre = c.strip()
+                for cell in row:
+                    cell_str = str(cell).strip()
+                    if (cell_str and len(cell_str) > 2 and 
+                        not re.search(r"\d", cell_str) and
+                        cell_str.lower() not in ['nombre', 'cliente', 'prospecto', 'teléfono', 'telefono']):
+                        nombre = cell_str
                         break
                 
-                # Buscar teléfono en columnas que probablemente contengan números
-                for c in row:
-                    if c and last10 in re.sub(r"\D", "", c):
-                        telefono = c.strip()
-                        break
+                # Si no encontramos nombre, usar primera columna no vacía
+                if not nombre:
+                    for cell in row:
+                        if str(cell).strip():
+                            nombre = str(cell).strip()
+                            break
                 
-                log.info(f"✅ Match encontrado: {nombre} - {telefono}")
                 return {
                     "row": i, 
-                    "nombre": nombre, 
-                    "telefono": telefono,
+                    "nombre": nombre or "Cliente",
+                    "telefono": last10,
                     "raw": row
                 }
         
-        log.info(f"❌ No se encontró match para {last10}")
+        log.warning(f"❌ No se encontró match para {last10}")
         return None
-    except Exception:
-        log.exception("Error leyendo Google Sheets")
+        
+    except Exception as e:
+        log.exception(f"Error leyendo Google Sheets: {str(e)}")
         return None
 
 def list_drive_manuals(folder_id: str) -> List[Dict[str, str]]:
@@ -707,30 +712,6 @@ def webhook_verify():
         log.exception("Error verificando webhook")
     return "Error", 403
 
-def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
-    if not META_TOKEN:
-        return None, None, None
-    try:
-        meta = requests.get(
-            f"https://graph.facebook.com/v20.0/{media_id}",
-            headers={"Authorization": f"Bearer {META_TOKEN}"},
-            timeout=WPP_TIMEOUT,
-        )
-        if meta.status_code != 200:
-            return None, None, None
-        mj = meta.json()
-        url = mj.get("url")
-        mime = mj.get("mime_type")
-        fname = mj.get("filename") or f"media_{media_id}"
-        if not url:
-            return None, None, None
-        binr = requests.get(url, headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=WPP_TIMEOUT)
-        if binr.status_code != 200:
-            return None, None, None
-        return binr.content, (mime or "application/octet-stream"), fname
-    except Exception:
-        return None, None, None
-
 @app.post("/webhook")
 def webhook_receive():
     try:
@@ -849,6 +830,43 @@ def ext_diagnostico_google():
     
     return jsonify(diagnostico)
 
+@app.get("/ext/debug-busqueda")
+def ext_debug_busqueda():
+    """Debug específico para la búsqueda en Sheets"""
+    test_number = "5216681620521"  # Tu número
+    last10 = _normalize_last10(test_number)
+    
+    debug_info = {
+        "numero_original": test_number,
+        "last10_buscado": last10,
+        "resultado": None
+    }
+    
+    if sheets_client and GOOGLE_SHEET_ID:
+        try:
+            sh = sheets_client.open_by_key(GOOGLE_SHEET_ID)
+            ws = sh.worksheet(GOOGLE_SHEET_NAME)
+            rows = ws.get_all_values()
+            
+            debug_info["total_filas"] = len(rows)
+            debug_info["primeras_filas"] = rows[:3]  # Muestra primeras filas
+            
+            # Buscar manualmente
+            for i, row in enumerate(rows):
+                row_text = " | ".join(str(cell) for cell in row)
+                if last10 in row_text:
+                    debug_info["resultado"] = {
+                        "fila": i + 1,
+                        "contenido": row,
+                        "texto_completo": row_text
+                    }
+                    break
+                    
+        except Exception as e:
+            debug_info["error"] = str(e)
+    
+    return jsonify(debug_info)
+
 @app.post("/ext/test-send")
 def ext_test_send():
     try:
@@ -903,4 +921,5 @@ if __name__ == "__main__":
     log.info(f"Google listo: {google_ready}")
     log.info(f"OpenAI listo: {bool(client_oa is not None)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
