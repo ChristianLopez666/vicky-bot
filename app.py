@@ -732,6 +732,13 @@ def webhook_receive():
         return jsonify({"ok": True}), 200
 
 # =========================
+# Ruta raíz para health checks de Render
+# =========================
+@app.route('/')
+def root():
+    return jsonify({"status": "online", "service": "Vicky Bot SECOM", "timestamp": datetime.utcnow().isoformat()}), 200
+
+# =========================
 # Endpoints auxiliares
 # =========================
 @app.get("/ext/health")
