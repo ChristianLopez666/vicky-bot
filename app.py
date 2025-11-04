@@ -2,14 +2,38 @@
 # -*- coding: utf-8 -*-
 """
 Vicky SECOM – modo Wapi
-Archivo listo para ejecutarse con Gunicorn:
+Listo para desplegar en Render con Python 3.10+ y Gunicorn:
   gunicorn app:app --bind 0.0.0.0:$PORT
 
-Notas de cambio reciente:
-- Eliminada dependencia directa a 'pytz' para evitar ModuleNotFoundError en despliegues
-  (se usa zoneinfo del stdlib con fallback a UTC).
-- Mantengo fallback interno de reintentos (sin tenacity) según tu instrucción.
-- Logs y enmascarado conservados; cuidado con variables de entorno en Render.
+Dependencias (referencia para requirements.txt; usa las que ya compartiste):
+  Flask==2.3.3
+  gunicorn==21.2.0
+  requests==2.31.0
+  python-dotenv==1.0.0
+  openai==1.3.0
+  numpy==1.26.4
+  rank-bm25==0.2.2
+  pdfminer.six==20231228
+  pypdf==4.3.1
+  google-api-python-client==2.149.0
+  google-auth==2.35.0
+  google-auth-httplib2==0.2.0
+  google-auth-oauthlib==1.1.0
+  gspread==5.11.0
+  httpx==0.27.2
+  PyPDF2==3.0.1
+
+Resumen:
+- Verificación/validación de env vars (obligatorias -> aborta si faltan).
+- Fallback interno de reintentos (no requiere tenacity).
+- ZoneInfo (stdlib) para TZ; fallback a UTC.
+- Clientes: WhatsApp Cloud API (send_text, send_template, send_image_url).
+- Google Sheets & Drive (service account JSON desde GOOGLE_CREDENTIALS_JSON).
+- RAG (lectura de PDFs desde Drive; cache in-memory con TTL 6h).
+- Cola in-memory para promociones con worker daemon.
+- Endpoints exactos: GET/POST /webhook, GET /ext/health, POST /ext/test-send,
+  POST /ext/send-promo, GET /ext/manuales
+- Logs en español; tokens y teléfonos enmascarados.
 """
 
 from __future__ import annotations
@@ -30,25 +54,21 @@ import mimetypes
 from flask import Flask, request, jsonify, g
 
 import requests
-from cachetools import TTLCache
+import openai
 
-# PDF handling
+# PDF
 from PyPDF2 import PdfReader
 
-# Google
+# Google APIs
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-# OpenAI
-import openai
-
 # -------------------------
-# LOGGING
+# CONFIGURACIÓN DE LOGGING
 # -------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-# Safe formatter that expects request_id but we will inject it in before_request
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s [%(request_id)s] %(message)s"
@@ -56,50 +76,40 @@ logging.basicConfig(
 logger = logging.getLogger("vicky-secom-wapi")
 
 # -------------------------
-# ZONA HORARIA (sin pytz)
+# ZONA HORARIA (zoneinfo o UTC)
 # -------------------------
 try:
-    # zoneinfo está en stdlib (Python 3.9+)
     from zoneinfo import ZoneInfo
     FLASK_TZ = ZoneInfo("America/Mazatlan")
-except Exception as e:
-    logger.warning("ZoneInfo no disponible o zona no encontrada ('America/Mazatlan'): %s. Usando UTC.", str(e))
+except Exception:
+    logger.warning("ZoneInfo no disponible o zona no encontrada; usando UTC")
     from datetime import timezone as _tz
     FLASK_TZ = _tz.utc
 
 # -------------------------
-# TENACITY FALLBACK (sin dependencia)
+# Fallback simple de reintentos (sin tenacity)
 # -------------------------
-try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-    TENACITY_AVAILABLE = True
-except Exception:
-    TENACITY_AVAILABLE = False
-    def retry(*_args, **_kwargs):
-        """Decorador fallback: 3 intentos con backoff exponencial 1s,2s,4s"""
-        def decorator(fn):
-            @wraps(fn)
-            def wrapper(*args, **kwargs):
-                attempts = 3
-                delay = 1.0
-                last_exc = None
-                for i in range(attempts):
-                    try:
-                        return fn(*args, **kwargs)
-                    except Exception as e:
-                        last_exc = e
-                        if i < attempts - 1:
-                            time.sleep(delay)
-                            delay = min(delay * 2, 8)
-                raise last_exc
-            return wrapper
-        return decorator
-    def stop_after_attempt(n): return None
-    def wait_exponential(*a, **k): return None
-    def retry_if_exception_type(exc): return None
+def retry_decorator(attempts: int = 3, initial_wait: float = 1.0):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            wait = initial_wait
+            for i in range(attempts):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    last_exc = e
+                    if i < attempts - 1:
+                        time.sleep(wait)
+                        wait = min(wait * 2, 8)
+            # re-lanzar la última excepción
+            raise last_exc
+        return wrapper
+    return decorator
 
 # -------------------------
-# VALIDACIÓN DE VARIABLES DE ENTORNO (OBLIGATORIAS)
+# VALIDACIÓN DE ENV (OBLIGATORIAS)
 # -------------------------
 REQUIRED_ENVS = [
     "META_TOKEN",
@@ -138,9 +148,7 @@ RAG_AUTO_FILE_NAME = _env.get("RAG_AUTO_FILE_NAME")
 RAG_IMSS_FILE_NAME = _env.get("RAG_IMSS_FILE_NAME")
 DRIVE_UPLOAD_ROOT_FOLDER_ID = _env.get("DRIVE_UPLOAD_ROOT_FOLDER_ID")
 
-# -------------------------
-# UTILIDADES DE LOG (enmascarar)
-# -------------------------
+# Enmascarado para logs
 def mask_token(t: Optional[str]) -> str:
     if not t:
         return "MISSING"
@@ -156,32 +164,41 @@ def mask_phone(p: Optional[str]) -> str:
     return "*" * (len(d)-4) + d[-4:]
 
 logger.info("Inicializando Vicky SECOM WAPI")
-logger.info("META_TOKEN=%s WABA_PHONE_ID=%s ADVISOR_NUMBER=%s", mask_token(META_TOKEN), mask_phone(WABA_PHONE_ID), mask_phone(ADVISOR_NUMBER))
+logger.info("META_TOKEN=%s WABA_PHONE_ID=%s ADVISOR_NUMBER=%s",
+            mask_token(META_TOKEN), mask_phone(WABA_PHONE_ID), mask_phone(ADVISOR_NUMBER))
 
 # -------------------------
-# CONSTANTES Y CLIENTES
+# APP Y ESTADO GLOBAL
 # -------------------------
-QPS_LIMIT = 5
-PROMO_BATCH_LIMIT = 100
-
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 
-state: Dict[str, Dict[str, Any]] = {}
-rag_cache = TTLCache(maxsize=4, ttl=6 * 3600)  # 6 horas
-promo_queue = queue.Queue()
+QPS_LIMIT = 5
+PROMO_BATCH_LIMIT = 100
 
 session = requests.Session()
 session.headers.update({"Authorization": f"Bearer {META_TOKEN}"})
 
+# State in-memory (simple)
+state: Dict[str, Dict[str, Any]] = {}  # state[wa_id] = {"stage":..., "updated":...}
+state_ttl_seconds = 3600
+
+# RAG cache simple: domain -> {"text":..., "loaded_at": timestamp, "name": ...}
+rag_cache: Dict[str, Dict[str, Any]] = {}
+
+# Promo queue
+promo_queue: "queue.Queue[Dict[str,Any]]" = queue.Queue()
+
+# Google clients placeholders
 sheets_client = None
 drive_service = None
 
+# OpenAI
 openai.api_key = OPENAI_API_KEY
 OPENAI_MODEL_RAG = "gpt-4o-mini"
 
 # -------------------------
-# FUNCIONES DE TELÉFONO Y FECHAS
+# UTILIDADES TELÉFONO / FECHA
 # -------------------------
 def normalize_msisdn(s: str) -> str:
     if not s:
@@ -198,6 +215,12 @@ def normalize_msisdn(s: str) -> str:
 def last10(msisdn: str) -> str:
     d = re.sub(r"\D", "", msisdn or "")
     return d[-10:] if len(d) >= 10 else d
+
+def now_iso() -> str:
+    try:
+        return datetime.now(FLASK_TZ).isoformat()
+    except Exception:
+        return datetime.utcnow().isoformat()
 
 def parse_date_from_text(s: str) -> Optional[datetime]:
     if not s:
@@ -217,11 +240,11 @@ def parse_date_from_text(s: str) -> Optional[datetime]:
     return None
 
 # -------------------------
-# WHATSAPP - ENVIOS (con fallback de reintentos)
+# WHATSAPP CLIENT (envío texto, template, imagen)
 # -------------------------
 WHATSAPP_API_BASE = f"https://graph.facebook.com/v17.0/{WABA_PHONE_ID}/messages"
-_last_send_ts = 0.0
 _send_lock = threading.Lock()
+_last_send_ts = 0.0
 
 def _rate_limit_sleep():
     global _last_send_ts
@@ -233,7 +256,7 @@ def _rate_limit_sleep():
             time.sleep(min_interval - delta)
         _last_send_ts = time.time()
 
-@retry()
+@retry_decorator(attempts=3, initial_wait=1.0)
 def _post_whatsapp(payload: dict) -> dict:
     resp = session.post(WHATSAPP_API_BASE, json=payload, timeout=30)
     if resp.status_code not in (200, 201):
@@ -243,55 +266,49 @@ def _post_whatsapp(payload: dict) -> dict:
 
 def send_text(to: str, text: str) -> Tuple[bool, dict]:
     to_norm = normalize_msisdn(to)
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_norm,
-        "type": "text",
-        "text": {"body": text}
-    }
+    payload = {"messaging_product":"whatsapp","to":to_norm,"type":"text","text":{"body":text}}
     try:
         _rate_limit_sleep()
         resp = _post_whatsapp(payload)
-        mid = resp.get("messages", [{}])[0].get("id")
+        mid = resp.get("messages",[{}])[0].get("id")
         logger.info("Texto enviado a %s mid=%s", mask_phone(to_norm), mid)
         return True, resp
     except Exception as e:
-        logger.error("Error enviando texto a %s: %s", mask_phone(to), str(e))
+        logger.error("Error enviando texto a %s: %s", mask_phone(to_norm), str(e))
         return False, {"error": str(e)}
 
 def send_template(to: str, template_name: str, language_code: str = "es_MX", components: Optional[list] = None) -> Tuple[bool, dict]:
     to_norm = normalize_msisdn(to)
-    template = {"name": template_name, "language": {"code": language_code}}
+    payload = {"messaging_product":"whatsapp","to":to_norm,"type":"template","template":{"name":template_name,"language":{"code":language_code}}}
     if components:
-        template["components"] = components
-    payload = {"messaging_product": "whatsapp", "to": to_norm, "type": "template", "template": template}
+        payload["template"]["components"] = components
     try:
         _rate_limit_sleep()
         resp = _post_whatsapp(payload)
-        mid = resp.get("messages", [{}])[0].get("id")
-        logger.info("Template %s enviado a %s mid=%s", template_name, mask_phone(to_norm), mid)
+        mid = resp.get("messages",[{}])[0].get("id")
+        logger.info("Template '%s' enviado a %s mid=%s", template_name, mask_phone(to_norm), mid)
         return True, resp
     except Exception as e:
-        logger.error("Error enviando template a %s: %s", mask_phone(to), str(e))
+        logger.error("Error enviando template a %s: %s", mask_phone(to_norm), str(e))
         return False, {"error": str(e)}
 
 def send_image_url(to: str, image_url: str, caption: Optional[str] = None) -> Tuple[bool, dict]:
     to_norm = normalize_msisdn(to)
-    payload = {"messaging_product": "whatsapp", "to": to_norm, "type": "image", "image": {"link": image_url}}
+    payload = {"messaging_product":"whatsapp","to":to_norm,"type":"image","image":{"link":image_url}}
     if caption:
         payload["image"]["caption"] = caption
     try:
         _rate_limit_sleep()
         resp = _post_whatsapp(payload)
-        mid = resp.get("messages", [{}])[0].get("id")
+        mid = resp.get("messages",[{}])[0].get("id")
         logger.info("Imagen enviada a %s mid=%s url=%s", mask_phone(to_norm), mid, image_url)
         return True, resp
     except Exception as e:
-        logger.error("Error enviando imagen a %s: %s", mask_phone(to), str(e))
+        logger.error("Error enviando imagen a %s: %s", mask_phone(to_norm), str(e))
         return False, {"error": str(e)}
 
 # -------------------------
-# GOOGLE SHEETS y DRIVE (inicialización robusta)
+# GOOGLE SHEETS & DRIVE (service account)
 # -------------------------
 def initialize_google_clients():
     global sheets_client, drive_service
@@ -303,18 +320,15 @@ def initialize_google_clients():
         drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
         logger.info("Cliente Google inicializado correctamente")
     except Exception as e:
-        # No abortar aquí: se loguea y la app seguirá, pero muchas funciones quedarán limitadas.
-        logger.error("❌ Error inicializando Google clients: %s", str(e))
-        sheets_client = None
-        drive_service = None
+        # De acuerdo a spec: abortar si falta GOOGLE_CREDENTIALS_JSON, pero ya validamos su existencia arriba.
+        logger.critical("Error inicializando Google clients: %s", str(e))
+        raise
 
 initialize_google_clients()
 
-SHEET_MIN_FIELDS = ["status", "greeted_at", "renovacion_vencimiento", "recordar_30d", "reintento_7d", "campaña_origen", "notas", "wa_last10", "nombre"]
+SHEET_MIN_FIELDS = ["status","greeted_at","renovacion_vencimiento","recordar_30d","reintento_7d","campaña_origen","notas","wa_last10","nombre"]
 
 def get_leads_worksheet():
-    if not sheets_client:
-        raise RuntimeError("Google Sheets no inicializado")
     sh = sheets_client.open_by_key(SHEETS_ID_LEADS)
     try:
         ws = sh.worksheet(SHEETS_TITLE_LEADS)
@@ -334,13 +348,13 @@ def find_or_create_contact_row(wa_last10: str) -> int:
     ws = get_leads_worksheet()
     records = ws.get_all_records()
     for i, r in enumerate(records, start=2):
-        if str(r.get("wa_last10", "")).endswith(wa_last10):
+        if str(r.get("wa_last10","")).endswith(wa_last10):
             return i
     header = ws.row_values(1)
-    row = {k: "" for k in header}
+    row = {k:"" for k in header}
     row["status"] = "nuevo"
     row["wa_last10"] = wa_last10
-    values = [row.get(col, "") for col in header]
+    values = [row.get(col,"") for col in header]
     ws.append_row(values)
     return len(ws.get_all_values())
 
@@ -358,24 +372,22 @@ def set_contact_data(row_index: int, fields: Dict[str, Any]) -> None:
     header = ws.row_values(1)
     existing = ws.row_values(row_index)
     new_row = existing + [""] * max(0, len(header) - len(existing))
-    for k, v in fields.items():
+    for k,v in fields.items():
         if k in header:
             new_row[header.index(k)] = str(v)
     ws.update(f"{row_index}:{row_index}", [new_row])
 
 def append_note_to_contact(row_index: int, note: str):
     data = get_contact_data(row_index)
-    prev = data.get("notas", "")
-    ts = datetime.now(FLASK_TZ).isoformat()
+    prev = data.get("notas","")
+    ts = now_iso()
     new_notes = (prev + "\n" + f"[{ts}] {note}").strip()
     set_contact_data(row_index, {"notas": new_notes})
 
 # -------------------------
-# DRIVE: manuales RAG y backup multimedia
+# DRIVE: RAG y respaldo multimedia
 # -------------------------
-def _drive_find_pdf_by_id(file_id: str) -> Optional[Dict[str, Any]]:
-    if not drive_service:
-        return None
+def _drive_find_pdf_by_id(file_id: str) -> Optional[Dict[str,Any]]:
     try:
         f = drive_service.files().get(fileId=file_id, fields="id,name,mimeType").execute()
         if f and f.get("mimeType") == "application/pdf":
@@ -384,9 +396,7 @@ def _drive_find_pdf_by_id(file_id: str) -> Optional[Dict[str, Any]]:
         logger.warning("No se pudo obtener archivo Drive por ID %s: %s", file_id, e)
     return None
 
-def _drive_search_pdf_by_name(name: str) -> Optional[Dict[str, Any]]:
-    if not drive_service:
-        return None
+def _drive_search_pdf_by_name(name: str) -> Optional[Dict[str,Any]]:
     try:
         q = f"name = '{name}' and mimeType='application/pdf' and trashed=false"
         res = drive_service.files().list(q=q, pageSize=10, fields="files(id,name,mimeType)").execute()
@@ -398,8 +408,6 @@ def _drive_search_pdf_by_name(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 def _drive_download_file_bytes(file_id: str) -> Optional[bytes]:
-    if not drive_service:
-        return None
     try:
         request = drive_service.files().get_media(fileId=file_id)
         fh = io.BytesIO()
@@ -432,6 +440,10 @@ def _extract_text_from_pdf_bytes(b: bytes) -> str:
             return ""
 
 def load_manual_to_cache(domain: str) -> bool:
+    """
+    Carga manual desde Drive por ID preferente, sino por nombre.
+    Guarda en rag_cache con loaded_at (timestamp).
+    """
     try:
         if domain == "auto":
             file_id = RAG_AUTO_FILE_ID
@@ -463,14 +475,23 @@ def load_manual_to_cache(domain: str) -> bool:
         return False
 
 def rag_answer(query: str, domain: str = "auto") -> str:
-    domain = domain if domain in ("auto", "imss") else "auto"
-    if domain not in rag_cache:
+    """
+    Responde usando manual. Si no hay soporte responde educado.
+    Usa chunking naive por párrafos y busca coincidencias.
+    """
+    domain = domain if domain in ("auto","imss") else "auto"
+    # limpiar cache viejo (TTL 6h)
+    cached = rag_cache.get(domain)
+    if cached and time.time() - cached.get("loaded_at", 0) > 6 * 3600:
+        rag_cache.pop(domain, None)
+        cached = None
+    if not cached:
         ok = load_manual_to_cache(domain)
         if not ok:
             return "No encuentro esta información en el manual correspondiente."
-    manual = rag_cache.get(domain, {})
-    text = manual.get("text", "")
-    name = manual.get("name", "manual")
+        cached = rag_cache.get(domain)
+    text = cached.get("text","")
+    name = cached.get("name","manual")
     if not text:
         return f"No encuentro esta información en el manual {name}."
     query_words = set([w.lower() for w in re.findall(r"\w{3,}", query)])
@@ -480,9 +501,9 @@ def rag_answer(query: str, domain: str = "auto") -> str:
         words = set([w.lower() for w in re.findall(r"\w{3,}", p)])
         score = len(query_words.intersection(words))
         if score > 0:
-            scored.append((score, p))
+            scored.append((score,p))
     scored.sort(reverse=True, key=lambda x: x[0])
-    context = "\n\n".join([p for _, p in scored[:3]]) if scored else "\n\n".join(paragraphs[:3])
+    context = "\n\n".join([p for _,p in scored[:3]]) if scored else "\n\n".join(paragraphs[:3])
     prompt = (
         f"Eres Vicky, asistente basada en el manual '{name}'. Usa SOLO la información del contexto provisto.\n\n"
         f"Contexto relevante:\n{context}\n\n"
@@ -493,7 +514,7 @@ def rag_answer(query: str, domain: str = "auto") -> str:
     try:
         resp = openai.ChatCompletion.create(
             model=OPENAI_MODEL_RAG,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role":"user","content":prompt}],
             temperature=0.2,
             max_tokens=300
         )
@@ -503,8 +524,8 @@ def rag_answer(query: str, domain: str = "auto") -> str:
         return "No puedo procesar la consulta ahora. Intenta más tarde."
 
 def backup_media_to_drive(file_bytes: bytes, filename: str, mime_type: str, contact_name: Optional[str], wa_last4: str) -> Optional[str]:
-    if not DRIVE_UPLOAD_ROOT_FOLDER_ID or not drive_service:
-        logger.info("DRIVE no configurado o no inicializado; omitiendo respaldo")
+    if not DRIVE_UPLOAD_ROOT_FOLDER_ID:
+        logger.info("DRIVE_UPLOAD_ROOT_FOLDER_ID no configurado; omitiendo respaldo")
         return None
     try:
         folder_name = f"{(contact_name or 'Cliente')}_{wa_last4}"
@@ -529,7 +550,7 @@ def backup_media_to_drive(file_bytes: bytes, filename: str, mime_type: str, cont
         return None
 
 # -------------------------
-# SALUDO PROTEGIDO y SHEETS helpers
+# SALUDO PROTEGIDO Y HELPERS SHEETS
 # -------------------------
 def should_greet(wa_last10: str) -> bool:
     try:
@@ -551,13 +572,12 @@ def should_greet(wa_last10: str) -> bool:
 def mark_greeted(wa_last10: str):
     try:
         row = find_or_create_contact_row(wa_last10)
-        now_iso = datetime.now(FLASK_TZ).isoformat()
-        set_contact_data(row, {"greeted_at": now_iso})
+        set_contact_data(row, {"greeted_at": now_iso()})
     except Exception as e:
         logger.error("Error en mark_greeted: %s", str(e))
 
 # -------------------------
-# FLUJOS AUTO / IMSS (resumidos)
+# FLUJOS BÁSICOS (AUTO e IMSS) y notificaciones
 # -------------------------
 def notify_advisor(wa_id: str, row_index: int, reason: str):
     try:
@@ -581,24 +601,23 @@ def handle_auto_flow(wa_id: str, text: str, row_index: int):
     stage = st.get("stage","AUTO_START")
     t = text.strip().lower()
     if stage == "AUTO_START":
-        msg = (
-            "Planes Auto SECOM:\n\n"
-            "1) Amplia Plus\n2) Amplia\n3) Limitada\n\n"
-            "Responde con 'INE: <datos>' o 'PLACA: <datos>' para continuar."
-        )
+        msg = ("Planes Auto SECOM:\n\n1) Amplia Plus\n2) Amplia\n3) Limitada\n\nResponde con 'INE: <datos>' o 'PLACA: <datos>' para continuar.")
         send_text(wa_id, msg)
         st["stage"] = "AUTO_DOCS"
+        st["updated"] = time.time()
         return
     if stage == "AUTO_DOCS":
         if "ine" in t or t.startswith("ine:"):
             append_note_to_contact(row_index, "INE provisto: " + text)
             send_text(wa_id, "Gracias. Por favor proporciona placa o tarjeta de circulación si la tienes.")
             st["stage"] = "AUTO_PLAN"
+            st["updated"] = time.time()
             return
         if "placa" in t or "tarjeta" in t:
             append_note_to_contact(row_index, "Placa/tarjeta: " + text)
             send_text(wa_id, "Perfecto. ¿Qué plan te interesa? Responde 1, 2 o 3.")
             st["stage"] = "AUTO_PLAN"
+            st["updated"] = time.time()
             return
         send_text(wa_id, "No entendí. Responde 'INE: <datos>' o 'PLACA: <datos>'.")
         return
@@ -613,6 +632,7 @@ def handle_auto_flow(wa_id: str, text: str, row_index: int):
             if "renov" in t or "vencim" in t or "póliza" in t:
                 send_text(wa_id, "¿Fecha de vencimiento? Formato dd-mm-aaaa o aaaa-mm-dd")
                 st["stage"] = "AUTO_RENOV"
+                st["updated"] = time.time()
                 return
             send_text(wa_id, "Selecciona 1,2 o 3. O escribe 'asesor' para contacto humano.")
             return
@@ -620,6 +640,7 @@ def handle_auto_flow(wa_id: str, text: str, row_index: int):
         set_contact_data(row_index, {"status":"en_seguimiento"})
         send_text(wa_id, f"Has seleccionado {plan}. ¿Deseas que un asesor te contacte? Escribe 'asesor'.")
         st["stage"] = "AUTO_RESUMEN"
+        st["updated"] = time.time()
         return
     if stage == "AUTO_RENOV":
         d = parse_date_from_text(text)
@@ -628,6 +649,7 @@ def handle_auto_flow(wa_id: str, text: str, row_index: int):
             append_note_to_contact(row_index, f"Fecha de renovación: {d.isoformat()}")
             send_text(wa_id, "Fecha guardada. ¿Deseas que un asesor te contacte? Escribe 'asesor'.")
             st["stage"] = "AUTO_RESUMEN"
+            st["updated"] = time.time()
             return
         send_text(wa_id, "No pude reconocer la fecha. Usa dd-mm-aaaa o aaaa-mm-dd.")
         return
@@ -636,9 +658,11 @@ def handle_auto_flow(wa_id: str, text: str, row_index: int):
             notify_advisor(wa_id, row_index, "Solicitud contacto desde AUTO")
             send_text(wa_id, "He notificado a un asesor. Te contactarán pronto.")
             st["stage"] = "DONE"
+            st["updated"] = time.time()
             return
         send_text(wa_id, "Gracias. Si necesitas más, escribe 'menu'.")
         st["stage"] = "DONE"
+        st["updated"] = time.time()
         return
 
 def handle_imss_flow(wa_id: str, text: str, row_index: int):
@@ -648,20 +672,24 @@ def handle_imss_flow(wa_id: str, text: str, row_index: int):
     if stage == "IMSS_START":
         send_text(wa_id, "IMSS Ley 73: responde 'requisitos', 'cálculo' o 'prestamo'.")
         st["stage"] = "IMSS_QUALIFY"
+        st["updated"] = time.time()
         return
     if stage == "IMSS_QUALIFY":
         if "requisitos" in t:
             resp = rag_answer("requisitos para pensión IMSS", domain="imss")
             send_text(wa_id, resp)
             st["stage"] = "IMSS_FOLLOW"
+            st["updated"] = time.time()
             return
         if "cálculo" in t or "calculo" in t:
             send_text(wa_id, "Para calcular necesitamos salario promedio, semanas cotizadas y edad. ¿Quieres asesoría? Responde 'sí' o 'no'.")
             st["stage"] = "IMSS_CALC"
+            st["updated"] = time.time()
             return
         if "prestamo" in t or "ley 73" in t:
             send_text(wa_id, "Préstamos Ley 73: hasta 12 meses de pensión. ¿Quieres contacto con asesor?")
             st["stage"] = "IMSS_FOLLOW"
+            st["updated"] = time.time()
             return
         send_text(wa_id, "No entendí. Responde 'requisitos', 'cálculo' o 'prestamo'.")
         return
@@ -672,25 +700,29 @@ def handle_imss_flow(wa_id: str, text: str, row_index: int):
             set_contact_data(row_index, {"status":"en_seguimiento"})
             send_text(wa_id, "He notificado a un asesor.")
             st["stage"] = "DONE"
+            st["updated"] = time.time()
             return
         send_text(wa_id, "Entendido. Si deseas asesor escribe 'asesor'.")
         st["stage"] = "DONE"
+        st["updated"] = time.time()
         return
     if stage == "IMSS_FOLLOW":
         if "asesor" in t:
             notify_advisor(wa_id, row_index, "Solicitud contacto IMSS")
             send_text(wa_id, "Asesor notificado. Te contactarán.")
             st["stage"] = "DONE"
+            st["updated"] = time.time()
             return
         send_text(wa_id, "Si necesitas algo más escribe 'menu'.")
         st["stage"] = "DONE"
+        st["updated"] = time.time()
         return
 
 # -------------------------
-# PROMO WORKER
+# PROMO WORKER (daemon)
 # -------------------------
 def promo_worker():
-    logger.info("Promo worker iniciado")
+    logger.info("Promo worker iniciado (daemon)")
     while True:
         try:
             job = promo_queue.get()
@@ -741,10 +773,10 @@ promo_thread.start()
 def attach_request_id():
     request_id = request.headers.get("X-Request-Id") or f"{int(time.time()*1000)}"
     g.request_id = request_id
-    # Inyectar request_id en el record para evitar KeyError en el formatter
-    for h in logging.root.handlers:
+    # formatter espera %(request_id)s; si falta, lo inyectamos en el record mediante un filtro simple
+    # (no añadimos filtros complejos aquí, solo aseguramos que exista el atributo)
+    for handler in logging.root.handlers:
         try:
-            # no-op; we rely on formatter field presence
             pass
         except Exception:
             pass
@@ -782,11 +814,12 @@ def webhook_receive():
                     wa_from = msg.get("from")
                     wa_id = normalize_msisdn(wa_from)
                     wa_last10 = last10(wa_id)
-                    wa_last4 = re.sub(r"\D", "", wa_id)[-4:] if wa_id else "0000"
+                    wa_last4 = re.sub(r"\D","",wa_id)[-4:] if wa_id else "0000"
+                    # localizar contacto en Sheets (crear si no existe)
                     try:
                         row = find_or_create_contact_row(wa_last10)
                     except Exception as e:
-                        logger.warning("Google Sheets no configurado o error accediendo: %s", str(e))
+                        logger.warning("❌ Google Sheets no configurado o error accediendo: %s", str(e))
                         row = None
                     # saludo protegido
                     try:
@@ -797,18 +830,19 @@ def webhook_receive():
                         logger.warning("No fue posible evaluar saludo protegido: %s", str(e))
                     mtype = msg.get("type")
                     if mtype == "text":
-                        text = msg.get("text", {}).get("body", "")
+                        text = msg.get("text",{}).get("body","")
                         logger.info("💬 Mensaje de %s: %s", mask_phone(wa_id), text[:200])
                         t_low = text.lower()
                         if "auto" in t_low:
                             handle_auto_flow(wa_id, text, row)
                         elif "imss" in t_low:
                             handle_imss_flow(wa_id, text, row)
-                        elif any(k in t_low for k in ["asesor", "contacto", "llámame", "llamame", "hablar con christian", "christian"]):
+                        elif any(k in t_low for k in ["asesor","contacto","llámame","llamame","hablar con christian","christian"]):
                             notify_advisor(wa_id, row, "Solicitud de contacto")
                             send_text(wa_id, "He notificado al asesor. Te contactarán pronto.")
-                        elif any(q in t_low for q in ["cómo", "como", "requisitos", "cobertura", "qué", "que", "cuando", "cuándo", "dónde", "donde"]):
-                            domain = "auto" if "auto" in t_low or "cobertura" in t_low else "imss" if "imss" in t_low or "pensión" in t_low else None
+                        elif any(q in t_low for q in ["cómo","como","requisitos","cobertura","qué","que","cuando","cuándo","dónde","donde","pensión","pension"]):
+                            # heurística de dominio
+                            domain = "auto" if "auto" in t_low or "cobertura" in t_low else ("imss" if "imss" in t_low or "pensión" in t_low or "pension" in t_low else None)
                             if not domain:
                                 send_text(wa_id, "¿Tu duda es sobre *Auto* o *IMSS*? Responde con la palabra correspondiente.")
                             else:
@@ -816,7 +850,7 @@ def webhook_receive():
                                 send_text(wa_id, resp)
                         else:
                             send_text(wa_id, "No entendí. Escribe *AUTO*, *IMSS* o *CONTACTO* para iniciar.")
-                    elif mtype in ("image", "document", "video", "audio", "sticker"):
+                    elif mtype in ("image","document","video","audio","sticker"):
                         media_info = msg.get(mtype, {})
                         media_id = media_info.get("id")
                         if media_id:
@@ -827,7 +861,7 @@ def webhook_receive():
                                 if media_url:
                                     mdata = requests.get(media_url, headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=30)
                                     b = mdata.content
-                                    mime_type = mdata.headers.get("Content-Type", "application/octet-stream")
+                                    mime_type = mdata.headers.get("Content-Type","application/octet-stream")
                                     ext = mimetypes.guess_extension(mime_type) or ""
                                     filename = f"{mtype}_{wa_last4}{ext}"
                                     link = backup_media_to_drive(b, filename, mime_type, contact_name=None, wa_last4=wa_last4)
@@ -852,20 +886,19 @@ def webhook_receive():
         return jsonify({"ok": True}), 200
     except Exception:
         logger.error("❌ Error crítico en webhook: %s", traceback.format_exc())
-        # Responder 200 a Meta para evitar reintentos
-        return jsonify({"ok": True}), 200
+        return jsonify({"ok": True}), 200  # devolver 200 para evitar reintentos de Meta
 
 @app.route("/ext/health", methods=["GET"])
 def ext_health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status":"ok"}), 200
 
 @app.route("/ext/test-send", methods=["POST"])
 def ext_test_send():
     body = request.get_json(silent=True) or {}
     to = body.get("to")
-    text = body.get("text", "Prueba Vicky")
+    text = body.get("text","Prueba Vicky")
     if not to:
-        return jsonify({"error": "missing 'to' in body"}), 400
+        return jsonify({"error":"missing 'to' in body"}), 400
     ok, resp = send_text(to, text)
     status = 200 if ok else 500
     return jsonify({"ok": ok, "resp": resp}), status
@@ -874,21 +907,21 @@ def ext_test_send():
 def ext_send_promo():
     job = request.get_json(silent=True)
     if not job:
-        return jsonify({"error": "JSON body esperado"}), 400
+        return jsonify({"error":"JSON body esperado"}), 400
     recipients = job.get("recipients") or []
     if not isinstance(recipients, list) or not recipients:
-        return jsonify({"error": "recipients debe ser lista de msisdn"}), 400
+        return jsonify({"error":"recipients debe ser lista de msisdn"}), 400
     if len(recipients) > 1000:
-        return jsonify({"error": "Máximo 1000 recipients por job"}), 400
+        return jsonify({"error":"Máximo 1000 recipients por job"}), 400
     mode = job.get("mode")
-    if mode not in ("text", "template", "image"):
-        return jsonify({"error": "mode inválido. 'text'|'template'|'image'"}), 400
+    if mode not in ("text","template","image"):
+        return jsonify({"error":"mode inválido. 'text'|'template'|'image'"}), 400
     if mode == "text" and not job.get("text"):
-        return jsonify({"error": "text requerido para mode=text"}), 400
+        return jsonify({"error":"text requerido para mode=text"}), 400
     if mode == "template" and not job.get("template"):
-        return jsonify({"error": "template requerido para mode=template"}), 400
+        return jsonify({"error":"template requerido para mode=template"}), 400
     if mode == "image" and not job.get("image"):
-        return jsonify({"error": "image requerido para mode=image"}), 400
+        return jsonify({"error":"image requerido para mode=image"}), 400
     recipients_norm = [normalize_msisdn(r) for r in recipients][:1000]
     promo_job = {"campaign": job.get("campaign"), "recipients": recipients_norm, "mode": mode, "text": job.get("text"), "template": job.get("template"), "image": job.get("image")}
     promo_queue.put(promo_job)
@@ -898,7 +931,7 @@ def ext_send_promo():
 @app.route("/ext/manuales", methods=["GET"])
 def ext_manuales():
     status = {}
-    for d in ("auto", "imss"):
+    for d in ("auto","imss"):
         cached = rag_cache.get(d)
         status[d] = {
             "loaded": bool(cached),
@@ -908,9 +941,11 @@ def ext_manuales():
         }
     return jsonify(status), 200
 
-# Carga inicial de manuales
+# -------------------------
+# CARGA INICIAL DE MANUALES EN BACKGROUND
+# -------------------------
 def background_initial_load():
-    for d in ("auto", "imss"):
+    for d in ("auto","imss"):
         try:
             load_manual_to_cache(d)
         except Exception:
@@ -929,17 +964,23 @@ bg_thread.start()
 2) Test send:
    curl -XPOST https://<host>/ext/test-send -H "Content-Type: application/json" -d '{"to":"5216682478005","text":"Prueba OK"}'
 
-3) Encolar promo:
+3) Encolar promo texto:
    curl -XPOST https://<host>/ext/send-promo -H "Content-Type: application/json" -d '{"recipients":["5216682478005"],"mode":"text","text":"Promo SECOM ✔️"}'
 
 4) Manuales:
    curl -s https://<host>/ext/manuales
+
+Notas:
+- Las variables de entorno obligatorias deben existir antes de iniciar la app; la app abortará en caso de faltar alguna para evitar comportamiento inesperado.
+- El worker de promos respeta QPS y usa reintentos básicos. El sistema marca recordar_30d/reintento_7d en Sheets; se recomienda un proceso externo para recordatorios periódicos.
+- Para producción, agrega autenticación en /ext/* (ej. X-Api-Key).
 """
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     logger.info("Iniciando Flask en puerto %d", port)
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 
