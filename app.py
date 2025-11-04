@@ -2,36 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 Vicky SECOM – modo Wapi
-Archivo listo para ejecutar en Render con:
+Archivo listo para ejecutar con Gunicorn:
   gunicorn app:app --bind 0.0.0.0:$PORT
 
-Dependencias (referencia para requirements.txt, ajustar según tu entorno):
-  Flask==2.3.3
-  gunicorn==21.2.0
-  requests==2.31.0
-  python-dotenv==1.0.0
-  openai==1.3.0
-  numpy==1.26.4
-  rank-bm25==0.2.2
-  pdfminer.six==20231228
-  pypdf==4.3.1
-  google-api-python-client==2.149.0
-  google-auth==2.35.0
-  google-auth-httplib2==0.2.0
-  google-auth-oauthlib==1.1.0
-  gspread==5.11.0
-  httpx==0.27.2
-  PyPDF2==3.0.1
-
-Descripción:
-- Implementación robusta y tolerante a entornos incompletos: si faltan variables de entorno
-  o servicios (Google, WhatsApp, OpenAI) la app sigue levantando y ofrece respuestas básicas.
-- Logs en español; tokens y teléfonos enmascarados.
-- Endpoints exactos requeridos: GET/POST /webhook, GET /ext/health, POST /ext/test-send,
-  POST /ext/send-promo, GET /ext/manuales
-- Cola in-memory para promociones con worker daemon.
-- RAG (lectura PDF desde Drive) con cache TTL 6h (simple dict).
-- Nota: para funcionalidad completa configure todas las env vars obligatorias en Render.
+Notas:
+- Se aplicaron correcciones solicitadas:
+  1) OpenAI 1.x (client = OpenAI(api_key=...)) y uso en rag_answer(...)
+  2) RequestIdFilter seguro para hilos (no accede a flask.g fuera de contexto)
+  3) find_contact_row_by_last10() implementada; webhook usa búsqueda sin crear fila de inmediato
+  4) handle_imss_flow() aclara que la nómina NO es obligatoria y añade mensaje "pre-autorizado" antes de notificar asesor
+- No se agregaron endpoints ni se cambió la firma de los existentes.
 """
 
 from __future__ import annotations
@@ -52,12 +32,14 @@ import mimetypes
 from flask import Flask, request, jsonify, g
 
 import requests
-import openai
 
-# PDF extraction (PyPDF2 is in requirements)
+# OpenAI 1.x client
+from openai import OpenAI
+
+# PDF extraction (PyPDF2)
 from PyPDF2 import PdfReader
 
-# Google APIs (may raise if not installed in environment)
+# Google APIs (may be unavailable if not installed)
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -68,14 +50,18 @@ except Exception:
     GOOGLE_LIBS_AVAILABLE = False
 
 # -------------------------
-# LOGGING - safe request_id injection
+# LOGGING (RequestIdFilter safe for threads)
 # -------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 class RequestIdFilter(logging.Filter):
     def filter(self, record):
-        if not hasattr(record, "request_id"):
-            record.request_id = getattr(g, "request_id", "no-rid")
+        try:
+            # access flask.g safely (may raise outside app context)
+            from flask import g as _g
+            record.request_id = getattr(_g, "request_id", "no-rid")
+        except Exception:
+            record.request_id = "no-rid"
         return True
 
 logging.basicConfig(
@@ -86,10 +72,10 @@ logger = logging.getLogger("vicky-secom-wapi")
 logger.addFilter(RequestIdFilter())
 
 # -------------------------
-# TIMEZONE (zoneinfo fallback)
+# TZ (zoneinfo fallback)
 # -------------------------
 try:
-    from zoneinfo import ZoneInfo
+    from zoneinfo import ZoneInfo  # Python 3.9+
     FLASK_TZ = ZoneInfo("America/Mazatlan")
 except Exception:
     logger.warning("ZoneInfo no disponible o zona no encontrada; usando UTC")
@@ -97,7 +83,7 @@ except Exception:
     FLASK_TZ = _tz.utc
 
 # -------------------------
-# SIMPLE RETRY DECORATOR (fallback en lugar de tenacity)
+# RETRY DECORATOR (simple fallback)
 # -------------------------
 def retry_decorator(attempts: int = 3, initial_wait: float = 1.0):
     def deco(fn):
@@ -118,7 +104,7 @@ def retry_decorator(attempts: int = 3, initial_wait: float = 1.0):
     return deco
 
 # -------------------------
-# ENVIRONMENT CONFIG (non-fatal validation)
+# ENV VARS
 # -------------------------
 REQUIRED_ENVS = [
     "META_TOKEN",
@@ -132,15 +118,12 @@ REQUIRED_ENVS = [
 ]
 
 env = os.environ.copy()
-missing_envs = [k for k in REQUIRED_ENVS if not env.get(k)]
-if missing_envs:
-    # Log clearly but DO NOT abort; run in degraded mode so server starts.
-    for k in missing_envs:
+_missing = [k for k in REQUIRED_ENVS if not env.get(k)]
+if _missing:
+    # Log clearly but continue in degraded mode; user requested file-level changes only
+    for k in _missing:
         logger.warning("Variable de entorno obligatoria NO configurada: %s", k)
-else:
-    logger.info("Todas las env vars obligatorias parecen presentes (verifica en Render).")
 
-# Load envs (may be None)
 META_TOKEN = env.get("META_TOKEN")
 WABA_PHONE_ID = env.get("WABA_PHONE_ID")
 VERIFY_TOKEN = env.get("VERIFY_TOKEN")
@@ -158,12 +141,10 @@ RAG_AUTO_FILE_NAME = env.get("RAG_AUTO_FILE_NAME")
 RAG_IMSS_FILE_NAME = env.get("RAG_IMSS_FILE_NAME")
 DRIVE_UPLOAD_ROOT_FOLDER_ID = env.get("DRIVE_UPLOAD_ROOT_FOLDER_ID")
 
-# Flags for enabled services
 WHATSAPP_ENABLED = bool(META_TOKEN and WABA_PHONE_ID)
 GOOGLE_ENABLED = bool(GOOGLE_LIBS_AVAILABLE and GOOGLE_CREDENTIALS_JSON and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS)
 OPENAI_ENABLED = bool(OPENAI_API_KEY)
 
-# Masking utils for logs
 def mask_token(t: Optional[str]) -> str:
     if not t: return "MISSING"
     s = str(t)
@@ -176,9 +157,21 @@ def mask_phone(p: Optional[str]) -> str:
         return "*" * max(0, len(d)-1) + d[-1:]
     return "*" * (len(d)-4) + d[-4:]
 
-logger.info("Arrancando Vicky SECOM WAPI (modo degradado si falta configuración)")
-logger.info("WHATSAPP_ENABLED=%s GOOGLE_ENABLED=%s OPENAI_ENABLED=%s", WHATSAPP_ENABLED, GOOGLE_ENABLED, OPENAI_ENABLED)
-logger.debug("WABA_PHONE_ID=%s META_TOKEN=%s", mask_phone(WABA_PHONE_ID), mask_token(META_TOKEN))
+logger.info("Vicky SECOM WAPI init - WHATSAPP_ENABLED=%s GOOGLE_ENABLED=%s OPENAI_ENABLED=%s",
+            WHATSAPP_ENABLED, GOOGLE_ENABLED, OPENAI_ENABLED)
+
+# -------------------------
+# OpenAI 1.x client (per instruction)
+# -------------------------
+client: Optional[OpenAI] = None
+OPENAI_MODEL_RAG = "gpt-4o-mini"
+if OPENAI_ENABLED:
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        logger.info("Cliente OpenAI inicializado (1.x)")
+    except Exception as e:
+        logger.error("Error inicializando cliente OpenAI: %s", str(e))
+        client = None
 
 # -------------------------
 # APP, STATE, CACHE, QUEUE
@@ -193,30 +186,21 @@ session = requests.Session()
 if META_TOKEN:
     session.headers.update({"Authorization": f"Bearer {META_TOKEN}"})
 
-state: Dict[str, Dict[str, Any]] = {}  # ephemeral in-memory state per wa_id
-state_ttl_seconds = 3600
-
-# Simple rag cache with TTL
-rag_cache: Dict[str, Dict[str, Any]] = {}  # domain -> {"text":..., "loaded_at":..., "name":...}
+state: Dict[str, Dict[str, Any]] = {}
 RAG_TTL_SECONDS = 6 * 3600
-
+rag_cache: Dict[str, Dict[str, Any]] = {}
 promo_queue = queue.Queue()
 
 # Google clients placeholders
 sheets_client = None
 drive_service = None
 
-# OpenAI client init
-if OPENAI_ENABLED:
-    openai.api_key = OPENAI_API_KEY
-
-OPENAI_MODEL_RAG = "gpt-4o-mini"
-
 # -------------------------
 # PHONE / DATE HELPERS
 # -------------------------
 def normalize_msisdn(s: str) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     digits = re.sub(r"\D", "", s)
     if digits.startswith("521") and len(digits) == 13:
         return digits
@@ -253,7 +237,7 @@ def parse_date_from_text(s: str) -> Optional[datetime]:
     return None
 
 # -------------------------
-# WHATSAPP SENDER (tolerant if not configured)
+# WHATSAPP SENDER
 # -------------------------
 WHATSAPP_API_BASE = f"https://graph.facebook.com/v17.0/{WABA_PHONE_ID}/messages" if WABA_PHONE_ID else None
 _send_lock = threading.Lock()
@@ -332,7 +316,7 @@ def send_image_url(to: str, image_url: str, caption: Optional[str] = None) -> Tu
         return False, {"error": str(e)}
 
 # -------------------------
-# GOOGLE SHEETS & DRIVE helpers (graceful when disabled)
+# GOOGLE SHEETS & DRIVE (graceful)
 # -------------------------
 def initialize_google_clients():
     global sheets_client, drive_service, GOOGLE_ENABLED
@@ -358,7 +342,6 @@ def initialize_google_clients():
         drive_service = None
         GOOGLE_ENABLED = False
 
-# Initialize once at startup (non-fatal)
 initialize_google_clients()
 
 SHEET_MIN_FIELDS = ["status","greeted_at","renovacion_vencimiento","recordar_30d","reintento_7d","campaña_origen","notas","wa_last10","nombre"]
@@ -382,6 +365,7 @@ def get_leads_worksheet():
     return ws
 
 def find_or_create_contact_row(wa_last10: str) -> int:
+    """Crea fila si no existe (uso cuando el usuario entra al flujo)."""
     ws = get_leads_worksheet()
     records = ws.get_all_records()
     for i, r in enumerate(records, start=2):
@@ -394,6 +378,22 @@ def find_or_create_contact_row(wa_last10: str) -> int:
     values = [row.get(col,"") for col in header]
     ws.append_row(values)
     return len(ws.get_all_values())
+
+def find_contact_row_by_last10(wa_last10: str) -> Optional[int]:
+    """BÚSQUEDA sin crear fila (uso en webhook para mensaje de cortesía)."""
+    ws = get_leads_worksheet()
+    records = ws.get_all_records()
+    for i, r in enumerate(records, start=2):
+        if str(r.get("wa_last10","")).endswith(wa_last10):
+            return i
+    return None
+
+def find_or_create_contact_row_safe(wa_last10: str) -> Optional[int]:
+    try:
+        return find_or_create_contact_row(wa_last10)
+    except Exception as e:
+        logger.warning("No fue posible crear fila en Sheets: %s", str(e))
+        return None
 
 def get_contact_data(row_index: int) -> Dict[str, Any]:
     ws = get_leads_worksheet()
@@ -425,7 +425,7 @@ def append_note_to_contact(row_index: int, note: str):
         logger.warning("No fue posible agregar nota en Sheets: %s", str(e))
 
 # -------------------------
-# DRIVE helpers for RAG and media backup
+# DRIVE: manuales RAG y backup multimedia
 # -------------------------
 def _drive_find_pdf_by_id(file_id: str) -> Optional[Dict[str,Any]]:
     if not GOOGLE_ENABLED or not drive_service:
@@ -517,8 +517,10 @@ def load_manual_to_cache(domain: str) -> bool:
         return False
 
 def rag_answer(query: str, domain: str = "auto") -> str:
+    """
+    Usa OpenAI 1.x client (client.chat.completions.create) para responder con contexto del manual.
+    """
     domain = domain if domain in ("auto","imss") else "auto"
-    # TTL enforcement
     cached = rag_cache.get(domain)
     if cached and time.time() - cached.get("loaded_at", 0) > RAG_TTL_SECONDS:
         rag_cache.pop(domain, None)
@@ -532,14 +534,15 @@ def rag_answer(query: str, domain: str = "auto") -> str:
     name = cached.get("name","manual")
     if not text:
         return f"No encuentro esta información en el manual {name}."
-    query_words = set([w.lower() for w in re.findall(r"\w{3,}", query)])
+    # simple chunking and scoring
+    query_words = set([w.lower() for w in re.findall(r"\w{3,}", query or "")])
     paragraphs = [p.strip() for p in re.split(r"\n{1,}", text) if p.strip()]
     scored = []
     for p in paragraphs:
         words = set([w.lower() for w in re.findall(r"\w{3,}", p)])
         score = len(query_words.intersection(words))
         if score > 0:
-            scored.append((score,p))
+            scored.append((score, p))
     scored.sort(reverse=True, key=lambda x: x[0])
     context = "\n\n".join([p for _,p in scored[:3]]) if scored else "\n\n".join(paragraphs[:3])
     prompt = (
@@ -549,21 +552,25 @@ def rag_answer(query: str, domain: str = "auto") -> str:
         "Si la respuesta no está en el contexto, responde exactamente: 'No encuentro esta información en el manual correspondiente.'\n"
         f"Al final agrega: 'Esta info proviene del manual {name}'. Responde en español, breve y clara."
     )
-    if not OPENAI_ENABLED:
-        logger.info("OpenAI no configurado; RAG devolviendo fallback")
+    if not client:
+        logger.info("OpenAI client no disponible; RAG devolviendo fallback")
         return "No puedo consultar el manual en este momento (servicio de IA no configurado)."
     try:
-        resp = openai.ChatCompletion.create(
+        resp = client.chat.completions.create(
             model=OPENAI_MODEL_RAG,
-            messages=[{"role":"user","content":prompt}],
+            messages=[{"role":"user","content": prompt}],
             temperature=0.2,
             max_tokens=300
         )
-        return (resp.choices[0].message.content or "").strip()
+        answer = (resp.choices[0].message.content or "").strip()
+        return answer
     except Exception as e:
         logger.error("Error llamando OpenAI para RAG: %s", str(e))
         return "No puedo procesar la consulta ahora. Intenta más tarde."
 
+# -------------------------
+# BACKUP MEDIA TO DRIVE
+# -------------------------
 def backup_media_to_drive(file_bytes: bytes, filename: str, mime_type: str, contact_name: Optional[str], wa_last4: str) -> Optional[str]:
     if not (GOOGLE_ENABLED and drive_service and DRIVE_UPLOAD_ROOT_FOLDER_ID):
         logger.info("Drive no configurado; omitiendo respaldo multimedia")
@@ -595,7 +602,18 @@ def backup_media_to_drive(file_bytes: bytes, filename: str, mime_type: str, cont
 # -------------------------
 def should_greet(wa_last10: str) -> bool:
     try:
-        row = find_or_create_contact_row(wa_last10)
+        row = find_contact_row_by_last10(wa_last10)
+        if not row:
+            # If Sheets not have contact, greet by process-local info
+            st = state.get(wa_last10, {})
+            last = st.get("greeted_at")
+            if not last:
+                return True
+            try:
+                dt = datetime.fromisoformat(last)
+                return (datetime.now(FLASK_TZ) - dt) > timedelta(hours=24)
+            except Exception:
+                return True
         data = get_contact_data(row)
         greeted_at = data.get("greeted_at")
         if not greeted_at:
@@ -606,10 +624,10 @@ def should_greet(wa_last10: str) -> bool:
             return (datetime.now(FLASK_TZ) - dt) > timedelta(hours=24)
         except Exception:
             return True
-    except Exception:
-        # If Sheets not available, fallback to greeting once per process per wa_last10
-        in_state = state.get(wa_last10, {})
-        last = in_state.get("greeted_at")
+    except Exception as e:
+        logger.warning("should_greet fallback por error: %s", str(e))
+        st = state.get(wa_last10, {})
+        last = st.get("greeted_at")
         if not last:
             return True
         try:
@@ -620,25 +638,19 @@ def should_greet(wa_last10: str) -> bool:
 
 def mark_greeted(wa_last10: str):
     try:
-        row = find_or_create_contact_row(wa_last10)
-        set_contact_data(row, {"greeted_at": now_iso()})
-    except Exception:
-        # store locally
+        row = find_contact_row_by_last10(wa_last10)
+        if row:
+            set_contact_data(row, {"greeted_at": now_iso()})
+        else:
+            st = state.setdefault(wa_last10, {})
+            st["greeted_at"] = now_iso()
+    except Exception as e:
+        logger.warning("mark_greeted fallback: %s", str(e))
         st = state.setdefault(wa_last10, {})
         st["greeted_at"] = now_iso()
 
 # -------------------------
-# SHEETS helpers (ensure fail-safe)
-# -------------------------
-def find_or_create_contact_row_safe(wa_last10: str) -> Optional[int]:
-    try:
-        return find_or_create_contact_row(wa_last10)
-    except Exception as e:
-        logger.debug("find_or_create_contact_row_safe: Sheets no disponible: %s", str(e))
-        return None
-
-# -------------------------
-# FLOWS (AUTO / IMSS) simplified but robust
+# FLOWS: AUTO & IMSS (IMSS message updated per spec)
 # -------------------------
 def notify_advisor(wa_id: str, row_index: Optional[int], reason: str):
     nombre = "Desconocido"
@@ -667,8 +679,7 @@ def handle_auto_flow(wa_id: str, text: str, row_index: Optional[int]):
     stage = st.get("stage","AUTO_START")
     t = (text or "").strip().lower()
     if stage == "AUTO_START":
-        msg = ("Planes Auto SECOM:\n\n1) Amplia Plus\n2) Amplia\n3) Limitada\n\n"
-               "Responde con 'INE: <datos>' o 'PLACA: <datos>' para continuar.")
+        msg = ("Planes Auto SECOM:\n\n1) Amplia Plus\n2) Amplia\n3) Limitada\n\nResponde con 'INE: <datos>' o 'PLACA: <datos>' para continuar.")
         send_text(wa_id, msg)
         st["stage"] = "AUTO_DOCS"
         st["updated"] = time.time()
@@ -741,7 +752,11 @@ def handle_imss_flow(wa_id: str, text: str, row_index: Optional[int]):
     stage = st.get("stage","IMSS_START")
     t = (text or "").strip().lower()
     if stage == "IMSS_START":
-        send_text(wa_id, "IMSS Ley 73: responde 'requisitos', 'cálculo' o 'prestamo'.")
+        # Per spec: aclarar que nómina NO es obligatoria
+        send_text(wa_id,
+            "IMSS Ley 73: los beneficios de nómina son *adicionales y NO obligatorios*. "
+            "Responde *requisitos*, *cálculo* o *prestamo*."
+        )
         st["stage"] = "IMSS_QUALIFY"
         st["updated"] = time.time()
         return
@@ -766,6 +781,11 @@ def handle_imss_flow(wa_id: str, text: str, row_index: Optional[int]):
         return
     if stage == "IMSS_CALC":
         if "sí" in t or "si" in t:
+            # Per spec: message pre-autorizado antes de notificar asesor
+            send_text(wa_id,
+                "Quedas pre-autorizado de forma tentativa. Si cambias tu nómina con nosotros obtienes beneficios extra, "
+                "pero no es requisito. ¿Deseas que un asesor te contacte?"
+            )
             notify_advisor(wa_id, row_index, "Cliente solicita cálculo IMSS")
             if row_index:
                 append_note_to_contact(row_index, "Solicitó cálculo IMSS")
@@ -780,6 +800,10 @@ def handle_imss_flow(wa_id: str, text: str, row_index: Optional[int]):
         return
     if stage == "IMSS_FOLLOW":
         if "asesor" in t:
+            send_text(wa_id,
+                "Quedas pre-autorizado de forma tentativa. Si cambias tu nómina con nosotros obtienes beneficios extra, "
+                "pero no es requisito. ¿Deseas que un asesor te contacte?"
+            )
             notify_advisor(wa_id, row_index, "Solicitud contacto IMSS")
             send_text(wa_id, "Asesor notificado. Te contactarán.")
             st["stage"] = "DONE"
@@ -791,7 +815,7 @@ def handle_imss_flow(wa_id: str, text: str, row_index: Optional[int]):
         return
 
 # -------------------------
-# PROMO WORKER (daemon)
+# PROMO WORKER
 # -------------------------
 def promo_worker():
     logger.info("Promo worker iniciado (daemon)")
@@ -839,7 +863,7 @@ promo_thread = threading.Thread(target=promo_worker, daemon=True)
 promo_thread.start()
 
 # -------------------------
-# ENDPOINTS EXACTOS
+# ENDPOINTS (sin cambios en firmas)
 # -------------------------
 @app.before_request
 def attach_request_id():
@@ -880,29 +904,66 @@ def webhook_receive():
                     wa_id = normalize_msisdn(wa_from)
                     wa_last10 = last10(wa_id)
                     wa_last4 = re.sub(r"\D","",wa_id)[-4:] if wa_id else "0000"
-                    # find or create contact row (graceful)
+
+                    # 3) BUSCAR sin crear fila inicialmente
                     row = None
                     try:
-                        row = find_or_create_contact_row_safe(wa_last10)
-                    except Exception:
-                        row = None
-                    # saludo protegido
-                    try:
-                        if should_greet(wa_last10):
-                            send_text(wa_id, "Hola 👋 Soy Vicky de SECOM. Escribe *AUTO*, *IMSS* o *CONTACTO* para iniciar.")
-                            mark_greeted(wa_last10)
+                        # If Sheets unavailable, find_contact_row_by_last10 will raise; handle graceful
+                        row = find_contact_row_by_last10(wa_last10) if GOOGLE_ENABLED else None
                     except Exception as e:
-                        logger.warning("No fue posible evaluar saludo protegido: %s", str(e))
+                        logger.debug("find_contact_row_by_last10 error (continuando sin row): %s", str(e))
+                        row = None
+
+                    # If no row: send courteous greeting/menu and do not create row yet
                     mtype = msg.get("type")
+                    if row is None and mtype == "text":
+                        text_preview = (msg.get("text",{}).get("body","") or "")[:200]
+                        logger.info("Mensaje de %s (no encontrado en Sheets): %s", mask_phone(wa_id), text_preview)
+                        t_low = (msg.get("text",{}).get("body","") or "").lower()
+                        try:
+                            if should_greet(wa_last10):
+                                send_text(wa_id, "Hola 👋 Soy Vicky. Escribe *AUTO*, *IMSS* o *CONTACTO* para iniciar.")
+                                mark_greeted(wa_last10)
+                        except Exception as e:
+                            logger.warning("No fue posible evaluar saludo protegido: %s", str(e))
+                        # Only create row if user explicitly enters a flow
+                        create_now = False
+                        if "auto" in t_low or "imss" in t_low or any(k in t_low for k in ["asesor","contacto","llámame","llamame","hablar con christian","christian"]):
+                            create_now = True
+                        if create_now:
+                            try:
+                                row = find_or_create_contact_row_safe(wa_last10)
+                            except Exception as e:
+                                logger.warning("No fue posible crear fila al entrar al flujo: %s", str(e))
+                                row = None
+                        # If still no row and not entering flow, continue (user may respond again)
+                        if not create_now and (not row):
+                            # We already sent courtesy; do not further process this message.
+                            continue
+                    # If row exists OR user created it, proceed with flows
+                    # If message is text and triggers flows, ensure row exists before calling flows
                     if mtype == "text":
                         text = msg.get("text",{}).get("body","")
-                        logger.info("💬 Mensaje de %s: %s", mask_phone(wa_id), (text or "")[:200])
                         t_low = (text or "").lower()
+                        # If user hasn't been created yet but now requests flow keywords, create row
+                        if row is None and ("auto" in t_low or "imss" in t_low or any(k in t_low for k in ["asesor","contacto","llámame","llamame","hablar con christian","christian"])):
+                            try:
+                                row = find_or_create_contact_row_safe(wa_last10)
+                            except Exception as e:
+                                logger.warning("No fue posible crear fila al detectar interés: %s", str(e))
+                                row = None
+                        logger.info("💬 Mensaje de %s: %s", mask_phone(wa_id), (text or "")[:200])
                         if "auto" in t_low:
                             handle_auto_flow(wa_id, text, row)
                         elif "imss" in t_low:
                             handle_imss_flow(wa_id, text, row)
                         elif any(k in t_low for k in ["asesor","contacto","llámame","llamame","hablar con christian","christian"]):
+                            # create row if not exists before notifying
+                            if row is None:
+                                try:
+                                    row = find_or_create_contact_row_safe(wa_last10)
+                                except Exception:
+                                    row = None
                             notify_advisor(wa_id, row, "Solicitud de contacto")
                             send_text(wa_id, "He notificado al asesor. Te contactarán pronto.")
                         elif any(q in t_low for q in ["cómo","como","requisitos","cobertura","qué","que","cuando","cuándo","dónde","donde","pensión","pension"]):
@@ -947,7 +1008,6 @@ def webhook_receive():
         return jsonify({"ok": True}), 200
     except Exception:
         logger.error("❌ Error crítico en webhook: %s", traceback.format_exc())
-        # Responder 200 para evitar reintentos de Meta en caso de error interno
         return jsonify({"ok": True}), 200
 
 # -------------------------
@@ -955,7 +1015,7 @@ def webhook_receive():
 # -------------------------
 @app.route("/ext/health", methods=["GET"])
 def ext_health():
-    return jsonify({"status":"ok","whatsapp":WHATSAPP_ENABLED,"google":GOOGLE_ENABLED,"openai":OPENAI_ENABLED}), 200
+    return jsonify({"status":"ok","whatsapp":WHATSAPP_ENABLED,"google":GOOGLE_ENABLED,"openai":bool(client)}), 200
 
 @app.route("/ext/test-send", methods=["POST"])
 def ext_test_send():
@@ -1006,47 +1066,41 @@ def ext_manuales():
         }
     return jsonify(status), 200
 
-# Background initial load of manuals (non-blocking, optional)
+# Background load manuals
 def background_initial_load():
     for d in ("auto","imss"):
         try:
             load_manual_to_cache(d)
         except Exception:
-            logger.debug("No pudo cargar manual inicial %s (posible falta de Drive o credenciales)", d)
+            logger.debug("No pudo cargar manual inicial %s (posible falta de Drive/credenciales)", d)
 
 bg_thread = threading.Thread(target=background_initial_load, daemon=True)
 bg_thread.start()
 
 # -------------------------
-# HUMO / NOTAS
+# Humo / notas
 # -------------------------
 """
-Pruebas de humo (curl):
+Pruebas rápidas (curl):
 
-1) Health:
-   curl -s https://<host>/ext/health
+Health:
+  curl -s https://<host>/ext/health
 
-2) Test send:
-   curl -XPOST https://<host>/ext/test-send -H "Content-Type: application/json" -d '{"to":"5216682478005","text":"Prueba OK"}'
+Test send:
+  curl -XPOST https://<host>/ext/test-send -H "Content-Type: application/json" -d '{"to":"5216682478005","text":"Prueba OK"}'
 
-3) Encolar promo:
-   curl -XPOST https://<host>/ext/send-promo -H "Content-Type: application/json" -d '{"recipients":["5216682478005"],"mode":"text","text":"Promo SECOM ✔️"}'
+Promo:
+  curl -XPOST https://<host>/ext/send-promo -H "Content-Type: application/json" -d '{"recipients":["5216682478005"],"mode":"text","text":"Promo SECOM ✔️"}'
 
-4) Manuales:
-   curl -s https://<host>/ext/manuales
-
-Notas operativas:
-- En este archivo la app NO aborta si faltan env vars; en lugar de eso opera en modo degradado:
-  - Si falta META_TOKEN o WABA_PHONE_ID, los envíos se simulan.
-  - Si falta GOOGLE_CREDENTIALS_JSON o libs, Sheets/Drive se deshabilitan.
-  - Si falta OPENAI_API_KEY, RAG devolverá fallback informativo.
-- Para comportamiento completo configure en Render las env vars obligatorias.
+Manuales:
+  curl -s https://<host>/ext/manuales
 """
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     logger.info("Iniciando Flask en puerto %d", port)
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 
