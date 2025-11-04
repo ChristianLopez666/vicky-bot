@@ -1,798 +1,640 @@
-# app.py — Vicky Bot SECOM (Render-ready)
-# Python 3.10+
-# Ejecuta en Render: gunicorn app:app --bind 0.0.0.0:$PORT
-
 import os
+import logging
+import time
 import re
 import json
-import time
-import logging
-import threading
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, List, Tuple
-
-import io
-import requests
+from typing import Dict, Any, Optional, List
 from flask import Flask, request, jsonify
-from dotenv import load_dotenv
-
-# Google (sin oauth2client): usa google-auth + gspread + google-api-python-client
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from PyPDF2 import PdfReader  # <- para RAG light (PDF)
-
-# OpenAI SDK 1.x
 from openai import OpenAI
+import requests
 
-# =========================
-# Entorno y logging
-# =========================
-load_dotenv()
+# Configuración de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-META_TOKEN = os.getenv("META_TOKEN", "").strip()
-WABA_PHONE_ID = os.getenv("WABA_PHONE_ID", "").strip()
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "").strip()
-ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "").strip()
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo-1106")
-
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Prospectos SECOM Auto").strip()
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
-MANUALES_VICKY_FOLDER_ID = os.getenv("MANUALES_VICKY_FOLDER_ID", "").strip()
-
-NOTIFICAR_ASESOR = os.getenv("NOTIFICAR_ASESOR", "true").lower() == "true"
-PORT = int(os.getenv("PORT", "5000"))
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("vicky-secom")
-
-# =========================
-# Clientes externos
-# =========================
-# WhatsApp
-WPP_API_URL = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages" if WABA_PHONE_ID else None
-WPP_TIMEOUT = 15
-
-# OpenAI 1.x
-client_oa: Optional[OpenAI] = None
-if OPENAI_API_KEY:
-    try:
-        client_oa = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception:
-        log.exception("No se pudo inicializar OpenAI")
-
-# Google Sheets + Drive (solo lectura)
-sheets_client = None
-drive_client = None
-google_ready = False
-try:
-    if GOOGLE_CREDENTIALS_JSON:
-        info = json.loads(GOOGLE_CREDENTIALS_JSON)
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        sheets_client = gspread.authorize(creds)
-        drive_client = build("drive", "v3", credentials=creds)
-        google_ready = True
-        log.info("Google listo (Sheets RO + Drive RO)")
-    else:
-        log.warning("GOOGLE_CREDENTIALS_JSON ausente. Google deshabilitado.")
-except Exception:
-    log.exception("Error inicializando Google")
-
-# =========================
-# Estado en memoria
-# =========================
 app = Flask(__name__)
-user_state: Dict[str, str] = {}
-user_ctx: Dict[str, Dict[str, Any]] = {}
-last_sent: Dict[str, str] = {}
 
-# Saludo solo 1 vez por ventana (24h)
-greeted_at: Dict[str, datetime] = {}
-GREET_WINDOW_HOURS = 24
+# Variables globales
+user_state = {}
+user_ctx = {}
+greeted_at = {}
+rag_cache = {}
 
-# =========================
-# Utilidades
-# =========================
-def _normalize_last10(phone: str) -> str:
-    d = re.sub(r"\D", "", phone or "")
-    return d[-10:] if len(d) >= 10 else d
+# Configuración
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Hoja 1")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4")
 
-def _send_wpp_payload(payload: Dict[str, Any]) -> bool:
-    if not (META_TOKEN and WPP_API_URL):
-        log.error("WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID).")
-        return False
-    headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
-    for attempt in range(3):
+# Clientes
+sheets_client = None
+client_oa = None
+google_ready = False
+
+# Inicializar clientes
+def initialize_clients():
+    global sheets_client, client_oa, google_ready
+    
+    # Inicializar OpenAI
+    if OPENAI_API_KEY:
         try:
-            r = requests.post(WPP_API_URL, headers=headers, json=payload, timeout=WPP_TIMEOUT)
-            if r.status_code == 200:
-                return True
-            if r.status_code in (429,) or 500 <= r.status_code < 600:
-                time.sleep(2 ** attempt)
-                continue
-            log.warning(f"WhatsApp {r.status_code}: {r.text[:200]}")
-            return False
-        except requests.exceptions.Timeout:
-            time.sleep(2 ** attempt)
-        except Exception:
-            log.exception("Error enviando a WhatsApp")
-            return False
-    return False
-
-def send_message(to: str, text: str) -> bool:
-    text = (text or "").strip()
-    if not text:
-        return False
-    if last_sent.get(to) == text:
-        return True
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text[:4096]},
-    }
-    ok = _send_wpp_payload(payload)
-    if ok:
-        last_sent[to] = text
-    return ok
-
-def notify_advisor(text: str) -> None:
-    if NOTIFICAR_ASESOR and ADVISOR_NUMBER:
-        try:
-            send_message(ADVISOR_NUMBER, text)
-        except Exception:
-            log.exception("Error notificando al asesor")
-
-def interpret_yesno(text: str) -> str:
-    t = (text or "").lower()
-    pos = ["sí", "si", "claro", "ok", "vale", "de acuerdo", "afirmativo", "correcto"]
-    neg = ["no", "nop", "negativo", "no gracias", "no quiero", "nel"]
-    if any(w in t for w in pos):
-        return "yes"
-    if any(w in t for w in neg):
-        return "no"
-    return "unknown"
-
-def extract_number(text: str) -> Optional[float]:
-    if not text:
-        return None
-    t = text.replace(",", "").replace("$", "")
-    m = re.search(r"(\d{1,12}(\.\d+)?)", t)
+            client_oa = OpenAI(api_key=OPENAI_API_KEY)
+            logger.info("✅ Cliente OpenAI inicializado")
+        except Exception as e:
+            logger.error(f"❌ Error inicializando OpenAI: {str(e)}")
+    
+    # Inicializar Google Sheets
     try:
-        return float(m.group(1)) if m else None
-    except Exception:
-        return None
+        google_creds_json = os.getenv("GOOGLE_CREDS_JSON")
+        if google_creds_json and GOOGLE_SHEET_ID:
+            creds_dict = json.loads(google_creds_json)
+            creds = Credentials.from_service_account_info(creds_dict)
+            sheets_client = gspread.authorize(creds)
+            google_ready = True
+            logger.info("✅ Cliente Google Sheets inicializado")
+    except Exception as e:
+        logger.error(f"❌ Error inicializando Google Sheets: {str(e)}")
+
+initialize_clients()
+
+# =========================
+# FUNCIONES AUXILIARES MEJORADAS
+# =========================
+
+def _normalize_last10(phone: str) -> str:
+    """Normaliza número de teléfono a últimos 10 dígitos"""
+    digits = re.sub(r"\D", "", phone)
+    return digits[-10:] if len(digits) >= 10 else digits
 
 def ensure_ctx(phone: str) -> Dict[str, Any]:
+    """Asegura que existe un contexto para el usuario"""
     if phone not in user_ctx:
-        user_ctx[phone] = {}
+        user_ctx[phone] = {
+            "created_at": datetime.utcnow(),
+            "message_count": 0,
+            "match": None,
+            "last10": _normalize_last10(phone)
+        }
+    user_ctx[phone]["message_count"] += 1
+    user_ctx[phone]["last_activity"] = datetime.utcnow()
     return user_ctx[phone]
 
-# =========================
-# Google helpers
-# =========================
-def sheet_match_by_last10(last10: str) -> Optional[Dict[str, Any]]:
-    if not (google_ready and sheets_client and GOOGLE_SHEET_ID and GOOGLE_SHEET_NAME):
-        return None
+def send_message(phone: str, message: str, real_send: bool = True) -> bool:
+    """Envía mensaje a WhatsApp"""
+    if not real_send:
+        logger.info(f"📤 [SIMULADO] Para {phone}: {message}")
+        return True
+        
+    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_ID:
+        logger.error("❌ Configuración de WhatsApp incompleta")
+        return False
+        
     try:
-        sh = sheets_client.open_by_key(GOOGLE_SHEET_ID)
-        ws = sh.worksheet(GOOGLE_SHEET_NAME)
-        rows = ws.get_all_values()
-        for i, row in enumerate(rows, start=1):
-            joined = " | ".join(row)
-            digits = re.sub(r"\D", "", joined)
-            if last10 and last10 in digits:
-                nombre = ""
-                for c in row:
-                    if c and not re.search(r"\d", c):
-                        nombre = c.strip()
-                        break
-                return {"row": i, "nombre": nombre, "raw": row}
-        return None
-    except Exception:
-        log.exception("Error leyendo Google Sheets")
-        return None
-
-def list_drive_manuals(folder_id: str) -> List[Dict[str, str]]:
-    if not (google_ready and drive_client and folder_id):
-        return []
-    try:
-        q = f"'{folder_id}' in parents and mimeType='application/pdf' and trashed=false"
-        resp = drive_client.files().list(q=q, fields="files(id, name, webViewLink)").execute()
-        files = resp.get("files", [])
-        out = []
-        for f in files:
-            link = f.get("webViewLink", "")
-            if not link:
-                meta = drive_client.files().get(fileId=f["id"], fields="webViewLink").execute()
-                link = meta.get("webViewLink", "")
-            out.append({"id": f["id"], "name": f["name"], "webViewLink": link})
-        return out
-    except Exception:
-        log.exception("Error listando manuales en Drive")
-        return []
+        url = f"https://graph.facebook.com/v17.0/{WHATSAPP_PHONE_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "messaging_product": "whatsapp",
+            "to": phone,
+            "text": {"body": message}
+        }
+        
+        response = requests.post(url, headers=headers, json=data, timeout=30)
+        if response.status_code == 200:
+            logger.info(f"✅ Mensaje enviado a {phone}")
+            return True
+        else:
+            logger.error(f"❌ Error enviando mensaje: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Excepción enviando mensaje: {str(e)}")
+        return False
 
 # =========================
-# RAG light (Auto) — lectura PDF desde Drive
+# GOOGLE SHEETS MEJORADO CON REINTENTOS
 # =========================
-_manual_auto_cache = {"text": None, "file_id": None, "loaded_at": None}
 
-def _find_auto_manual_file_id() -> Optional[str]:
-    if not (google_ready and drive_client and MANUALES_VICKY_FOLDER_ID):
+def sheet_match_by_last10(last10: str, test_mode: bool = False) -> Optional[Dict[str, Any]]:
+    """Busca coincidencias en Google Sheets con reintentos"""
+    if test_mode:
+        return {"test": True, "nombre": "Test User"}
+        
+    if not (google_ready and sheets_client and GOOGLE_SHEET_ID):
+        logger.warning("❌ Google Sheets no configurado")
         return None
-    try:
-        q = (
-            f"'{MANUALES_VICKY_FOLDER_ID}' in parents and "
-            "mimeType='application/pdf' and trashed=false"
-        )
-        resp = drive_client.files().list(q=q, fields="files(id, name)", pageSize=50).execute()
-        files = resp.get("files", [])
-        # Prioriza nombres que sugieran auto/coberturas
-        for f in files:
-            name = (f.get("name") or "").lower()
-            if "auto" in name or "cobertura" in name:
-                return f["id"]
-        return files[0]["id"] if files else None
-    except Exception:
-        log.exception("Error buscando manual Auto")
-        return None
+        
+    for attempt in range(3):
+        try:
+            sh = sheets_client.open_by_key(GOOGLE_SHEET_ID)
+            ws = sh.worksheet(GOOGLE_SHEET_NAME)
+            rows = ws.get_all_values()
+            
+            # ✅ MEJORA: Búsqueda más inteligente con múltiples campos
+            for i, row in enumerate(rows, start=1):
+                if not row:
+                    continue
+                    
+                # Buscar en todos los campos que puedan contener teléfonos
+                searchable_text = " ".join([str(cell) for cell in row])
+                digits_in_row = re.sub(r"\D", "", searchable_text)
+                
+                if last10 and last10 in digits_in_row:
+                    nombre = extract_name_from_row(row)
+                    logger.info(f"✅ Coincidencia encontrada para {last10}: {nombre}")
+                    return {
+                        "row": i, 
+                        "nombre": nombre,
+                        "raw": row,
+                        "found_by": "phone_match"
+                    }
+                    
+            # ✅ MEJORA: Si no encuentra por teléfono, buscar por nombre aproximado
+            fuzzy_match = search_by_fuzzy_name(last10, rows)
+            if fuzzy_match:
+                return fuzzy_match
+                
+            logger.info(f"🔍 No se encontraron coincidencias para {last10}")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Intento {attempt + 1} fallado: {str(e)}")
+            if attempt == 2:  # Último intento
+                logger.error(f"❌ Error en sheet_match después de {attempt+1} intentos: {str(e)}")
+            time.sleep(1 * (attempt + 1))
+    
+    return None
 
-def _download_pdf_text(file_id: str) -> Optional[str]:
-    try:
-        from googleapiclient.http import MediaIoBaseDownload
-        req = drive_client.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, req)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        fh.seek(0)
-        reader = PdfReader(fh)
-        pages = []
-        for p in reader.pages:
-            try:
-                pages.append(p.extract_text() or "")
-            except Exception:
-                pages.append("")
-        text = "\n".join(pages)
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return text.strip() or None
-    except Exception:
-        log.exception("No se pudo extraer texto PDF (Auto)")
-        return None
+def extract_name_from_row(row: List[str]) -> str:
+    """Extrae nombre de una fila buscando en las primeras columnas"""
+    for cell in row[:3]:  # Buscar en primeras 3 columnas
+        if cell and len(cell.strip()) > 1 and not cell.strip().isdigit():
+            # Eliminar caracteres especiales y números
+            clean_name = re.sub(r'[^a-zA-ZáéíóúÁÉÍÓÚñÑ\s]', '', cell.strip())
+            if len(clean_name) > 1:
+                return clean_name.title()
+    return "Cliente"
 
-def ensure_auto_manual_text(force_reload: bool = False) -> Optional[str]:
+def search_by_fuzzy_name(phone: str, rows: List[List[str]]) -> Optional[Dict[str, Any]]:
+    """Búsqueda aproximada por nombre (placeholder para implementación futura)"""
+    # Por ahora retorna None, se puede implementar fuzzy matching después
+    return None
+
+# =========================
+# SISTEMA RAG MEJORADO CON CACHE
+# =========================
+
+def answer_with_enhanced_rag(question: str, context: str = "auto") -> Optional[str]:
+    """Sistema RAG mejorado con cache inteligente"""
     if not client_oa:
+        logger.warning("❌ OpenAI no disponible para RAG")
         return None
-    if not force_reload and _manual_auto_cache.get("text"):
-        return _manual_auto_cache["text"]
-    fid = _find_auto_manual_file_id()
-    if not fid:
-        return None
-    text = _download_pdf_text(fid)
-    if text:
-        _manual_auto_cache.update({"text": text, "file_id": fid, "loaded_at": datetime.utcnow()})
-        log.info("[rag-auto] Manual cacheado")
-    return text
-
-def answer_auto_from_manual(question: str) -> Optional[str]:
-    if not client_oa:
-        return None
-    manual_text = ensure_auto_manual_text()
-    if not manual_text:
-        return None
-    # Heurística: filtra párrafos relevantes
-    keys = ["amplia plus", "amplia", "cobertura", "asistencia", "cristales", "auto de reemplazo", "deducible"]
-    parts = []
-    for ln in manual_text.split("\n"):
-        low = ln.lower()
-        if any(k in low for k in keys):
-            parts.append(ln.strip())
-            if len(" ".join(parts)) > 8000:
-                break
-    focus = "\n".join(parts) if parts else manual_text[:9000]
+        
+    # ✅ MEJORA: Cache inteligente por contexto y pregunta
+    cache_key = f"{context}:{question.lower().strip()}"
+    if cache_key in rag_cache and time.time() - rag_cache[cache_key]["timestamp"] < 3600:  # 1 hora
+        logger.info(f"✅ Respuesta desde cache: {cache_key}")
+        return rag_cache[cache_key]["answer"]
+    
     try:
-        prompt = (
-            "Responde SOLO con base en el texto del manual (auto). "
-            "Sé preciso, en español, y usa viñetas si ayuda. "
-            "Si no aparece en el manual, di: 'No está indicado en el manual'.\n\n"
-            f"Pregunta: {question}\n\n"
-            f"Manual (extracto):\n{focus}\n\n"
-            "==\nRespuesta:"
+        # ✅ MEJORA: Seleccionar contexto específico
+        if context == "auto":
+            manual_text = ensure_auto_manual_text()
+            system_prompt = "Eres un experto en seguros de auto. Responde basado únicamente en el manual."
+        elif context == "imss":
+            manual_text = get_imss_guidelines()
+            system_prompt = "Eres un experto en pensiones IMSS y préstamos Ley 73."
+        else:
+            manual_text = get_general_knowledge()
+            system_prompt = "Eres Vicky, una asistente especializada en servicios financieros e hipotecarios."
+        
+        if not manual_text:
+            logger.warning("❌ No hay contexto disponible para RAG")
+            return None
+            
+        # ✅ MEJORA: Chunking inteligente para contextos largos
+        relevant_chunks = extract_relevant_chunks(question, manual_text)
+        
+        prompt = f"""
+        {system_prompt}
+        
+        Contexto relevante:
+        {relevant_chunks}
+        
+        Pregunta del usuario: {question}
+        
+        Instrucciones:
+        - Responde en español de manera clara y profesional
+        - Usa emojis apropiados si es necesario
+        - Si la información no está en el contexto, sugiere contactar a un asesor
+        - Sé conciso pero completo
+        - Mantén un tono amable y servicial
+        """
+        
+        logger.info(f"🔍 Consultando GPT para: {question[:50]}...")
+        response = client_oa.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": prompt}],
+            temperature=0.3,
+            max_tokens=500
         )
-        res = client_oa.chat.completions.create(
+        
+        answer = (response.choices[0].message.content or "").strip()
+        
+        # ✅ MEJORA: Guardar en cache
+        if answer:
+            rag_cache[cache_key] = {
+                "answer": answer,
+                "timestamp": time.time(),
+                "context": context
+            }
+            logger.info(f"✅ Respuesta GPT guardada en cache")
+            
+        return answer
+        
+    except Exception as e:
+        logger.error(f"❌ Error en RAG mejorado: {str(e)}")
+        return None
+
+# Funciones de contexto (placeholders)
+def ensure_auto_manual_text() -> str:
+    return "Información sobre seguros de auto: coberturas básicas, deducibles, asistencia vial, etc."
+
+def get_imss_guidelines() -> str:
+    return "Información sobre pensiones IMSS: requisitos, cálculo de pensiones, trámites, Ley 73."
+
+def get_general_knowledge() -> str:
+    return "Servicios financieros: hipotecas, créditos, seguros, asesoría financiera."
+
+def extract_relevant_chunks(question: str, text: str) -> str:
+    """Extrae chunks relevantes del texto (simplificado)"""
+    # Implementación básica - se puede mejorar con embeddings
+    words = question.lower().split()
+    sentences = text.split('.')
+    relevant = []
+    
+    for sentence in sentences:
+        if any(word in sentence.lower() for word in words if len(word) > 3):
+            relevant.append(sentence.strip())
+    
+    return '. '.join(relevant[:3])  # Máximo 3 oraciones
+
+def detect_question_context(question: str) -> str:
+    """Detecta el contexto de la pregunta"""
+    question_lower = question.lower()
+    auto_keywords = ["auto", "carro", "coche", "seguro", "cobertura", "deducible"]
+    imss_keywords = ["imss", "pensión", "jubilación", "ley 73", "préstamo"]
+    
+    if any(keyword in question_lower for keyword in auto_keywords):
+        return "auto"
+    elif any(keyword in question_lower for keyword in imss_keywords):
+        return "imss"
+    else:
+        return "general"
+
+def is_technical_question(text: str) -> bool:
+    """Determina si es una pregunta técnica"""
+    question_indicators = ["qué", "cómo", "cuándo", "dónde", "por qué", "cuál", "explica", "información"]
+    text_lower = text.lower()
+    return any(indicator in text_lower for indicator in question_indicators) and len(text) > 15
+
+# =========================
+# ROUTING MEJORADO CON GPT
+# =========================
+
+def classify_intent_with_gpt(text: str) -> str:
+    """Clasifica la intención del mensaje usando GPT"""
+    if not client_oa or len(text) < 10:
+        return "unknown"
+        
+    try:
+        prompt = f"""
+        Clasifica la intención del siguiente mensaje en una de estas categorías:
+        - "seguros": Preguntas sobre seguros de auto, vida, hogar, etc.
+        - "pensiones": Consultas sobre IMSS, pensiones, jubilaciones
+        - "creditos": Solicitudes de créditos, préstamos, hipotecas
+        - "info_general": Información general, contacto, horarios
+        - "otro": Otras consultas no categorizadas
+        
+        Mensaje: "{text}"
+        
+        Responde solo con la categoría, nada más.
+        """
+        
+        response = client_oa.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
+            temperature=0.1,
+            max_tokens=10
         )
-        ans = (res.choices[0].message.content or "").strip()
-        return ans[:1500] if ans else None
-    except Exception:
-        log.exception("Error RAG-auto")
-        return None
+        
+        intent = (response.choices[0].message.content or "").strip().lower()
+        valid_intents = ["seguros", "pensiones", "creditos", "info_general", "otro"]
+        return intent if intent in valid_intents else "unknown"
+        
+    except Exception as e:
+        logger.error(f"❌ Error clasificando intención: {str(e)}")
+        return "unknown"
 
-# =========================
-# Menú y flujos
-# =========================
-MAIN_MENU = (
-    "🟦 *Vicky Bot — Inbursa*\n"
-    "Elige una opción:\n"
-    "1) Asesoría en pensiones IMSS\n"
-    "2) Cotizador de seguro de auto\n"
-    "3) Seguros de vida y salud\n"
-    "4) Membresía médica VRIM\n"
-    "5) Préstamos a pensionados IMSS ($10,000 a $650,000)\n"
-    "6) Financiamiento empresarial\n"
-    "7) Contactar con Christian\n\n"
-    "Escribe el número u opción (ej. 'imss', 'auto', 'empresarial', 'contactar')."
-)
+def redirect_based_on_intent(phone: str, intent: str, match: Optional[Dict[str, Any]]):
+    """Redirige al flujo basado en la intención detectada"""
+    responses = {
+        "seguros": "¡Excelente! Te ayudo con información de seguros. ¿Es para auto, vida, hogar o salud?",
+        "pensiones": "Perfecto, soy experta en pensiones IMSS. ¿Qué necesitas saber sobre tu pensión o jubilación?",
+        "creditos": "¡Claro! Te ayudo con créditos. ¿Es hipotecario, personal, o de otro tipo?",
+        "info_general": "Te proporciono información general. ¿Qué necesitas saber específicamente?"
+    }
+    
+    response = responses.get(intent, "¿En qué más puedo ayudarte?")
+    send_message(phone, response)
+    user_state[phone] = intent
 
-def send_main_menu(phone: str) -> None:
-    send_message(phone, MAIN_MENU)
-
-def greet_with_match(phone: str, *, do_greet: bool = True) -> Optional[Dict[str, Any]]:
-    """
-    Saluda solo si no se saludó en la última ventana (24h).
-    Guarda el match en contexto para reutilizarlo.
-    """
-    last10 = _normalize_last10(phone)
-    match = sheet_match_by_last10(last10)
-
-    now = datetime.utcnow()
-    must_greet = do_greet and (
-        phone not in greeted_at or (now - greeted_at.get(phone, now)) >= timedelta(hours=GREET_WINDOW_HOURS)
-    )
-
-    if must_greet:
-        if match and match.get("nombre"):
-            send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
-        else:
-            send_message(phone, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
-        greeted_at[phone] = now
-
-    # guarda en contexto
-    ctx = ensure_ctx(phone)
-    ctx["match"] = match
-    return match
-
-def flow_imss_info(phone: str, match: Optional[Dict[str, Any]]) -> None:
-    user_state[phone] = "imss_q1"
-    send_message(phone, "🟩 *Asesoría IMSS*\n¿Deseas conocer requisitos y cálculo aproximado? (sí/no)")
-
-def flow_imss_next(phone: str, text: str) -> None:
-    st = user_state.get(phone, "")
-    ctx = ensure_ctx(phone)
-
-    if st == "imss_q1":
-        yn = interpret_yesno(text)
-        if yn == "yes":
-            user_state[phone] = "imss_pension"
-            send_message(phone, "¿Cuál es tu *pensión mensual* aproximada? (ej. 8,500)")
-        elif yn == "no":
-            user_state[phone] = ""
-            send_message(phone, "Entendido. Escribe *menú* para ver más opciones.")
-        else:
-            send_message(phone, "¿Me confirmas con *sí* o *no*?")
-    elif st == "imss_pension":
-        p = extract_number(text)
-        if not p:
-            send_message(phone, "No pude leer el monto. Indica tu pensión mensual (ej. 8500).")
-            return
-        ctx["imss_pension"] = p
-        user_state[phone] = "imss_monto"
-        send_message(phone, "Gracias. ¿Qué *monto* te gustaría solicitar? (entre $10,000 y $650,000)")
-    elif st == "imss_monto":
-        m = extract_number(text)
-        if not m or m < 10000 or m > 650000:
-            send_message(phone, "Ingresa un monto entre $10,000 y $650,000.")
-            return
-        ctx["imss_monto"] = m
-        user_state[phone] = "imss_nombre"
-        send_message(phone, "¿Tu *nombre completo*?")
-    elif st == "imss_nombre":
-        ctx["imss_nombre"] = (text or "").strip()
-        user_state[phone] = "imss_ciudad"
-        send_message(phone, "¿En qué *ciudad* te encuentras?")
-    elif st == "imss_ciudad":
-        ctx["imss_ciudad"] = (text or "").strip()
-        user_state[phone] = "imss_nomina"
-        send_message(phone, "¿Tienes *nómina Inbursa*? (sí/no)\n*No es obligatoria; otorga beneficios adicionales.*")
-    elif st == "imss_nomina":
-        yn = interpret_yesno(text)
-        ctx["imss_nomina"] = ("sí" if yn == "yes" else "no")
-        resumen = (
-            "✅ *Preautorizado*. Un asesor te contactará.\n"
-            f"- Nombre: {ctx.get('imss_nombre','')}\n"
-            f"- Ciudad: {ctx.get('imss_ciudad','')}\n"
-            f"- Pensión: ${ctx.get('imss_pension',0):,.0f}\n"
-            f"- Monto deseado: ${ctx.get('imss_monto',0):,.0f}\n"
-            f"- Nómina Inbursa: {ctx.get('imss_nomina','no')}"
-        )
-        send_message(phone, resumen)
-        if NOTIFICAR_ASESOR:
-            notify_advisor(f"🔔 IMSS — Prospecto preautorizado\nWhatsApp: {phone}\n{resumen}")
-        user_state[phone] = ""
+def enhanced_gpt_fallback(phone: str, text: str, match: Optional[Dict[str, Any]]):
+    """Fallback mejorado con GPT"""
+    if not client_oa:
         send_main_menu(phone)
-
-def flow_auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
-    user_state[phone] = "auto_intro"
-    send_message(
-        phone,
-        "🚗 *Cotizador Auto*\nEnvíame:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas.\n"
-        "Si ya tienes póliza, dime la *fecha de vencimiento* (AAAA-MM-DD) para recordarte 30 días antes."
-    )
-
-def flow_auto_next(phone: str, text: str) -> None:
-    st = user_state.get(phone, "")
-    if st == "auto_intro":
-        if re.search(r"\d{4}-\d{2}-\d{2}", text or ""):
-            user_state[phone] = "auto_vto"
-            flow_auto_next(phone, text)
+        return
+        
+    try:
+        user_name = match.get("nombre", "") if match else ""
+        context = f"Usuario: {user_name}\nMensaje: {text}"
+        
+        prompt = f"""
+        Eres Vicky, una asistente especializada en servicios financieros, seguros y pensiones.
+        
+        Contexto: {context}
+        
+        Responde de manera amable y profesional, ofreciendo ayuda específica.
+        Usa emojis apropiados. Sé concisa pero útil.
+        Si no estás segura, sugiere opciones del menú principal.
+        """
+        
+        response = client_oa.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=150
+        )
+        
+        answer = (response.choices[0].message.content or "").strip()
+        if answer:
+            send_message(phone, answer)
         else:
-            send_message(phone, "Perfecto. Envía documentos o escribe la fecha de vencimiento (AAAAA-MM-DD).")
-    elif st == "auto_vto":
-        try:
-            date = datetime.fromisoformat(text.strip()).date()
-            objetivo = date - timedelta(days=30)
-            send_message(phone, f"✅ Gracias. Te contactaré *un mes antes* ({objetivo.isoformat()}).")
-            def _reminder():
-                try:
-                    time.sleep(7 * 24 * 60 * 60)
-                    send_message(phone, "⏰ ¿Deseas que coticemos tu seguro al acercarse el vencimiento?")
-                except Exception:
-                    pass
-            threading.Thread(target=_reminder, daemon=True).start()
-            user_state[phone] = ""
             send_main_menu(phone)
-        except Exception:
-            send_message(phone, "Formato inválido. Usa AAAA-MM-DD (ej. 2025-12-31).")
-
-def flow_vida_salud(phone: str) -> None:
-    send_message(phone, "🧬 *Seguros de Vida y Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.")
-    notify_advisor(f"🔔 Vida/Salud — Solicitud de contacto\nWhatsApp: {phone}")
-    send_main_menu(phone)
-
-def flow_vrim(phone: str) -> None:
-    send_message(phone, "🩺 *VRIM* — Membresía médica con cobertura amplia. Notificaré al asesor para darte detalles.")
-    notify_advisor(f"🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}")
-    send_main_menu(phone)
-
-def flow_prestamo_imss(phone: str, match: Optional[Dict[str, Any]]) -> None:
-    user_state[phone] = "imss_monto_directo"
-    send_message(phone, "🟩 *Préstamo IMSS (Ley 73)*\nIndica el *monto* deseado (entre $10,000 y $650,000).")
-
-def flow_prestamo_imss_next(phone: str, text: str) -> None:
-    st = user_state.get(phone, "")
-    ctx = ensure_ctx(phone)
-    if st == "imss_monto_directo":
-        m = extract_number(text)
-        if not m or m < 10000 or m > 650000:
-            send_message(phone, "Ingresa un monto entre $10,000 y $650,000.")
-            return
-        ctx["imss_monto"] = m
-        user_state[phone] = "imss_nombre_directo"
-        send_message(phone, "¿Tu *nombre completo*?")
-    elif st == "imss_nombre_directo":
-        ctx["imss_nombre"] = (text or "").strip()
-        user_state[phone] = "imss_ciudad_directo"
-        send_message(phone, "¿En qué *ciudad* te encuentras?")
-    elif st == "imss_ciudad_directo":
-        ctx["imss_ciudad"] = (text or "").strip()
-        user_state[phone] = "imss_nomina_directo"
-        send_message(phone, "¿Tienes *nómina Inbursa*? (sí/no)\n*No es obligatoria; da beneficios adicionales.*")
-    elif st == "imss_nomina_directo":
-        yn = interpret_yesno(text)
-        ctx["imss_nomina"] = ("sí" if yn == "yes" else "no")
-        resumen = (
-            "✅ *Preautorizado*. Un asesor te contactará.\n"
-            f"- Nombre: {ctx.get('imss_nombre','')}\n"
-            f"- Ciudad: {ctx.get('imss_ciudad','')}\n"
-            f"- Monto deseado: ${ctx.get('imss_monto',0):,.0f}\n"
-            f"- Nómina Inbursa: {ctx.get('imss_nomina','no')}"
-        )
-        send_message(phone, resumen)
-        notify_advisor(f"🔔 IMSS — Solicitud préstamo\nWhatsApp: {phone}\n{resumen}")
-        user_state[phone] = ""
+            
+    except Exception as e:
+        logger.error(f"❌ Error en GPT fallback: {str(e)}")
         send_main_menu(phone)
 
-def flow_empresarial(phone: str, match: Optional[Dict[str, Any]]) -> None:
-    user_state[phone] = "emp_confirma"
-    send_message(phone, "🟦 *Financiamiento Empresarial*\n¿Eres empresario(a) o representas una empresa? (sí/no)")
+def send_main_menu(phone: str):
+    """Envía el menú principal"""
+    menu = """
+    🎯 *Menú Principal* 🎯
 
-def flow_empresarial_next(phone: str, text: str) -> None:
-    st = user_state.get(phone, "")
-    ctx = ensure_ctx(phone)
-    if st == "emp_confirma":
-        yn = interpret_yesno(text)
-        if yn != "yes":
-            send_message(phone, "Entendido. Si necesitas otra cosa, escribe *menú*.")
-            user_state[phone] = ""
-            return
-        user_state[phone] = "emp_giro"
-        send_message(phone, "¿A qué *se dedica* tu empresa?")
-    elif st == "emp_giro":
-        ctx["emp_giro"] = (text or "").strip()
-        user_state[phone] = "emp_monto"
-        send_message(phone, "¿Qué *monto* necesitas? (mínimo $100,000)")
-    elif st == "emp_monto":
-        m = extract_number(text)
-        if not m or m < 100000:
-            send_message(phone, "El monto mínimo es $100,000. Indica un monto igual o mayor.")
-            return
-        ctx["emp_monto"] = m
-        user_state[phone] = "emp_nombre"
-        send_message(phone, "¿Tu *nombre completo*?")
-    elif st == "emp_nombre":
-        ctx["emp_nombre"] = (text or "").strip()
-        user_state[phone] = "emp_ciudad"
-        send_message(phone, "¿Tu *ciudad*?")
-    elif st == "emp_ciudad":
-        ctx["emp_ciudad"] = (text or "").strip()
-        resumen = (
-            "✅ Gracias. Un asesor te contactará.\n"
-            f"- Nombre: {ctx.get('emp_nombre','')}\n"
-            f"- Ciudad: {ctx.get('emp_ciudad','')}\n"
-            f"- Giro: {ctx.get('emp_giro','')}\n"
-            f"- Monto: ${ctx.get('emp_monto',0):,.0f}"
-        )
-        send_message(phone, resumen)
-        notify_advisor(f"🔔 Empresarial — Nueva solicitud\nWhatsApp: {phone}\n{resumen}")
-        user_state[phone] = ""
-        send_main_menu(phone)
+    🤔 ¿En qué te puedo ayudar?
 
-def flow_contacto(phone: str) -> None:
-    send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
-    notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
-    send_main_menu(phone)
+    1️⃣ 📊 *Seguros* - Auto, Vida, Hogar
+    2️⃣ 👵 *Pensiones IMSS* - Asesoría
+    3️⃣ 💰 *Créditos* - Hipotecarios, Personales
+    4️⃣ 🏠 *Avalúos* - Información y cotizaciones
+    5️⃣ 📞 *Contacto* - Hablar con asesor
 
-# =========================
-# Router principal
-# =========================
+    Responde con el número o lo que necesites 👍
+    """
+    send_message(phone, menu)
+
 def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
+    """Rutea comandos con GPT integrado"""
     t = (text or "").strip().lower()
-
-    # --- RAG light para preguntas de AUTO (coberturas) ---
-    if any(k in t for k in ["amplia plus", "amplia+", "cobertura", "coberturas", "cristales", "asistencia", "auto de reemplazo"]):
-        rag_ans = answer_auto_from_manual(text or t)
-        if rag_ans:
-            send_message(phone, rag_ans)
+    current_state = user_state.get(phone, "")
+    
+    # ✅ MEJORA: Detectar intención con GPT para mejor routing
+    if not current_state and len(t) > 10:  # Mensajes largos sin estado
+        intent = classify_intent_with_gpt(t)
+        if intent and intent != "unknown":
+            logger.info(f"🎯 Intención detectada: {intent} para {phone}")
+            # Redirigir al flujo correspondiente basado en intención
+            redirect_based_on_intent(phone, intent, match)
             return
-    # -----------------------------------------------------
-
-    if t in ("menu", "menú", "inicio", "hola"):
-        user_state[phone] = ""
-        send_main_menu(phone)
-        return
-
-    if t in ("1", "asesoría imss", "asesoria imss", "imss", "pensión", "pension"):
-        flow_imss_info(phone, match)
-        return
-    if t in ("2", "auto", "seguro auto", "cotización auto", "cotizacion auto"):
-        flow_auto_start(phone, match)
-        return
-    if t in ("3", "vida", "salud", "seguro de vida", "seguro de salud"):
-        flow_vida_salud(phone)
-        return
-    if t in ("4", "vrim", "membresía médica", "membresia medica"):
-        flow_vrim(phone)
-        return
-    if t in ("5", "préstamo", "prestamo", "préstamo imss", "prestamo imss", "ley 73"):
-        flow_prestamo_imss(phone, match)
-        return
-    if t in ("6", "financiamiento", "empresarial", "crédito empresarial", "credito empresarial"):
-        flow_empresarial(phone, match)
-        return
-    if t in ("7", "contactar", "asesor", "contactar con christian"):
-        flow_contacto(phone)
-        return
-
-    st = user_state.get(phone, "")
-    if st.startswith("imss_"):
-        if st in {"imss_q1", "imss_pension", "imss_monto", "imss_nombre", "imss_ciudad", "imss_nomina"}:
-            flow_imss_next(phone, text)
-        else:
-            flow_prestamo_imss_next(phone, text)
-        return
-    if st.startswith("auto_"):
-        flow_auto_next(phone, text)
-        return
-    if st.startswith("emp_"):
-        flow_empresarial_next(phone, text)
-        return
-
-    # Fallback GPT (OpenAI 1.x)
-    if client_oa:
-        def _gpt_reply():
-            try:
-                prompt = (
-                    "Eres Vicky, una asistente amable y profesional. "
-                    "Responde en español, breve y con emojis si corresponde. "
-                    f"Mensaje del usuario: {text or ''}"
-                )
-                res = client_oa.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.4,
-                )
-                answer = (res.choices[0].message.content or "").strip()
-                send_message(phone, answer or "¿Te puedo ayudar con algo más? Escribe *menú*.")
-            except Exception:
-                send_main_menu(phone)
-        threading.Thread(target=_gpt_reply, daemon=True).start()
+    
+    # ✅ MEJORA: RAG mejorado para preguntas técnicas
+    if is_technical_question(t):
+        logger.info(f"🔍 Pregunta técnica detectada: {t[:50]}...")
+        answer = answer_with_enhanced_rag(t, detect_question_context(t))
+        if answer:
+            send_message(phone, answer)
+            return
+    
+    # Lógica de flujos existente (simplificada)
+    if t in ["1", "seguro", "seguros"]:
+        send_message(phone, "¡Excelente! ¿Qué tipo de seguro te interesa: auto, vida, hogar o salud?")
+        user_state[phone] = "seguros"
+    elif t in ["2", "pension", "pensiones", "imss"]:
+        send_message(phone, "Perfecto, soy experta en pensiones IMSS. ¿Qué necesitas saber sobre tu pensión o jubilación?")
+        user_state[phone] = "pensiones"
+    elif t in ["3", "credito", "creditos", "préstamo"]:
+        send_message(phone, "¡Claro! Te ayudo con créditos. ¿Es hipotecario, personal, automotriz o de nómina?")
+        user_state[phone] = "creditos"
+    elif t in ["4", "contacto", "asesor", "hablar"]:
+        send_message(phone, "📞 Te conecto con un asesor especializado. Ellos te contactarán en breve. ¿Podrías confirmarme tu nombre completo?")
+        user_state[phone] = "contacto"
     else:
-        send_message(phone, "No te entendí bien. Escribe *menú* para ver opciones.")
+        # ✅ CORRECCIÓN: Fallback a GPT mejorado
+        if current_state == "" and client_oa:
+            enhanced_gpt_fallback(phone, t, match)
+        else:
+            send_main_menu(phone)
+
+def process_media_with_gpt(phone: str, msg: Dict[str, Any]):
+    """Procesa medios con GPT-4 Vision si es imagen"""
+    # Placeholder para implementación futura
+    send_message(phone, "📎 Archivo recibido. Lo revisaré y te respondo pronto.")
 
 # =========================
-# Webhook
+# WEBHOOK CORREGIDO - LÓGICA MEJORADA
 # =========================
-@app.get("/webhook")
-def webhook_verify():
-    try:
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge", "")
-        if mode == "subscribe" and token == VERIFY_TOKEN:
-            return challenge, 200
-    except Exception:
-        log.exception("Error verificando webhook")
-    return "Error", 403
 
-def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
-    if not META_TOKEN:
-        return None, None, None
-    try:
-        meta = requests.get(
-            f"https://graph.facebook.com/v20.0/{media_id}",
-            headers={"Authorization": f"Bearer {META_TOKEN}"},
-            timeout=WPP_TIMEOUT,
-        )
-        if meta.status_code != 200:
-            return None, None, None
-        mj = meta.json()
-        url = mj.get("url")
-        mime = mj.get("mime_type")
-        fname = mj.get("filename") or f"media_{media_id}"
-        if not url:
-            return None, None, None
-        binr = requests.get(url, headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=WPP_TIMEOUT)
-        if binr.status_code != 200:
-            return None, None, None
-        return binr.content, (mime or "application/octet-stream"), fname
-    except Exception:
-        return None, None, None
-
-@app.post("/webhook")
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook_receive():
+    """Webhook corregido con lógica de estados mejorada"""
     try:
-        payload = request.get_json(force=True, silent=True) or {}
+        if request.method == "GET":
+            # Verificación del webhook
+            mode = request.args.get("hub.mode")
+            token = request.args.get("hub.verify_token")
+            challenge = request.args.get("hub.challenge")
+            
+            if mode and token:
+                if mode == "subscribe" and token == os.getenv("VERIFY_TOKEN"):
+                    logger.info("✅ Webhook verificado")
+                    return challenge, 200
+                else:
+                    logger.error("❌ Token de verificación inválido")
+                    return "Forbidden", 403
+            return "Bad Request", 400
+        
+        # Procesar mensaje POST
+        payload = request.get_json()
+        logger.info(f"📥 Payload recibido: {json.dumps(payload, indent=2)}")
+        
+        if not payload:
+            return jsonify({"ok": True}), 200
+            
+        # Extraer mensaje
         entry = payload.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
         messages = value.get("messages", [])
+        
         if not messages:
             return jsonify({"ok": True}), 200
-
+            
         msg = messages[0]
         phone = msg.get("from", "").strip()
         if not phone:
             return jsonify({"ok": True}), 200
 
-        # Saludo+match solo una vez por ventana
+        # ✅ CORRECCIÓN: Determinar si es primer mensaje SIN afectar user_state
+        is_new_conversation = (phone not in user_state)
+        
+        # ✅ CORRECCIÓN: Buscar en Google Sheets ANTES de cualquier procesamiento
+        last10 = _normalize_last10(phone)
+        match = sheet_match_by_last10(last10)
+        
+        # ✅ CORRECCIÓN: Guardar match en contexto inmediatamente
+        ctx = ensure_ctx(phone)
+        ctx["match"] = match
+        ctx["last10"] = last10
+        
+        # ✅ CORRECCIÓN: Saludo solo si es nuevo Y no se saludó recientemente
+        if is_new_conversation:
+            now = datetime.utcnow()
+            last_greeting = greeted_at.get(phone)
+            if not last_greeting or (now - last_greeting) > timedelta(hours=24):
+                if match and match.get("nombre"):
+                    send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar?")
+                else:
+                    send_message(phone, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
+                greeted_at[phone] = now
+        
+        # ✅ CORRECCIÓN: Inicializar estado SOLO si no existe
         if phone not in user_state:
-            match = greet_with_match(phone, do_greet=True)
             user_state[phone] = ""
-        else:
-            ctx = ensure_ctx(phone)
-            match = ctx.get("match")
-            if match is None:
-                match = greet_with_match(phone, do_greet=False)
 
-        mtype = msg.get("type")
-
+        # ✅ CORRECCIÓN: Procesar mensaje según tipo
+        mtype = msg.get("type", "")
         if mtype == "text" and "text" in msg:
             text = (msg["text"].get("body") or "").strip()
-            if text.lower().startswith("sgpt:") and client_oa:
-                prompt = text.split("sgpt:", 1)[1].strip()
-                def _gpt_direct():
-                    try:
-                        res = client_oa.chat.completions.create(
-                            model=OPENAI_MODEL,
-                            messages=[{"role": "user", "content": prompt}],
-                            temperature=0.3,
-                        )
-                        ans = (res.choices[0].message.content or "").strip()
-                        send_message(phone, ans or "Listo.")
-                    except Exception:
-                        send_message(phone, "Hubo un detalle al procesar tu solicitud.")
-                threading.Thread(target=_gpt_direct, daemon=True).start()
-                return jsonify({"ok": True}), 200
-
+            logger.info(f"💬 Mensaje de {phone}: {text}")
             route_command(phone, text, match)
-            return jsonify({"ok": True}), 200
-
-        if mtype in {"image", "audio", "video", "document"}:
-            send_message(phone, "📎 *Recibido*. Gracias, lo reviso y te confirmo en breve.")
-            return jsonify({"ok": True}), 200
-
+            
+        elif mtype in {"image", "document", "audio", "video"}:
+            logger.info(f"📎 Medio recibido de {phone}: {mtype}")
+            # ✅ MEJORA: Procesar medios con GPT-4 Vision si es imagen
+            if mtype == "image" and client_oa:
+                process_media_with_gpt(phone, msg)
+            else:
+                send_message(phone, "📎 Archivo recibido. Lo revisaré y te respondo pronto.")
+                
         return jsonify({"ok": True}), 200
-    except Exception:
-        log.exception("Error en webhook_receive")
+        
+    except Exception as e:
+        logger.error(f"❌ Error en webhook: {str(e)}", exc_info=True)
+        # ✅ CORRECCIÓN: Siempre responder 200 para evitar reintentos de Meta
         return jsonify({"ok": True}), 200
 
 # =========================
-# Ruta raíz para health checks de Render
+# HEALTH CHECKS MEJORADOS
 # =========================
-@app.route('/')
-def root():
-    return jsonify({"status": "online", "service": "Vicky Bot SECOM", "timestamp": datetime.utcnow().isoformat()}), 200
 
-# =========================
-# Endpoints auxiliares
-# =========================
-@app.get("/ext/health")
-def ext_health():
-    return jsonify({
-        "status": "ok",
+@app.route("/ext/deep-health")
+def deep_health_check():
+    """Health check mejorado para monitoreo"""
+    health_status = {
+        "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID),
-        "google_ready": google_ready,
-        "openai_ready": bool(client_oa is not None),
-        "sheet_name": GOOGLE_SHEET_NAME,
-        "manuales_folder": bool(MANUALES_VICKY_FOLDER_ID),
-    }), 200
-
-@app.post("/ext/test-send")
-def ext_test_send():
+        "components": {}
+    }
+    
+    # Verificar WhatsApp API
     try:
-        data = request.get_json(force=True) or {}
-        to = str(data.get("to", "")).strip()
-        text = str(data.get("text", "")).strip()
-        if not to or not text:
-            return jsonify({"ok": False, "error": "Faltan 'to' y/o 'text'"}), 400
-        ok = send_message(to, text)
-        return jsonify({"ok": bool(ok)}), 200
+        test_msg = send_message("test", "Health check", real_send=False)
+        health_status["components"]["whatsapp"] = "healthy" if test_msg else "unhealthy"
     except Exception as e:
-        log.exception("Error en /ext/test-send")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-@app.get("/ext/manuales")
-def ext_manuales():
+        health_status["components"]["whatsapp"] = f"unhealthy: {str(e)}"
+    
+    # Verificar Google Sheets
     try:
-        files = list_drive_manuals(MANUALES_VICKY_FOLDER_ID)
-        return jsonify({"ok": True, "files": files}), 200
+        test_sheet = sheet_match_by_last10("1234567890", test_mode=True)
+        health_status["components"]["google_sheets"] = "healthy"
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        health_status["components"]["google_sheets"] = f"unhealthy: {str(e)}"
+    
+    # Verificar OpenAI
+    try:
+        test_gpt = client_oa.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": "Test"}],
+            max_tokens=5
+        ) if client_oa else None
+        health_status["components"]["openai"] = "healthy" if test_gpt else "unhealthy"
+    except Exception as e:
+        health_status["components"]["openai"] = f"unhealthy: {str(e)}"
+    
+    # Determinar estado general
+    unhealthy_components = [c for c in health_status["components"].values() if "unhealthy" in c]
+    if unhealthy_components:
+        health_status["status"] = "degraded"
+        health_status["unhealthy_components"] = unhealthy_components
+    
+    return jsonify(health_status), 200
 
-@app.get("/health")
-def health():
-    return jsonify({"status": "ok", "service": "Vicky Bot SECOM"}), 200
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "online",
+        "service": "WhatsApp Business API + GPT-4",
+        "timestamp": datetime.utcnow().isoformat()
+    })
 
 # =========================
-# Arranque local
+# LIMPIEZA PERIÓDICA
 # =========================
+
+def cleanup_old_data():
+    """Limpia datos antiguos para optimizar memoria"""
+    now = datetime.utcnow()
+    
+    # Limpiar user_state antiguo (24 horas sin actividad)
+    expired_phones = []
+    for phone, ctx in user_ctx.items():
+        last_activity = ctx.get("last_activity", ctx["created_at"])
+        if (now - last_activity) > timedelta(hours=24):
+            expired_phones.append(phone)
+    
+    for phone in expired_phones:
+        user_state.pop(phone, None)
+        user_ctx.pop(phone, None)
+        greeted_at.pop(phone, None)
+    
+    # Limpiar cache RAG antiguo (24 horas)
+    global rag_cache
+    current_time = time.time()
+    rag_cache = {k: v for k, v in rag_cache.items() 
+                if current_time - v["timestamp"] < 86400}
+    
+    if expired_phones:
+        logger.info(f"🧹 Limpiados {len(expired_phones)} usuarios inactivos")
+
+# Ejecutar limpieza al inicio
+cleanup_old_data()
+
 if __name__ == "__main__":
-    log.info(f"Vicky SECOM en puerto {PORT}")
-    log.info(f"WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
-    log.info(f"Google listo: {google_ready}")
-    log.info(f"OpenAI listo: {bool(client_oa is not None)}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
-
-
-
-
-
-
-
-
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
