@@ -229,15 +229,24 @@ def list_drive_manuals(folder_id: str) -> List[Dict[str, str]]:
 _manual_auto_cache = {"text": None, "file_id": None, "loaded_at": None}
 
 def _find_auto_manual_file_id() -> Optional[str]:
-    if not (google_ready and drive_client and MANUALES_VICKY_FOLDER_ID):
+
+    if not (google_ready and drive_client):
         return None
     try:
-        q = (
-            f"'{MANUALES_VICKY_FOLDER_ID}' in parents and "
-            "mimeType='application/pdf' and trashed=false"
-        )
-        resp = drive_client.files().list(q=q, fields="files(id, name)", pageSize=50).execute()
-        files = resp.get("files", [])
+        # Prefer folder search when provided
+        files = []
+        if MANUALES_VICKY_FOLDER_ID:
+            q = (
+                f"'{MANUALES_VICKY_FOLDER_ID}' in parents and "
+                "mimeType='application/pdf' and trashed=false"
+            )
+            resp = drive_client.files().list(q=q, fields="files(id, name)", pageSize=100).execute()
+            files = resp.get("files", [])
+        else:
+            # Global fallback: search PDFs related to auto/coberturas anywhere in Drive
+            q = "mimeType='application/pdf' and trashed=false and (name contains 'auto' or name contains 'cobertura')"
+            resp = drive_client.files().list(q=q, fields="files(id, name)", pageSize=50).execute()
+            files = resp.get("files", [])
         # Prioriza nombres que sugieran auto/coberturas
         for f in files:
             name = (f.get("name") or "").lower()
@@ -247,6 +256,7 @@ def _find_auto_manual_file_id() -> Optional[str]:
     except Exception:
         log.exception("Error buscando manual Auto")
         return None
+
 
 def _download_pdf_text(file_id: str) -> Optional[str]:
     try:
@@ -274,43 +284,59 @@ def _download_pdf_text(file_id: str) -> Optional[str]:
         return None
 
 def ensure_auto_manual_text(force_reload: bool = False) -> Optional[str]:
-    if not client_oa:
+
+    if not (google_ready and drive_client):
+        log.error("[rag-auto] Google Drive no disponible")
         return None
     if not force_reload and _manual_auto_cache.get("text"):
         return _manual_auto_cache["text"]
     fid = _find_auto_manual_file_id()
     if not fid:
+        log.error("[rag-auto] No se encontró PDF de Auto en Drive")
         return None
-    text = _download_pdf_text(fid)
-    if text:
-        _manual_auto_cache.update({"text": text, "file_id": fid, "loaded_at": datetime.utcnow()})
+    text_content = _download_pdf_text(fid)
+    if text_content:
+        _manual_auto_cache.update({"text": text_content, "file_id": fid, "loaded_at": datetime.utcnow()})
         log.info("[rag-auto] Manual cacheado")
-    return text
+    else:
+        log.error("[rag-auto] No se pudo leer texto del PDF")
+    return _manual_auto_cache.get("text")
+
 
 def answer_auto_from_manual(question: str) -> Optional[str]:
-    if not client_oa:
-        return None
+
     manual_text = ensure_auto_manual_text()
     if not manual_text:
+        log.warning("[rag-auto] Sin texto del manual; no se responderá por RAG")
         return None
     # Heurística: filtra párrafos relevantes
-    keys = ["amplia plus", "amplia", "cobertura", "asistencia", "cristales", "auto de reemplazo", "deducible"]
+    keys = ["amplia plus", "amplia", "cobertura", "asistencia", "cristales", "auto de reemplazo", "deducible", "responsabilidad civil", "daños materiales"]
     parts = []
-    for ln in manual_text.split("\n"):
+    for ln in manual_text.split("
+"):
         low = ln.lower()
         if any(k in low for k in keys):
             parts.append(ln.strip())
             if len(" ".join(parts)) > 8000:
                 break
-    focus = "\n".join(parts) if parts else manual_text[:9000]
+    focus = "
+".join(parts) if parts else manual_text[:9000]
     try:
         prompt = (
             "Responde SOLO con base en el texto del manual (auto). "
-            "Sé preciso, en español, y usa viñetas si ayuda. "
-            "Si no aparece en el manual, di: 'No está indicado en el manual'.\n\n"
-            f"Pregunta: {question}\n\n"
-            f"Manual (extracto):\n{focus}\n\n"
-            "==\nRespuesta:"
+            "Si una cobertura no aparece, responde exactamente: 'No está indicado en el manual'. "
+            "Sé preciso, en español, y usa viñetas claras.
+
+"
+            f"Pregunta: {question}
+
+"
+            f"Manual (extracto):
+{focus}
+
+"
+            "==
+Respuesta:"
         )
         res = client_oa.chat.completions.create(
             model=OPENAI_MODEL,
@@ -318,12 +344,14 @@ def answer_auto_from_manual(question: str) -> Optional[str]:
             temperature=0.2,
         )
         ans = (res.choices[0].message.content or "").strip()
+        log.info("[rag-auto] Respuesta generada por RAG (%d chars)", len(ans) if ans else 0)
         return ans[:1500] if ans else None
     except Exception:
         log.exception("Error RAG-auto")
         return None
 
 # =========================
+
 # Menú y flujos
 # =========================
 MAIN_MENU = (
@@ -441,7 +469,7 @@ def flow_auto_next(phone: str, text: str) -> None:
             user_state[phone] = "auto_vto"
             flow_auto_next(phone, text)
         else:
-            send_message(phone, "Perfecto. Envía documentos o escribe la fecha de vencimiento (AAAAA-MM-DD).")
+            send_message(phone, "Perfecto. Envía documentos o escribe la fecha de vencimiento (AAAA-MM-DD).")
     elif st == "auto_vto":
         try:
             date = datetime.fromisoformat(text.strip()).date()
@@ -733,6 +761,18 @@ def webhook_receive():
 
 # =========================
 # Endpoints auxiliares
+# --- RAG cache control ---
+@app.post("/ext/rag/refresh")
+def ext_rag_refresh():
+    try:
+        _manual_auto_cache.clear()
+        _manual_auto_cache.update({"text": None, "file_id": None, "loaded_at": None})
+        txt = ensure_auto_manual_text(force_reload=True)
+        return jsonify({"ok": bool(txt), "loaded": bool(txt)}), 200
+    except Exception as e:
+        log.exception("Error en /ext/rag/refresh")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 # =========================
 @app.get("/ext/health")
 def ext_health():
@@ -781,8 +821,3 @@ if __name__ == "__main__":
     log.info(f"Google listo: {google_ready}")
     log.info(f"OpenAI listo: {bool(client_oa is not None)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
-
-
-
-
