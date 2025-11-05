@@ -1,6 +1,6 @@
-# app_vicky_wapi.py — Vicky Bot SECOM (WAPI-safe, ADD-ONLY patches)
+# app.py — Vicky Bot SECOM (Render-ready)
 # Python 3.10+
-# Ejecuta en Render: gunicorn app_vicky_wapi:app --bind 0.0.0.0:$PORT
+# Ejecuta en Render: gunicorn app:app --bind 0.0.0.0:$PORT
 
 import os
 import re
@@ -43,11 +43,6 @@ GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Prospectos SECOM Auto").stri
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 MANUALES_VICKY_FOLDER_ID = os.getenv("MANUALES_VICKY_FOLDER_ID", "").strip()
 
-# >>> VX: DRIVE FILE OVERRIDE (ADD-ONLY)
-# Soporte de override directo de PDF del manual (opcional)
-PREF_MANUAL_FILE_ID = os.getenv("DRIVE_MANUAL_FILE_ID", "").strip()
-# <<< VX: DRIVE FILE OVERRIDE
-
 NOTIFICAR_ASESOR = os.getenv("NOTIFICAR_ASESOR", "true").lower() == "true"
 PORT = int(os.getenv("PORT", "5000"))
 
@@ -56,7 +51,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("vicky-secom-wapi")
+log = logging.getLogger("vicky-secom")
 
 # =========================
 # Clientes externos
@@ -72,20 +67,6 @@ if OPENAI_API_KEY:
         client_oa = OpenAI(api_key=OPENAI_API_KEY)
     except Exception:
         log.exception("No se pudo inicializar OpenAI")
-
-# >>> VX: OPENAI INIT (ADD-ONLY)
-# Inicialización robusta con logs claros y sin romper el flujo si falta API key.
-if client_oa is None:
-    try:
-        if OPENAI_API_KEY:
-            client_oa = OpenAI(api_key=OPENAI_API_KEY)
-            log.info("OpenAI listo (client_oa activo)")
-        else:
-            log.warning("OPENAI_API_KEY ausente. GPT deshabilitado.")
-    except Exception:
-        client_oa = None
-        log.exception("Error inicializando OpenAI")
-# <<< VX: OPENAI INIT
 
 # Google Sheets + Drive (solo lectura)
 sheets_client = None
@@ -198,25 +179,6 @@ def ensure_ctx(phone: str) -> Dict[str, Any]:
         user_ctx[phone] = {}
     return user_ctx[phone]
 
-# >>> VX: GPT HELPERS (ADD-ONLY)
-def gpt_complete(system_msg: str, user_msg: str, model: str = OPENAI_MODEL,
-                 temperature: float = 0.2, max_tokens: int = 400) -> Optional[str]:
-    if client_oa is None:
-        return None
-    try:
-        rsp = client_oa.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system_msg},
-                      {"role": "user", "content": user_msg}],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return (rsp.choices[0].message.content or "").strip()
-    except Exception:
-        log.exception("Fallo en gpt_complete")
-        return None
-# <<< VX: GPT HELPERS
-
 # =========================
 # Google helpers
 # =========================
@@ -286,30 +248,15 @@ def _find_auto_manual_file_id() -> Optional[str]:
         log.exception("Error buscando manual Auto")
         return None
 
-# >>> VX: DOWNLOAD PDF ROBUST (ADD-ONLY)
 def _download_pdf_text(file_id: str) -> Optional[str]:
-    """
-    Descarga el PDF desde Drive y extrae texto con PyPDF2, con reintentos y limpieza básica.
-    """
-    if not (google_ready and drive_client and file_id):
-        return None
     try:
         from googleapiclient.http import MediaIoBaseDownload
         req = drive_client.files().get_media(fileId=file_id)
         fh = io.BytesIO()
         downloader = MediaIoBaseDownload(fh, req)
         done = False
-        tries = 0
-        while not done and tries < 5:
-            tries += 1
-            try:
-                status, done = downloader.next_chunk()
-            except requests.exceptions.Timeout:
-                time.sleep(0.5 * tries)
-            except Exception:
-                if tries >= 5:
-                    raise
-                time.sleep(0.5 * tries)
+        while not done:
+            status, done = downloader.next_chunk()
         fh.seek(0)
         reader = PdfReader(fh)
         pages = []
@@ -321,78 +268,60 @@ def _download_pdf_text(file_id: str) -> Optional[str]:
         text = "\n".join(pages)
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
-        text = text.strip()
-        return text or None
+        return text.strip() or None
     except Exception:
         log.exception("No se pudo extraer texto PDF (Auto)")
         return None
-# <<< VX: DOWNLOAD PDF ROBUST
 
-# >>> VX: ENSURE MANUAL OVERRIDE (ADD-ONLY, modifica internamente la lógica)
 def ensure_auto_manual_text(force_reload: bool = False) -> Optional[str]:
-    """
-    Asegura que el texto del manual de Auto esté cacheado.
-    - Si DRIVE_MANUAL_FILE_ID está definido, lo usa directamente.
-    - Si no, busca en la carpeta MANUALES_VICKY_FOLDER_ID como antes.
-    - Quita dependencia de client_oa: debe funcionar aunque no haya GPT.
-    """
-    global _manual_auto_cache
-    # Cache
+    if not client_oa:
+        return None
     if not force_reload and _manual_auto_cache.get("text"):
         return _manual_auto_cache["text"]
-
-    # Selección de archivo
-    fid = None
-    if PREF_MANUAL_FILE_ID:
-        fid = PREF_MANUAL_FILE_ID
-    else:
-        fid = _find_auto_manual_file_id()
-
+    fid = _find_auto_manual_file_id()
     if not fid:
-        log.warning("No se encontró manual de autos en Drive (override o carpeta).")
         return None
-
     text = _download_pdf_text(fid)
     if text:
         _manual_auto_cache.update({"text": text, "file_id": fid, "loaded_at": datetime.utcnow()})
-        log.info("[rag-auto] Manual cacheado (override=%s)", bool(PREF_MANUAL_FILE_ID))
-        return text
-    return None
-# <<< VX: ENSURE MANUAL OVERRIDE
+        log.info("[rag-auto] Manual cacheado")
+    return text
 
 def answer_auto_from_manual(question: str) -> Optional[str]:
-    # Mantener compatibilidad: si hay GPT, resumimos; si no, devolvemos extracto básico.
+    if not client_oa:
+        return None
     manual_text = ensure_auto_manual_text()
     if not manual_text:
         return None
-
     # Heurística: filtra párrafos relevantes
-    keys = ["amplia plus", "amplia", "cobertura", "asistencia", "cristales", "auto de reemplazo", "deducible", "rc", "daños"]
+    keys = ["amplia plus", "amplia", "cobertura", "asistencia", "cristales", "auto de reemplazo", "deducible"]
     parts = []
     for ln in manual_text.split("\n"):
         low = ln.lower()
-        if any(k in low for k in keys) or any(k in (question or "").lower() for k in keys):
-            if ln.strip():
-                parts.append(ln.strip())
+        if any(k in low for k in keys):
+            parts.append(ln.strip())
             if len(" ".join(parts)) > 8000:
                 break
     focus = "\n".join(parts) if parts else manual_text[:9000]
-
-    # Si hay GPT, pedimos una respuesta limpia y amable; si no, devolvemos el extracto.
-    if client_oa:
-        try:
-            sys = ("Responde SOLO con base en el texto del manual (auto). "
-                   "Sé preciso, en español, y usa viñetas si ayuda. "
-                   "Si no aparece en el manual, di: 'No está indicado en el manual'.")
-            usr = f"Pregunta: {question}\n\nManual (extracto):\n{focus}\n\n==\nRedacta la respuesta:"
-            ans = gpt_complete(sys, usr, model=OPENAI_MODEL, temperature=0.2, max_tokens=600)
-            if ans:
-                return ans[:1500]
-        except Exception:
-            log.exception("Error RAG-auto con GPT")
-    # Fallback sin GPT
-    snippet = (focus or "").strip()
-    return snippet[:1200] if snippet else None
+    try:
+        prompt = (
+            "Responde SOLO con base en el texto del manual (auto). "
+            "Sé preciso, en español, y usa viñetas si ayuda. "
+            "Si no aparece en el manual, di: 'No está indicado en el manual'.\n\n"
+            f"Pregunta: {question}\n\n"
+            f"Manual (extracto):\n{focus}\n\n"
+            "==\nRespuesta:"
+        )
+        res = client_oa.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        ans = (res.choices[0].message.content or "").strip()
+        return ans[:1500] if ans else None
+    except Exception:
+        log.exception("Error RAG-auto")
+        return None
 
 # =========================
 # Menú y flujos
@@ -629,64 +558,6 @@ def flow_contacto(phone: str) -> None:
     send_main_menu(phone)
 
 # =========================
-# FREE-TEXT CATCH (ADD-ONLY) — RAG/GPT sin tocar el menú
-# =========================
-# >>> VX: FREE-TEXT CATCH (ADD-ONLY)
-KEYS_AUTO = ["cobertura", "coberturas", "suma asegurada", "exclusión", "exclusiones",
-             "deducible", "amplia", "limitada", "rc", "daños", "asistencia", "auto de reemplazo", "cristales"]
-
-def _handle_free_text(sender: str, text: str) -> bool:
-    """
-    Maneja texto libre:
-      1) Si contiene palabras clave de auto → usa RAG y pule con GPT si disponible.
-      2) Si no, intenta GPT genérico (si existe).
-      3) Si nada aplica, retorna False para que el caller haga fallback a menú.
-    """
-    low = (text or "").lower()
-
-    # 1) Palabras clave → RAG
-    if any(k in low for k in KEYS_AUTO):
-        manual_txt = ensure_auto_manual_text(force_reload=False)
-        if manual_txt:
-            base = None
-            try:
-                base = answer_auto_from_manual(low) or ""
-            except Exception:
-                log.exception("answer_auto_from_manual falló")
-                base = ""
-
-            # Reescribir con GPT si disponible
-            if client_oa and base:
-                nice = gpt_complete(
-                    "Eres Vicky, amable, clara y precisa. Responde en español neutro (México). "
-                    "No inventes datos; usa solo el texto base.",
-                    f"Texto base del manual:\n{base}\n\nReescribe para el cliente en 1-2 párrafos y agrega una línea con "
-                    "'¿Deseas que te ayude con una cotización o más detalles?'",
-                    max_tokens=300
-                )
-                if nice:
-                    send_message(sender, nice)
-                    return True
-            # Sin GPT o sin base → fallback breve
-            if base:
-                send_message(sender, base)
-                return True
-
-    # 2) GPT genérico si disponible
-    if client_oa:
-        nice = gpt_complete(
-            "Eres Vicky, bot de atención de seguros y créditos. Ayuda en tono cordial y breve. "
-            "Si la duda no es específica, sugiere usar el menú.",
-            f"Consulta del cliente: {text}\nResponde en 2-3 frases y sugiere el menú si aplica."
-        )
-        if nice:
-            send_message(sender, nice)
-            return True
-
-    return False
-# <<< VX: FREE-TEXT CATCH
-
-# =========================
 # Router principal
 # =========================
 def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
@@ -741,13 +612,7 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
         flow_empresarial_next(phone, text)
         return
 
-    # >>> VX: INVOCACIÓN FREE-TEXT CATCH (ADD-ONLY)
-    handled = _handle_free_text(phone, text or "")
-    if handled:
-        return
-    # <<< VX: INVOCACIÓN FREE-TEXT CATCH
-
-    # Fallback GPT (OpenAI 1.x) — se mantiene la ruta existente
+    # Fallback GPT (OpenAI 1.x)
     if client_oa:
         def _gpt_reply():
             try:
@@ -881,18 +746,6 @@ def ext_health():
         "manuales_folder": bool(MANUALES_VICKY_FOLDER_ID),
     }), 200
 
-# >>> VX: HEALTH FLAGS (ADD-ONLY)
-@app.get("/ext/ready")
-def ext_ready():
-    return jsonify({
-        "openai_ready": bool(client_oa is not None),
-        "drive_ready": bool(drive_client is not None),
-        "sheets_ready": bool(sheets_client is not None),
-        "manual_cached": bool(bool(globals().get("_manual_auto_cache", {}).get("text"))),
-        "override_file_id": bool(PREF_MANUAL_FILE_ID),
-    }), 200
-# <<< VX: HEALTH FLAGS
-
 @app.post("/ext/test-send")
 def ext_test_send():
     try:
@@ -917,15 +770,17 @@ def ext_manuales():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "service": "Vicky Bot SECOM (WAPI)"}), 200
+    return jsonify({"status": "ok", "service": "Vicky Bot SECOM"}), 200
 
 # =========================
 # Arranque local
 # =========================
 if __name__ == "__main__":
-    log.info(f"Vicky SECOM (WAPI) en puerto {PORT}")
+    log.info(f"Vicky SECOM en puerto {PORT}")
     log.info(f"WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
     log.info(f"Google listo: {google_ready}")
     log.info(f"OpenAI listo: {bool(client_oa is not None)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
+
 
