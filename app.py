@@ -17,7 +17,7 @@ app = Flask(__name__)
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("META_TOKEN")  # ✅ Ajustado para Render
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-ADVISOR_WHATSAPP = os.getenv("ADVISOR_WHATSAPP", "5216682478005")  # Notificación privada al asesor
+ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")  # Notificación privada al asesor
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ✅ GPT (opcional)
 
 # 🧠 Controles en memoria
@@ -346,9 +346,9 @@ def receive_message():
                 media_id = (message.get("image") or {}).get("id")
                 caption = (message.get("image") or {}).get("caption", "") or ""
                 try:
-                    if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender and media_id:
+                    if ADVISOR_NUMBER and ADVISOR_NUMBER != sender and media_id:
                         send_media_image(
-                            ADVISOR_WHATSAPP,
+                            ADVISOR_NUMBER,
                             media_id,
                             caption=f"📎 Imagen recibida de {profile_name or sender}. {('Nota: ' + caption) if caption else ''}"
                         )
@@ -362,9 +362,9 @@ def receive_message():
                 media_id = (message.get("document") or {}).get("id")
                 filename = (message.get("document") or {}).get("filename", "")
                 try:
-                    if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender and media_id:
+                    if ADVISOR_NUMBER and ADVISOR_NUMBER != sender and media_id:
                         send_media_document(
-                            ADVISOR_WHATSAPP,
+                            ADVISOR_NUMBER,
                             media_id,
                             caption=f"📄 Documento recibido de {profile_name or sender} {f'({filename})' if filename else ''}"
                         )
@@ -445,9 +445,9 @@ def receive_message():
                         f"- Mensaje original: \"{text.strip()}\""
                     )
                     try:
-                        if ADVISOR_WHATSAPP and ADVISOR_WHATSAPP != sender:
-                            send_message(ADVISOR_WHATSAPP, notify_text)
-                            logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_WHATSAPP}")
+                        if ADVISOR_NUMBER and ADVISOR_NUMBER != sender:
+                            send_message(ADVISOR_NUMBER, notify_text)
+                            logging.info(f"📨 Notificación privada enviada al asesor {ADVISOR_NUMBER}")
                     except Exception as e:
                         logging.error(f"❌ Error notificando al asesor: {e}")
                 continue
@@ -836,82 +836,59 @@ except NameError:
         return render_template_string(html)
 
 
-@app.route("/ext/send-promo", methods=["POST"])
-def vx_ext_send_promo():
-    """
-    Envía PROMO por WhatsApp.
-    Puede recibir:
-      - {"to": "521...", "text": "mensaje"}
-      - {"to": ["521...","521..."], "template": "promo_x", "params": {...}}
-      - {"secom": true, "producto": "auto", "text": "..."}
-    """
-    import json, gspread, re
-    from google.oauth2.service_account import Credentials
+    @app.route("/ext/send-promo", methods=["POST"])
+    def vx_ext_send_promo():
+        """
+        Envía PROMO por WhatsApp.
+        Body JSON:
+        {
+          "to": "5216682478005" | ["5216...","5218..."],
+          "text": "mensaje libre",                  # opcional
+          "template": "promo_auto_v1",              # opcional (string)
+          "params": { "nombre": "X", "oferta": "Y"} # opcional (dict)
+        }
+        """
+        import threading, logging
 
-    data = request.get_json(force=True, silent=True) or {}
-    to = data.get("to")
-    text = data.get("text")
-    template = data.get("template")
-    params = data.get("params", {})
-    use_secom = bool(data.get("secom"))
-    producto = (data.get("producto") or "").strip().lower()
+        data = request.get_json(force=True, silent=True) or {}
+        to = data.get("to")
+        text = data.get("text")
+        template = data.get("template")
+        params = data.get("params", {})
 
-    targets = []
+        if isinstance(to, str):
+            targets = [to]
+        elif isinstance(to, list):
+            targets = [str(x) for x in to if str(x).strip()]
+        else:
+            return jsonify({"ok": False, "error": "Falta 'to' (string o lista)"}), 400
 
-    if use_secom:
-        try:
-            gj = os.getenv("GOOGLE_CREDENTIALS_JSON")
-            sid = os.getenv("SHEETS_ID_LEADS")
-            title = os.getenv("SHEETS_TITLE_LEADS")
-            if gj and sid and title and producto:
-                info = json.loads(gj)
-                scopes = [
-                    "https://www.googleapis.com/auth/spreadsheets.readonly",
-                    "https://www.googleapis.com/auth/drive.readonly",
-                ]
-                creds = Credentials.from_service_account_info(info, scopes=scopes)
-                client = gspread.authorize(creds)
-                ws = client.open_by_key(sid).worksheet(title)
-                rows = ws.get_all_records()
-                seen = set()
-                for row in rows:
-                    prod = str(row.get("PRODUCTO", "")).strip().lower()
-                    wa = str(row.get("WhatsApp", "")).strip()
-                    if not wa:
-                        continue
-                    last10 = re.sub(r"\D", "", wa)[-10:]
-                    if not last10:
-                        continue
-                    e164 = f"521{last10}"
-                    if prod == producto and e164 not in seen:
-                        seen.add(e164)
-                        targets.append(e164)
-        except Exception as e:
-            logging.error(f"/ext/send-promo SECOM error: {e}")
+        def _worker(targets, text, template, params):
+            results = []
+            for num in targets:
+                ok = False
+                try:
+                    if template:
+                        comps = []
+                        if params:
+                            comps = [{
+                                "type": "body",
+                                "parameters": [
+                                    {"type": "text", "text": str(v)}
+                                    for v in params.values()
+                                ]
+                            }]
+                        ok = vx_wa_send_template(num, template, "es_MX", comps)
+                    elif text:
+                        ok = vx_wa_send_text(num, text)
+                    results.append({"to": num, "sent": ok})
+                except Exception as e:
+                    logging.getLogger("vx").error(f"send_promo worker error: {e}")
+                    results.append({"to": num, "sent": False, "error": str(e)})
+            logging.getLogger("vx").info(f"send_promo done: {results}")
 
-    elif isinstance(to, str):
-        targets = [to]
-    elif isinstance(to, list):
-        targets = [str(x) for x in to if str(x).strip()]
-
-    if not targets:
-        return jsonify({"ok": False, "error": "No se encontraron destinatarios"}), 400
-
-    def _worker(nums, text, template, params):
-        results = []
-        for num in nums:
-            ok = False
-            try:
-                if text:
-                    ok = send_message(num, text)
-                results.append({"to": num, "sent": ok})
-            except Exception as e:
-                results.append({"to": num, "sent": False, "error": str(e)})
-        logging.info(f"Promo results: {results}")
-
-    threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
-    return jsonify({"accepted": True, "count": len(targets)}), 202
-
+        threading.Thread(target=_worker, args=(targets, text, template, params), daemon=True).start()
+        return jsonify({"accepted": True, "count": len(targets)}), 202
 
 
 # ========= SECOM minimal integration (non-invasive) =========
@@ -986,3 +963,5 @@ try:
 except Exception:
     pass
 # ====== End SECOM minimal integration ======
+
+
