@@ -1067,5 +1067,3 @@ if __name__ == "__main__":
             log.warning("No se pudo cargar el manual inicial")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
-
