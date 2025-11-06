@@ -1,14 +1,5 @@
-# app.py — Vicky SECOM (Versión 100% Funcional Corregida)
-# Python 3.11+
-# ------------------------------------------------------------
-# CORRECCIONES APLICADAS:
-# 1. ✅ Endpoint /ext/send-promo completamente funcional
-# 2. ✅ Eliminación de función duplicada
-# 3. ✅ Validación robusta de configuración
-# 4. ✅ Logging exhaustivo para diagnóstico
-# 5. ✅ Manejo mejorado de errores
-# 6. ✅ Worker para envíos masivos
-# ------------------------------------------------------------
+# app.py — Vicky SECOM (Versión Corregida - Matching Siempre Activo)
+# CORRECCIÓN PRINCIPAL: Matching con Google Sheets siempre activo, sin importar el estado del usuario
 
 from __future__ import annotations
 
@@ -717,7 +708,11 @@ def webhook_receive():
 
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
 
-        match = _greet_and_match(phone) if phone not in user_state else None
+        # ✅ CORRECCIÓN PRINCIPAL: Siempre hacer matching con Google Sheets
+        # sin importar el estado del usuario
+        match = match_client_in_sheets(_normalize_phone_last10(phone))
+        if match and match.get("nombre") and phone not in user_state:
+            send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
 
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
@@ -944,6 +939,6 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
     
+
 
