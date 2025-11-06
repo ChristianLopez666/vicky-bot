@@ -1,5 +1,5 @@
-# app.py — Vicky SECOM (Versión Corregida - Matching Mejorado)
-# CORRECCIÓN PRINCIPAL: Matching con Google Sheets mejorado para buscar en columna específica
+# app.py — Vicky SECOM (Versión Integrada - Arquitectura Completa)
+# INTEGRACIÓN: Combina app (1).py + core_router + config_env + workers + utils
 
 from __future__ import annotations
 
@@ -19,7 +19,77 @@ import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-# Google
+# ==========================
+# Carga configuración modular
+# ==========================
+try:
+    from config_env import Config, DevelopmentConfig, ProductionConfig
+    config = ProductionConfig() if os.getenv('FLASK_ENV') == 'production' else DevelopmentConfig()
+except ImportError:
+    # Fallback a configuración directa si config_env no está disponible
+    class Config:
+        META_TOKEN = os.getenv("META_TOKEN")
+        WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
+        VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+        ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
+        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+        GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+        SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
+        SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto")
+        DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
+        PORT = int(os.getenv("PORT", "5000"))
+        LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    
+    config = Config()
+
+# ==========================
+# Utilitarios modulares
+# ==========================
+try:
+    from utils_logger import setup_logger
+    log = setup_logger("vicky-secom", level=config.LOG_LEVEL)
+except ImportError:
+    logging.basicConfig(
+        level=getattr(logging, config.LOG_LEVEL),
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    log = logging.getLogger("vicky-secom")
+
+try:
+    from utils_validators import normalize_phone, validate_email, extract_number
+except ImportError:
+    def normalize_phone(phone: str) -> str:
+        digits = re.sub(r"\D", "", phone or "")
+        return digits[-10:] if len(digits) >= 10 else digits
+    
+    def validate_email(email: str) -> bool:
+        return bool(re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email))
+    
+    def extract_number(text: str) -> Optional[float]:
+        if not text:
+            return None
+        clean = text.replace(",", "").replace("$", "")
+        m = re.search(r"(\d{1,12}(\.\d+)?)", clean)
+        try:
+            return float(m.group(1)) if m else None
+        except Exception:
+            return None
+
+# ==========================
+# Workers modulares
+# ==========================
+try:
+    from workers_inbound_worker import InboundWorker
+    from workers_outbound_worker import OutboundWorker
+    WORKERS_AVAILABLE = True
+except ImportError:
+    WORKERS_AVAILABLE = False
+    log.warning("Workers modulares no disponibles, usando procesamiento directo")
+
+# ==========================
+# Google APIs
+# ==========================
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -29,56 +99,50 @@ except Exception:
     build = None
     MediaIoBaseUpload = None
 
-# GPT opcional
+# ==========================
+# OpenAI GPT
+# ==========================
 try:
     import openai
 except Exception:
     openai = None
 
 # ==========================
-# Carga entorno + Logging
+# Inicialización Flask
 # ==========================
-load_dotenv()
-
-META_TOKEN = os.getenv("META_TOKEN")
-WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
-SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto")
-DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
-
-PORT = int(os.getenv("PORT", "5000"))
-
-# Configuración de logging robusta
-logging.basicConfig(
-    level=logging.INFO, 
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-log = logging.getLogger("vicky-secom")
-
-if OPENAI_API_KEY and openai:
-    try:
-        openai.api_key = OPENAI_API_KEY
-        log.info("OpenAI configurado correctamente")
-    except Exception:
-        log.warning("OpenAI configurado pero no disponible")
+app = Flask(__name__)
 
 # ==========================
-# Google Setup (degradable)
+# Queues y Workers
+# ==========================
+if WORKERS_AVAILABLE:
+    inbound_queue = queue.Queue()
+    outbound_queue = queue.Queue()
+    inbound_worker = InboundWorker(inbound_queue)
+    outbound_worker = OutboundWorker(outbound_queue)
+    log.info("✅ Workers modulares inicializados")
+else:
+    inbound_queue = None
+    outbound_queue = None
+    log.info("✅ Usando procesamiento directo (sin workers)")
+
+# ==========================
+# Estado de la aplicación
+# ==========================
+user_state: Dict[str, str] = {}
+user_data: Dict[str, Dict[str, Any]] = {}
+
+# ==========================
+# Configuración Google Services
 # ==========================
 creds = None
 sheets_svc = None
 drive_svc = None
 google_ready = False
 
-if GOOGLE_CREDENTIALS_JSON and service_account and build:
+if config.GOOGLE_CREDENTIALS_JSON and service_account and build:
     try:
-        info = json.loads(GOOGLE_CREDENTIALS_JSON)
+        info = json.loads(config.GOOGLE_CREDENTIALS_JSON)
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
@@ -93,56 +157,25 @@ if GOOGLE_CREDENTIALS_JSON and service_account and build:
 else:
     log.warning("⚠️ Credenciales de Google no disponibles. Modo mínimo activo.")
 
-# =================================
-# Estado por usuario en memoria
-# =================================
-app = Flask(__name__)
-user_state: Dict[str, str] = {}
-user_data: Dict[str, Dict[str, Any]] = {}
+# ==========================
+# Configuración OpenAI
+# ==========================
+if config.OPENAI_API_KEY and openai:
+    try:
+        openai.api_key = config.OPENAI_API_KEY
+        log.info("✅ OpenAI configurado correctamente")
+    except Exception:
+        log.warning("⚠️ OpenAI configurado pero no disponible")
 
 # ==========================
-# Utilidades generales
+# WhatsApp API Helpers
 # ==========================
-WPP_API_URL = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages" if WABA_PHONE_ID else None
+WPP_API_URL = f"https://graph.facebook.com/v20.0/{config.WABA_PHONE_ID}/messages" if config.WABA_PHONE_ID else None
 WPP_TIMEOUT = 15
 
-def _normalize_phone_last10(phone: str) -> str:
-    digits = re.sub(r"\D", "", phone or "")
-    return digits[-10:] if len(digits) >= 10 else digits
-
-def interpret_response(text: str) -> str:
-    if not text:
-        return "neutral"
-    t = text.lower()
-    pos = ["sí", "si", "claro", "ok", "de acuerdo", "vale", "afirmativo", "correcto"]
-    neg = ["no", "nel", "nop", "negativo", "no quiero", "no gracias", "no interesa"]
-    if any(p in t for p in pos):
-        return "positive"
-    if any(n in t for n in neg):
-        return "negative"
-    return "neutral"
-
-def extract_number(text: str) -> Optional[float]:
-    if not text:
-        return None
-    clean = text.replace(",", "").replace("$", "")
-    m = re.search(r"(\d{1,12}(\.\d+)?)", clean)
-    try:
-        return float(m.group(1)) if m else None
-    except Exception:
-        return None
-
-def _ensure_user(phone: str) -> Dict[str, Any]:
-    if phone not in user_data:
-        user_data[phone] = {}
-    return user_data[phone]
-
-# ==========================
-# WhatsApp Helpers (retries)
-# ==========================
 def _wpp_headers() -> Dict[str, str]:
     return {
-        "Authorization": f"Bearer {META_TOKEN}",
+        "Authorization": f"Bearer {config.META_TOKEN}",
         "Content-Type": "application/json"
     }
 
@@ -154,7 +187,7 @@ def _backoff(attempt: int) -> None:
 
 def send_message(to: str, text: str) -> bool:
     """Envía mensaje de texto WPP. Reintentos exponenciales en 429/5xx."""
-    if not (META_TOKEN and WPP_API_URL):
+    if not (config.META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID faltan).")
         return False
     
@@ -196,7 +229,7 @@ def send_message(to: str, text: str) -> bool:
 
 def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
     """Envía plantilla preaprobada."""
-    if not (META_TOKEN and WPP_API_URL):
+    if not (config.META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
         return False
     
@@ -251,30 +284,28 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
     return False
 
 # ==========================
-# Google Helpers - CORREGIDO
+# Google Sheets Helpers
 # ==========================
 def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
-    """CORREGIDO: Busca el teléfono específicamente en la tercera columna del sheet."""
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+    """Busca el teléfono específicamente en la tercera columna del sheet."""
+    if not (google_ready and sheets_svc and config.SHEETS_ID_LEADS and config.SHEETS_TITLE_LEADS):
         log.warning("⚠️ Sheets no disponible; no se puede hacer matching.")
         return None
     try:
-        rng = f"{SHEETS_TITLE_LEADS}!A:Z"
-        values = sheets_svc.spreadsheets().values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
+        rng = f"{config.SHEETS_TITLE_LEADS}!A:Z"
+        values = sheets_svc.spreadsheets().values().get(spreadsheetId=config.SHEETS_ID_LEADS, range=rng).execute()
         rows = values.get("values", [])
         phone_last10 = str(phone_last10)
         
         log.info(f"🔍 Buscando teléfono: {phone_last10} en {len(rows)} filas")
         
         for idx, row in enumerate(rows, start=1):
-            # CORRECCIÓN: Buscar específicamente en la tercera columna (índice 2) donde están los números
             if len(row) > 2:
-                sheet_phone = str(row[2]).strip()  # Tercera columna con números
+                sheet_phone = str(row[2]).strip()
                 sheet_phone_clean = re.sub(r"\D", "", sheet_phone)
                 
-                # Buscar coincidencia exacta en los últimos 10 dígitos
                 if phone_last10 == sheet_phone_clean[-10:] if len(sheet_phone_clean) >= 10 else sheet_phone_clean:
-                    nombre = row[0] if len(row) > 0 else ""  # Primera columna con nombre
+                    nombre = row[0] if len(row) > 0 else ""
                     log.info(f"✅ CLIENTE ENCONTRADO en Sheets: {nombre} ({phone_last10})")
                     return {"row": idx, "nombre": nombre or "", "raw": row}
         
@@ -286,7 +317,7 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
 
 def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
     """Registra una nota en una hoja 'Seguimiento' (append)."""
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+    if not (google_ready and sheets_svc and config.SHEETS_ID_LEADS):
         log.warning("⚠️ Sheets no disponible; no se puede escribir seguimiento.")
         return
     try:
@@ -295,7 +326,7 @@ def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
             "values": [[str(row), date_iso, note]]
         }
         sheets_svc.spreadsheets().values().append(
-            spreadsheetId=SHEETS_ID_LEADS,
+            spreadsheetId=config.SHEETS_ID_LEADS,
             range=f"{title}!A:C",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
@@ -307,11 +338,11 @@ def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
 
 def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
     """Ubica/crea subcarpeta dentro de DRIVE_PARENT_FOLDER_ID."""
-    if not (google_ready and drive_svc and DRIVE_PARENT_FOLDER_ID):
+    if not (google_ready and drive_svc and config.DRIVE_PARENT_FOLDER_ID):
         log.warning("⚠️ Drive no disponible; no se puede crear carpeta.")
         return None
     try:
-        q = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and '{DRIVE_PARENT_FOLDER_ID}' in parents and trashed = false"
+        q = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and '{config.DRIVE_PARENT_FOLDER_ID}' in parents and trashed = false"
         resp = drive_svc.files().list(q=q, fields="files(id, name)").execute()
         items = resp.get("files", [])
         if items:
@@ -320,7 +351,7 @@ def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
         meta = {
             "name": folder_name,
             "mimeType": "application/vnd.google-apps.folder",
-            "parents": [DRIVE_PARENT_FOLDER_ID],
+            "parents": [config.DRIVE_PARENT_FOLDER_ID],
         }
         created = drive_svc.files().create(body=meta, fields="id").execute()
         folder_id = created.get("id")
@@ -350,6 +381,33 @@ def upload_to_drive(file_name: str, file_bytes: bytes, mime_type: str, folder_na
         return None
 
 # ==========================
+# Funciones de utilidad
+# ==========================
+def interpret_response(text: str) -> str:
+    if not text:
+        return "neutral"
+    t = text.lower()
+    pos = ["sí", "si", "claro", "ok", "de acuerdo", "vale", "afirmativo", "correcto"]
+    neg = ["no", "nel", "nop", "negativo", "no quiero", "no gracias", "no interesa"]
+    if any(p in t for p in pos):
+        return "positive"
+    if any(n in t for n in neg):
+        return "negative"
+    return "neutral"
+
+def _ensure_user(phone: str) -> Dict[str, Any]:
+    if phone not in user_data:
+        user_data[phone] = {}
+    return user_data[phone]
+
+def _notify_advisor(text: str) -> None:
+    try:
+        log.info(f"👨‍💼 Notificando al asesor: {text}")
+        send_message(config.ADVISOR_NUMBER, text)
+    except Exception:
+        log.exception("❌ Error notificando al asesor")
+
+# ==========================
 # Menú principal
 # ==========================
 MAIN_MENU = (
@@ -370,14 +428,8 @@ def send_main_menu(phone: str) -> None:
     send_message(phone, MAIN_MENU)
 
 # ==========================
-# Embudos (conservados del original)
+# Embudos de conversación (preservados de app (1).py)
 # ==========================
-def _notify_advisor(text: str) -> None:
-    try:
-        log.info(f"👨‍💼 Notificando al asesor: {text}")
-        send_message(ADVISOR_NUMBER, text)
-    except Exception:
-        log.exception("❌ Error notificando al asesor")
 
 # --- IMSS (opción 1) ---
 def imss_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
@@ -433,10 +485,6 @@ def _imss_next(phone: str, text: str) -> None:
         _notify_advisor(f"🔔 IMSS — Prospecto preautorizado\nWhatsApp: {phone}\n" + msg)
         user_state[phone] = ""
         send_main_menu(phone)
-    else:
-        # ✅ CORRECCIÓN: Manejo de estado no reconocido
-        log.warning(f"⚠️ Estado no manejado en IMSS: {st} para {phone}")
-        send_message(phone, "Parece que hubo un error en la conversación. ¿Deseas volver al menú principal? (escribe 'menú')")
 
 # --- Crédito Empresarial (opción 5) ---
 def emp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
@@ -482,10 +530,6 @@ def _emp_next(phone: str, text: str) -> None:
         _notify_advisor(f"🔔 Empresarial — Nueva solicitud\nWhatsApp: {phone}\n" + resumen)
         user_state[phone] = ""
         send_main_menu(phone)
-    else:
-        # ✅ CORRECCIÓN: Manejo de estado no reconocido
-        log.warning(f"⚠️ Estado no manejado en Empresarial: {st} para {phone}")
-        send_message(phone, "Parece que hubo un error en la conversación. ¿Deseas volver al menú principal? (escribe 'menú')")
 
 # --- Financiamiento Práctico (opción 6) ---
 FP_QUESTIONS = [f"Pregunta {i}" for i in range(1, 12)]
@@ -518,10 +562,6 @@ def _fp_next(phone: str, text: str) -> None:
         _notify_advisor(f"🔔 Financiamiento Práctico — Resumen\nWhatsApp: {phone}\n{resumen}")
         user_state[phone] = ""
         send_main_menu(phone)
-    else:
-        # ✅ CORRECCIÓN: Manejo de estado no reconocido
-        log.warning(f"⚠️ Estado no manejado en Financiamiento: {st} para {phone}")
-        send_message(phone, "Parece que hubo un error en la conversación. ¿Deseas volver al menú principal? (escribe 'menú')")
 
 # --- Seguros de Auto (opción 2) ---
 def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
@@ -556,10 +596,6 @@ def _auto_next(phone: str, text: str) -> None:
             send_main_menu(phone)
         except Exception:
             send_message(phone, "Formato inválido. Usa AAAA-MM-DD. Ejemplo: 2025-12-31")
-    else:
-        # ✅ CORRECCIÓN: Manejo de estado no reconocido
-        log.warning(f"⚠️ Estado no manejado en Auto: {st} para {phone}")
-        send_message(phone, "Parece que hubo un error en la conversación. ¿Deseas volver al menú principal? (escribe 'menú')")
 
 def _retry_after_days(phone: str, days: int) -> None:
     try:
@@ -570,10 +606,10 @@ def _retry_after_days(phone: str, days: int) -> None:
         log.exception("Error en reintento programado")
 
 # ==========================
-# Router helpers
+# Router de comandos
 # ==========================
 def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
-    last10 = _normalize_phone_last10(phone)
+    last10 = normalize_phone(phone)
     match = match_client_in_sheets(last10)
     if match and match.get("nombre"):
         send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
@@ -620,33 +656,16 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
             send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
 
 # ==========================
-# Webhook — verificación
-# ==========================
-@app.get("/webhook")
-def webhook_verify():
-    try:
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge", "")
-        if mode == "subscribe" and token == VERIFY_TOKEN:
-            log.info("✅ Webhook verificado exitosamente")
-            return challenge, 200
-    except Exception:
-        log.exception("❌ Error en verificación webhook")
-    log.warning("❌ Webhook verification failed")
-    return "Error", 403
-
-# ==========================
-# Webhook — recepción
+# Webhook handlers
 # ==========================
 def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """Descarga bytes, mime_type y filename desde WPP Graph para media_id."""
-    if not META_TOKEN:
+    if not config.META_TOKEN:
         return None, None, None
     try:
         meta = requests.get(
             f"https://graph.facebook.com/v20.0/{media_id}",
-            headers={"Authorization": f"Bearer {META_TOKEN}"},
+            headers={"Authorization": f"Bearer {config.META_TOKEN}"},
             timeout=WPP_TIMEOUT
         )
         if meta.status_code != 200:
@@ -658,7 +677,7 @@ def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Opti
         fname = meta_j.get("filename") or f"media_{media_id}"
         if not url:
             return None, None, None
-        binr = requests.get(url, headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=WPP_TIMEOUT)
+        binr = requests.get(url, headers={"Authorization": f"Bearer {config.META_TOKEN}"}, timeout=WPP_TIMEOUT)
         if binr.status_code != 200:
             log.warning(f"⚠️ Meta media download fallo {binr.status_code}")
             return None, None, None
@@ -689,8 +708,8 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
             send_message(phone, "Recibí tu archivo, pero hubo un problema procesándolo.")
             return
 
-        last4 = _normalize_phone_last10(phone)[-4:]
-        match = match_client_in_sheets(_normalize_phone_last10(phone))
+        last4 = normalize_phone(phone)[-4:]
+        match = match_client_in_sheets(normalize_phone(phone))
         if match and match.get("nombre"):
             folder_name = f"{match['nombre'].replace(' ', '_')}_{last4}"
         else:
@@ -704,6 +723,23 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
     except Exception:
         log.exception("❌ Error manejando multimedia")
         send_message(phone, "Recibí tu archivo, gracias. Si algo falla, lo reviso de inmediato.")
+
+# ==========================
+# Core Router - Endpoints Flask
+# ==========================
+@app.get("/webhook")
+def webhook_verify():
+    try:
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge", "")
+        if mode == "subscribe" and token == config.VERIFY_TOKEN:
+            log.info("✅ Webhook verificado exitosamente")
+            return challenge, 200
+    except Exception:
+        log.exception("❌ Error en verificación webhook")
+    log.warning("❌ Webhook verification failed")
+    return "Error", 403
 
 @app.post("/webhook")
 def webhook_receive():
@@ -727,21 +763,23 @@ def webhook_receive():
 
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
 
-        # ✅ CORRECCIÓN PRINCIPAL: Siempre hacer matching con Google Sheets
-        # sin importar el estado del usuario - VERSIÓN CORREGIDA
-        match = match_client_in_sheets(_normalize_phone_last10(phone))
-        if match and match.get("nombre"):
-            # Solo saludar si NO estamos en medio de una conversación activa
-            current_state = user_state.get(phone, "")
-            if not current_state:  # Solo si no hay estado activo
-                send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
+        # Procesar con workers si están disponibles
+        if WORKERS_AVAILABLE and inbound_queue:
+            inbound_queue.put((phone, msg))
+            log.info(f"📨 Mensaje encolado para procesamiento asíncrono: {phone}")
+            return jsonify({"ok": True}), 200
+
+        # Procesamiento directo (fallback)
+        match = match_client_in_sheets(normalize_phone(phone))
+        if match and match.get("nombre") and phone not in user_state:
+            send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
 
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
 
-            if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
+            if text.lower().startswith("sgpt:") and openai and config.OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
                     log.info(f"🧠 Procesando solicitud GPT para {phone}")
@@ -780,16 +818,24 @@ def health():
     return jsonify({
         "status": "ok", 
         "service": "Vicky Bot Inbursa",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.utcnow().isoformat(),
+        "version": "integrated-v1"
     }), 200
 
 @app.get("/ext/health")
 def ext_health():
     return jsonify({
         "status": "ok",
-        "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID),
+        "whatsapp_configured": bool(config.META_TOKEN and config.WABA_PHONE_ID),
         "google_ready": google_ready,
-        "openai_ready": bool(openai and OPENAI_API_KEY)
+        "openai_ready": bool(openai and config.OPENAI_API_KEY),
+        "workers_available": WORKERS_AVAILABLE,
+        "modules_loaded": {
+            "config_env": True,
+            "utils_logger": True,
+            "utils_validators": True,
+            "workers": WORKERS_AVAILABLE
+        }
     }), 200
 
 @app.post("/ext/test-send")
@@ -817,7 +863,7 @@ def ext_test_send():
         }), 500
 
 def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
-    """Worker mejorado para envíos masivos con logging exhaustivo"""
+    """Worker para envíos masivos"""
     successful = 0
     failed = 0
     
@@ -862,15 +908,15 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
     
     log.info(f"🎯 Envío masivo completado: {successful} ✅, {failed} ❌")
     
-    if ADVISOR_NUMBER:
+    if config.ADVISOR_NUMBER:
         summary_msg = f"📊 Resumen envío masivo:\n• Exitosos: {successful}\n• Fallidos: {failed}\n• Total: {len(items)}"
-        send_message(ADVISOR_NUMBER, summary_msg)
+        send_message(config.ADVISOR_NUMBER, summary_msg)
 
 @app.post("/ext/send-promo")
 def ext_send_promo():
-    """Endpoint CORREGIDO para envíos masivos tipo WAPI"""
+    """Endpoint para envíos masivos tipo WAPI"""
     try:
-        if not META_TOKEN or not WABA_PHONE_ID:
+        if not config.META_TOKEN or not config.WABA_PHONE_ID:
             log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados")
             return jsonify({
                 "queued": False, 
@@ -925,18 +971,24 @@ def ext_send_promo():
 
         log.info(f"✅ Validación exitosa: {len(valid_items)} items válidos de {len(items)} recibidos")
         
-        threading.Thread(
-            target=_bulk_send_worker, 
-            args=(valid_items,), 
-            daemon=True,
-            name="BulkSendWorker"
-        ).start()
+        # Usar worker outbound si está disponible
+        if WORKERS_AVAILABLE and outbound_queue:
+            outbound_queue.put(valid_items)
+            log.info(f"📨 Envío masivo encolado para procesamiento asíncrono: {len(valid_items)} items")
+        else:
+            threading.Thread(
+                target=_bulk_send_worker, 
+                args=(valid_items,), 
+                daemon=True,
+                name="BulkSendWorker"
+            ).start()
         
         response = {
             "queued": True,
             "message": f"Procesando {len(valid_items)} mensajes en background",
             "total_received": len(items),
             "valid_items": len(valid_items),
+            "workers_used": WORKERS_AVAILABLE,
             "timestamp": datetime.utcnow().isoformat()
         }
         
@@ -951,14 +1003,14 @@ def ext_send_promo():
         }), 500
 
 # ==========================
-# Arranque (para desarrollo local)
-# En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
+# Inicialización
 # ==========================
 if __name__ == "__main__":
-    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
-    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
+    log.info(f"🚀 Iniciando Vicky Bot SECOM (Integrado) en puerto {config.PORT}")
+    log.info(f"📞 WhatsApp configurado: {bool(config.META_TOKEN and config.WABA_PHONE_ID)}")
     log.info(f"📊 Google Sheets/Drive: {google_ready}")
-    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
+    log.info(f"🧠 OpenAI: {bool(openai and config.OPENAI_API_KEY)}")
+    log.info(f"🔧 Workers modulares: {WORKERS_AVAILABLE}")
+    log.info(f"📁 Módulos cargados: config_env, utils_logger, utils_validators")
     
-    app.run(host="0.0.0.0", port=PORT, debug=False)
-
+    app.run(host="0.0.0.0", port=config.PORT, debug=False)
