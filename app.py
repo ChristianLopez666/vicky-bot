@@ -433,6 +433,10 @@ def _imss_next(phone: str, text: str) -> None:
         _notify_advisor(f"🔔 IMSS — Prospecto preautorizado\nWhatsApp: {phone}\n" + msg)
         user_state[phone] = ""
         send_main_menu(phone)
+    else:
+        # ✅ CORRECCIÓN: Manejo de estado no reconocido
+        log.warning(f"⚠️ Estado no manejado en IMSS: {st} para {phone}")
+        send_message(phone, "Parece que hubo un error en la conversación. ¿Deseas volver al menú principal? (escribe 'menú')")
 
 # --- Crédito Empresarial (opción 5) ---
 def emp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
@@ -478,6 +482,10 @@ def _emp_next(phone: str, text: str) -> None:
         _notify_advisor(f"🔔 Empresarial — Nueva solicitud\nWhatsApp: {phone}\n" + resumen)
         user_state[phone] = ""
         send_main_menu(phone)
+    else:
+        # ✅ CORRECCIÓN: Manejo de estado no reconocido
+        log.warning(f"⚠️ Estado no manejado en Empresarial: {st} para {phone}")
+        send_message(phone, "Parece que hubo un error en la conversación. ¿Deseas volver al menú principal? (escribe 'menú')")
 
 # --- Financiamiento Práctico (opción 6) ---
 FP_QUESTIONS = [f"Pregunta {i}" for i in range(1, 12)]
@@ -510,6 +518,10 @@ def _fp_next(phone: str, text: str) -> None:
         _notify_advisor(f"🔔 Financiamiento Práctico — Resumen\nWhatsApp: {phone}\n{resumen}")
         user_state[phone] = ""
         send_main_menu(phone)
+    else:
+        # ✅ CORRECCIÓN: Manejo de estado no reconocido
+        log.warning(f"⚠️ Estado no manejado en Financiamiento: {st} para {phone}")
+        send_message(phone, "Parece que hubo un error en la conversación. ¿Deseas volver al menú principal? (escribe 'menú')")
 
 # --- Seguros de Auto (opción 2) ---
 def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
@@ -544,6 +556,10 @@ def _auto_next(phone: str, text: str) -> None:
             send_main_menu(phone)
         except Exception:
             send_message(phone, "Formato inválido. Usa AAAA-MM-DD. Ejemplo: 2025-12-31")
+    else:
+        # ✅ CORRECCIÓN: Manejo de estado no reconocido
+        log.warning(f"⚠️ Estado no manejado en Auto: {st} para {phone}")
+        send_message(phone, "Parece que hubo un error en la conversación. ¿Deseas volver al menú principal? (escribe 'menú')")
 
 def _retry_after_days(phone: str, days: int) -> None:
     try:
@@ -712,10 +728,13 @@ def webhook_receive():
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
 
         # ✅ CORRECCIÓN PRINCIPAL: Siempre hacer matching con Google Sheets
-        # sin importar el estado del usuario
+        # sin importar el estado del usuario - VERSIÓN CORREGIDA
         match = match_client_in_sheets(_normalize_phone_last10(phone))
-        if match and match.get("nombre") and phone not in user_state:
-            send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
+        if match and match.get("nombre"):
+            # Solo saludar si NO estamos en medio de una conversación activa
+            current_state = user_state.get(phone, "")
+            if not current_state:  # Solo si no hay estado activo
+                send_message(phone, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar hoy?")
 
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
@@ -942,3 +961,4 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
