@@ -1,5 +1,5 @@
-# app.py — Vicky SECOM (Versión Corregida - Matching Siempre Activo)
-# CORRECCIÓN PRINCIPAL: Matching con Google Sheets siempre activo, sin importar el estado del usuario
+# app.py — Vicky SECOM (Versión Corregida - Matching Mejorado)
+# CORRECCIÓN PRINCIPAL: Matching con Google Sheets mejorado para buscar en columna específica
 
 from __future__ import annotations
 
@@ -251,10 +251,10 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
     return False
 
 # ==========================
-# Google Helpers
+# Google Helpers - CORREGIDO
 # ==========================
 def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
-    """Busca el teléfono en cualquier columna del sheet y devuelve dict con rowIndex y nombre si lo encuentra."""
+    """CORREGIDO: Busca el teléfono específicamente en la tercera columna del sheet."""
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         log.warning("⚠️ Sheets no disponible; no se puede hacer matching.")
         return None
@@ -264,17 +264,20 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
         rows = values.get("values", [])
         phone_last10 = str(phone_last10)
         
+        log.info(f"🔍 Buscando teléfono: {phone_last10} en {len(rows)} filas")
+        
         for idx, row in enumerate(rows, start=1):
-            joined = " | ".join(row)
-            digits = re.sub(r"\D", "", joined)
-            if phone_last10 and phone_last10 in digits:
-                nombre = None
-                for cell in row:
-                    if cell and not re.search(r"\d", cell):
-                        nombre = cell.strip()
-                        break
-                log.info(f"✅ Cliente encontrado en Sheets: {nombre} ({phone_last10})")
-                return {"row": idx, "nombre": nombre or "", "raw": row}
+            # CORRECCIÓN: Buscar específicamente en la tercera columna (índice 2) donde están los números
+            if len(row) > 2:
+                sheet_phone = str(row[2]).strip()  # Tercera columna con números
+                sheet_phone_clean = re.sub(r"\D", "", sheet_phone)
+                
+                # Buscar coincidencia exacta en los últimos 10 dígitos
+                if phone_last10 == sheet_phone_clean[-10:] if len(sheet_phone_clean) >= 10 else sheet_phone_clean:
+                    nombre = row[0] if len(row) > 0 else ""  # Primera columna con nombre
+                    log.info(f"✅ CLIENTE ENCONTRADO en Sheets: {nombre} ({phone_last10})")
+                    return {"row": idx, "nombre": nombre or "", "raw": row}
+        
         log.info(f"ℹ️ Cliente no encontrado en Sheets: {phone_last10}")
         return None
     except Exception:
@@ -939,6 +942,3 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
-    
-
-
