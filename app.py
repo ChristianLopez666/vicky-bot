@@ -1,13 +1,14 @@
-# app.py — Vicky SECOM (Versión Corregida - Campañas + Estado normalizado)
+# app.py — Vicky SECOM (Versión WAPI + Campañas + Recordatorios)
 from __future__ import annotations
 import os, re, json, time, logging, threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, List
 
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
+# Google API (Sheets)
 try:
     from google.oauth2.service_account import Credentials as ServiceAccountCredentials
     from googleapiclient.discovery import build as gbuild
@@ -15,6 +16,7 @@ except Exception:
     ServiceAccountCredentials = None
     gbuild = None
 
+# OpenAI opcional
 try:
     import openai
 except Exception:
@@ -77,7 +79,7 @@ def get_data(phone: str) -> Dict[str, Any]:
     return _user_data[key]
 
 # ==========================
-# Utilidades
+# Utilidades WhatsApp
 # ==========================
 WPP_API_URL = (
     f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
@@ -196,7 +198,7 @@ def send_template_message(
     return False
 
 # ==========================
-# Google Sheets (matching SECOM)
+# Google Sheets (SECOM)
 # ==========================
 sheets = None
 google_ready = False
@@ -204,20 +206,22 @@ google_ready = False
 if GOOGLE_CREDENTIALS_JSON and ServiceAccountCredentials and gbuild and SHEETS_ID_LEADS:
     try:
         info = json.loads(GOOGLE_CREDENTIALS_JSON)
+        # Scope de lectura/escritura autorizado
         creds = ServiceAccountCredentials.from_service_account_info(
             info,
             scopes=[
-                "https://www.googleapis.com/auth/spreadsheets.readonly",
+                "https://www.googleapis.com/auth/spreadsheets",
             ],
         )
         sheets = gbuild("sheets", "v4", credentials=creds)
         google_ready = True
-        log.info("✅ Google Sheets configurado")
+        log.info("✅ Google Sheets configurado con acceso RW")
     except Exception:
         log.exception("❌ Error configurando Google Sheets")
 
 def match_client_in_sheets(phone: str) -> Optional[Dict[str, Any]]:
-    if not (google_ready and sheets):
+    """Busca cliente por WhatsApp (últimos 10 dígitos) y devuelve nombre si existe."""
+    if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         return None
     try:
         rng = f"{SHEETS_TITLE_LEADS}!A:Z"
@@ -225,18 +229,141 @@ def match_client_in_sheets(phone: str) -> Optional[Dict[str, Any]]:
             spreadsheetId=SHEETS_ID_LEADS, range=rng
         ).execute()
         rows = res.get("values", [])
+        if not rows:
+            return None
+        headers = rows[0]
+        # índices relevantes
+        idx_name = _find_col(headers, ["Nombre", "CLIENTE", "Cliente"])
+        idx_wa = _find_col(headers, ["WhatsApp", "Whatsapp", "WHATSAPP", "Telefono", "Teléfono", "CELULAR"])
+
+        if idx_wa is None:
+            return None
+
         target = _normalize_phone(phone)
-        for row in rows:
-            if len(row) < 3:
+        for row in rows[1:]:
+            if len(row) <= idx_wa:
                 continue
-            tel = _normalize_phone(row[2])
+            tel = _normalize_phone(row[idx_wa])
             if tel == target:
-                nombre = row[0] if row else ""
+                nombre = (
+                    row[idx_name] if idx_name is not None and len(row) > idx_name else ""
+                )
                 return {"nombre": nombre}
         return None
     except Exception:
         log.exception("❌ Error en match_client_in_sheets")
         return None
+
+# Helpers genéricos para Sheets
+def _col_letter(col: int) -> str:
+    """Convierte índice de columna (1-based) a letra (A, B, ..., AA)."""
+    res = ""
+    while col > 0:
+        col, rem = divmod(col - 1, 26)
+        res = chr(65 + rem) + res
+    return res
+
+def _find_col(headers: List[str], names: List[str]) -> Optional[int]:
+    """Devuelve índice (0-based) de la primera coincidencia por nombre (case-insensitive)."""
+    if not headers:
+        return None
+    low = [h.strip().lower() for h in headers]
+    for name in names:
+        n = name.strip().lower()
+        if n in low:
+            return low.index(n)
+    return None
+
+def _get_sheet_headers_and_rows() -> tuple[list[str], list[list[str]]]:
+    if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+        return [], []
+    rng = f"{SHEETS_TITLE_LEADS}!A:Z"
+    res = sheets.spreadsheets().values().get(
+        spreadsheetId=SHEETS_ID_LEADS, range=rng
+    ).execute()
+    rows = res.get("values", [])
+    if not rows:
+        return [], []
+    headers = rows[0]
+    data_rows = rows[1:]
+    return headers, data_rows
+
+def _batch_update_cells(row_index: int, updates: Dict[str, str], headers: List[str]) -> None:
+    """
+    Actualiza celdas por nombre de columna en la fila indicada (2 = primera fila de datos).
+    Si alguna columna no existe, se ignora silenciosamente.
+    """
+    if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+        return
+    if row_index < 2:
+        return
+
+    data_ranges = []
+    header_low = [h.strip().lower() for h in headers]
+
+    for key, value in updates.items():
+        key_low = key.strip().lower()
+        if key_low in header_low:
+            idx = header_low.index(key_low) + 1  # 1-based
+        else:
+            # intentar coincidencia directa sin romper si no existe
+            continue
+        col_letter = _col_letter(idx)
+        cell_range = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_index}"
+        data_ranges.append({"range": cell_range, "values": [[str(value)]]})
+
+    if not data_ranges:
+        return
+
+    body = {
+        "valueInputOption": "RAW",
+        "data": data_ranges,
+    }
+    try:
+        sheets.spreadsheets().values().batchUpdate(
+            spreadsheetId=SHEETS_ID_LEADS, body=body
+        ).execute()
+    except Exception:
+        log.exception("❌ Error en _batch_update_cells")
+
+def _touch_last_inbound(phone: str) -> None:
+    """
+    Marca la última interacción entrante del cliente en LAST_MESSAGE_AT / LastInboundAt.
+    No rompe si las columnas no existen.
+    """
+    if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+        return
+    try:
+        headers, rows = _get_sheet_headers_and_rows()
+        if not headers or not rows:
+            return
+
+        idx_wa = _find_col(headers, ["WhatsApp", "Whatsapp", "WHATSAPP", "Telefono", "Teléfono", "CELULAR"])
+        idx_last = _find_col(headers, ["LastInboundAt", "LAST_INBOUND_AT", "LAST_MESSAGE_AT"])
+        if idx_wa is None or idx_last is None:
+            return
+
+        target = _normalize_phone(phone)
+        for offset, row in enumerate(rows, start=2):
+            if len(row) <= idx_wa:
+                continue
+            if _normalize_phone(row[idx_wa]) == target:
+                col_letter = _col_letter(idx_last + 1)
+                r = f"{SHEETS_TITLE_LEADS}!{col_letter}{offset}"
+                body = {
+                    "range": r,
+                    "majorDimension": "ROWS",
+                    "values": [[datetime.utcnow().isoformat()]],
+                }
+                sheets.spreadsheets().values().update(
+                    spreadsheetId=SHEETS_ID_LEADS,
+                    range=r,
+                    valueInputOption="RAW",
+                    body=body,
+                ).execute()
+                break
+    except Exception:
+        log.exception("❌ Error registrando LAST_MESSAGE_AT")
 
 # ==========================
 # Menú y helpers
@@ -603,6 +730,9 @@ def webhook_receive():
         if not phone:
             return jsonify({"ok": True}), 200
 
+        # Registrar última actividad en hoja (si aplica)
+        _touch_last_inbound(phone)
+
         match = match_client_in_sheets(phone)
         mtype = msg.get("type")
 
@@ -649,7 +779,7 @@ def webhook_receive():
         return jsonify({"ok": True}), 200
 
 # ==========================
-# Endpoints externos
+# Endpoints externos básicos
 # ==========================
 @app.get("/health")
 def health():
@@ -686,7 +816,9 @@ def ext_test_send():
         log.exception("❌ Error en /ext/test-send")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# --- Worker envíos masivos ---
+# ==========================
+# Worker envíos masivos manual (YA EXISTENTE)
+# ==========================
 def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
     ok = 0
     fail = 0
@@ -738,6 +870,7 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
 
 @app.post("/ext/send-promo")
 def ext_send_promo():
+    """Endpoint existente para campañas manuales con lista explícita de items."""
     try:
         if not (META_TOKEN and WABA_PHONE_ID):
             return jsonify(
@@ -773,15 +906,306 @@ def ext_send_promo():
         return jsonify({"queued": False, "error": str(e)}), 500
 
 # ==========================
+# Envío masivo SECOM desde Sheets (WAPI)
+# ==========================
+def _bulk_send_from_sheets_worker(
+    message_template: str,
+    use_sheet_message: bool,
+    limit: Optional[int] = None,
+) -> None:
+    """
+    Lee la hoja de leads SECOM y envía mensajes uno a uno (60s).
+    Reglas:
+      - Usa columna WhatsApp para número.
+      - Usa Mensaje_Base si existe y use_sheet_message=True.
+      - Solo envía si:
+          * FirstSentAt vacío
+          * Status/ESTATUS != NO_INTERESADO, CERRADO
+      - Marca:
+          * FirstSentAt = ahora
+          * Status/ESTATUS = ENVIADO_INICIAL
+    """
+    if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+        log.error("[SECOM-PROMO] Google Sheets no configurado")
+        return
+
+    try:
+        headers, rows = _get_sheet_headers_and_rows()
+        if not headers or not rows:
+            log.warning("[SECOM-PROMO] Hoja vacía")
+            return
+
+        idx_name = _find_col(headers, ["Nombre", "CLIENTE", "Cliente"])
+        idx_wa = _find_col(headers, ["WhatsApp", "Whatsapp", "WHATSAPP", "Telefono", "Teléfono", "CELULAR"])
+        idx_status = _find_col(headers, ["Status", "ESTATUS"])
+        idx_first = _find_col(headers, ["FirstSentAt", "FIRST_SENT_AT"])
+        idx_msg_base = _find_col(headers, ["Mensaje_Base", "MENSAJE_BASE"])
+
+        if idx_wa is None:
+            log.error("[SECOM-PROMO] No se encontró columna de WhatsApp")
+            return
+
+        now_iso = datetime.utcnow().isoformat()
+        enviados = 0
+        fallidos = 0
+
+        for offset, row in enumerate(rows, start=2):
+            if limit is not None and enviados >= limit:
+                break
+
+            phone_raw = row[idx_wa] if len(row) > idx_wa else ""
+            norm = _normalize_phone(str(phone_raw))
+            if not norm:
+                continue
+
+            # Status / ESTATUS
+            status_val = (
+                row[idx_status] if idx_status is not None and len(row) > idx_status else ""
+            )
+            status_up = str(status_val).strip().upper()
+
+            # FirstSentAt
+            first_val = (
+                row[idx_first] if idx_first is not None and len(row) > idx_first else ""
+            )
+            first_exists = bool(str(first_val).strip())
+
+            # Regla: solo si no se ha enviado antes y no está cerrado/no interesado
+            if first_exists:
+                continue
+            if status_up in ("NO_INTERESADO", "NO INTERESADO", "CERRADO"):
+                continue
+
+            name = (
+                row[idx_name] if idx_name is not None and len(row) > idx_name else ""
+            ).strip()
+
+            # Mensaje a usar
+            msg = ""
+            if use_sheet_message and idx_msg_base is not None and len(row) > idx_msg_base:
+                msg = str(row[idx_msg_base] or "").strip()
+            if not msg:
+                msg = str(message_template or "").strip()
+            if not msg:
+                continue
+
+            msg = msg.replace("{{nombre}}", name if name else "Hola")
+
+            to = f"52{norm}" if not str(phone_raw).startswith("52") else str(phone_raw)
+
+            if send_message(to, msg):
+                updates = {"FirstSentAt": now_iso}
+                if idx_status is not None:
+                    # respetar encabezado real (Status o ESTATUS)
+                    updates[headers[idx_status]] = "ENVIADO_INICIAL"
+                _batch_update_cells(offset, updates, headers)
+                enviados += 1
+                log.info(f"[SECOM-PROMO] Enviado a {to} fila {offset}")
+            else:
+                fallidos += 1
+                log.warning(f"[SECOM-PROMO] Falló envío a {to} fila {offset}")
+
+            # intervalo WAPI: 60 segundos entre envíos
+            time.sleep(60)
+
+        log.info(
+            f"[SECOM-PROMO] Finalizado. Enviados={enviados} Fallidos={fallidos}"
+        )
+        if ADVISOR_NUMBER:
+            send_message(
+                ADVISOR_NUMBER,
+                f"📊 Envío masivo SECOM finalizado.\nExitosos: {enviados}\nFallidos: {fallidos}",
+            )
+    except Exception:
+        log.exception("❌ Error en _bulk_send_from_sheets_worker")
+
+@app.post("/ext/send-promo-secom")
+def ext_send_promo_secom():
+    """
+    Envío masivo SECOM desde Google Sheets.
+
+    Body JSON:
+    {
+      "message": "Texto base con {{nombre}}",   # opcional si se usa Mensaje_Base
+      "use_sheet_message": true,                # por defecto true
+      "limit": 100                              # opcional
+    }
+    """
+    try:
+        if not (META_TOKEN and WABA_PHONE_ID):
+            return jsonify({"ok": False, "error": "WhatsApp API no configurada"}), 500
+        if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+            return jsonify({"ok": False, "error": "Google Sheets no configurado"}), 500
+
+        data = request.get_json(force=True) or {}
+        message_template = (data.get("message") or "").strip()
+        use_sheet_message = bool(data.get("use_sheet_message", True))
+        limit = data.get("limit")
+
+        # Si no hay Mensaje_Base y tampoco message, no hay de dónde sacar texto
+        if not message_template and not use_sheet_message:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "Debes enviar 'message' o activar 'use_sheet_message'.",
+                }
+            ), 400
+
+        t = threading.Thread(
+            target=_bulk_send_from_sheets_worker,
+            args=(message_template, use_sheet_message, limit),
+            daemon=True,
+        )
+        t.start()
+
+        return jsonify(
+            {
+                "ok": True,
+                "status": "queued",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        ), 202
+
+    except Exception as e:
+        log.exception("❌ Error en /ext/send-promo-secom")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# ==========================
+# Recordatorios 3 y 5 días
+# ==========================
+def _parse_iso(dt_str: str) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    try:
+        return datetime.fromisoformat(str(dt_str).replace("Z", ""))
+    except Exception:
+        return None
+
+def _start_reminders_worker() -> None:
+    """
+    Worker que cada hora revisa la hoja y envía recordatorios:
+      - Día 3: si no hay respuesta posterior al envío inicial.
+      - Día 5: igual.
+    Usa columnas:
+      - FirstSentAt
+      - Reminder3Sent
+      - Reminder5Sent
+      - Status / ESTATUS
+      - LAST_MESSAGE_AT / LastInboundAt
+    """
+    if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+        log.info("[REMINDERS] Sheets no configurado; worker no iniciado")
+        return
+
+    def worker():
+        while True:
+            try:
+                headers, rows = _get_sheet_headers_and_rows()
+                if not headers or not rows:
+                    time.sleep(3600)
+                    continue
+
+                idx_wa = _find_col(headers, ["WhatsApp", "Whatsapp", "WHATSAPP", "Telefono", "Teléfono", "CELULAR"])
+                idx_status = _find_col(headers, ["Status", "ESTATUS"])
+                idx_first = _find_col(headers, ["FirstSentAt", "FIRST_SENT_AT"])
+                idx_rem3 = _find_col(headers, ["Reminder3Sent", "REMINDER3", "REM3"])
+                idx_rem5 = _find_col(headers, ["Reminder5Sent", "REMINDER5", "REM5"])
+                idx_last = _find_col(headers, ["LastInboundAt", "LAST_INBOUND_AT", "LAST_MESSAGE_AT"])
+                idx_name = _find_col(headers, ["Nombre", "CLIENTE", "Cliente"])
+
+                if idx_wa is None or idx_first is None:
+                    time.sleep(3600)
+                    continue
+
+                now = datetime.utcnow()
+
+                for offset, row in enumerate(rows, start=2):
+                    if len(row) <= idx_wa:
+                        continue
+
+                    phone_raw = row[idx_wa]
+                    norm = _normalize_phone(str(phone_raw))
+                    if not norm:
+                        continue
+
+                    first_val = (
+                        row[idx_first] if len(row) > idx_first else ""
+                    )
+                    first_dt = _parse_iso(str(first_val).strip())
+                    if not first_dt:
+                        continue
+
+                    status_val = (
+                        row[idx_status] if idx_status is not None and len(row) > idx_status else ""
+                    )
+                    status_up = str(status_val).strip().upper()
+                    if status_up in ("NO_INTERESADO", "NO INTERESADO", "CERRADO"):
+                        continue
+
+                    days = (now - first_dt).days
+
+                    rem3_val = (
+                        row[idx_rem3] if idx_rem3 is not None and len(row) > idx_rem3 else ""
+                    )
+                    rem5_val = (
+                        row[idx_rem5] if idx_rem5 is not None and len(row) > idx_rem5 else ""
+                    )
+
+                    last_in_val = (
+                        row[idx_last] if idx_last is not None and len(row) > idx_last else ""
+                    )
+                    last_in_dt = _parse_iso(str(last_in_val).strip())
+
+                    # inactivo = nunca respondió después del envío inicial
+                    inactive = (last_in_dt is None) or (last_in_dt <= first_dt)
+
+                    name = (
+                        row[idx_name] if idx_name is not None and len(row) > idx_name else "Hola"
+                    )
+
+                    to = f"52{norm}" if not str(phone_raw).startswith("52") else str(phone_raw)
+
+                    # Recordatorio 3 días
+                    if days >= 3 and str(rem3_val).strip().upper() != "YES" and inactive:
+                        msg3 = (
+                            f"{name}, solo para recordarte que tenemos lista tu propuesta de seguro de auto "
+                            "con beneficio especial para ti. Si gustas te ayudo a revisarla por aquí mismo. 🚗"
+                        )
+                        if send_message(to, msg3):
+                            updates = {"Reminder3Sent": "YES"}
+                            if idx_status is not None:
+                                updates[headers[idx_status]] = "RECORDATORIO_3D"
+                            _batch_update_cells(offset, updates, headers)
+
+                    # Recordatorio 5 días
+                    if days >= 5 and str(rem5_val).strip().upper() != "YES" and inactive:
+                        msg5 = (
+                            f"{name}, confirmo si aún te interesa aprovechar tu beneficio preferencial en tu seguro "
+                            "de auto. Si quieres retomamos tu trámite por este medio. ✅"
+                        )
+                        if send_message(to, msg5):
+                            updates = {"Reminder5Sent": "YES"}
+                            if idx_status is not None:
+                                updates[headers[idx_status]] = "RECORDATORIO_5D"
+                            _batch_update_cells(offset, updates, headers)
+
+                time.sleep(3600)
+
+            except Exception:
+                log.exception("❌ Error en ciclo de recordatorios")
+                time.sleep(3600)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+# Iniciar worker de recordatorios al cargar la app (si Sheets está listo)
+_start_reminders_worker()
+
+# ==========================
 # Arranque local
 # ==========================
 if __name__ == "__main__":
     log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
-    log.info(
-        f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}"
-    )
+    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
     log.info(f"📊 Google listo: {google_ready}")
-    log.info(
-        f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}"
-    )
+    log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
