@@ -774,7 +774,13 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
         auto_next(phone, text)
     else:
         # Sin estado y sin comando válido
-    if not st and intent == "positive" and match:
+        if not st and intent == "positive" and match:
+            send_message(
+                phone,
+                "Perfecto ✅ Iniciemos con la revisión gratuita de tu seguro de auto."
+            )
+            auto_start(phone, match)
+            return
         send_message(
             phone,
             "Perfecto ✅ Iniciemos con la revisión gratuita de tu seguro de auto."
@@ -1285,3 +1291,5 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
+
