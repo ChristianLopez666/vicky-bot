@@ -923,10 +923,29 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
 
             sent = False
             if template:
-                sent = send_template_message(to, template, components)
-            else:
-                sent = send_message(to, text)
+    sent = send_template_message(to, template, components)
+else:
+    sent = send_message(to, text)
 
+if sent:
+    ok += 1
+    key = _normalize_phone(to)
+    low = (text or "").lower()
+    campaign = (item.get("campaign") or "").lower()
+
+    # 🔹 Activar automáticamente el embudo SECOM
+    if "seguro de auto" in low or "secom" in low:
+        _user_state[key] = "campaign_secom_auto"
+        log.info(f"📌 Estado de campaña SECOM activado para {key}")
+    elif "préstamo imss" in low or "prestamo imss" in low:
+        _user_state[key] = "campaign_imss_ley73"
+        log.info(f"📌 Estado de campaña IMSS activado para {key}")
+    elif campaign:
+        _user_state[key] = f"campaign_{campaign}"
+        log.info(f"📌 Estado genérico activado: {campaign} → {key}")
+else:
+    fail += 1
+    
             if sent:
                 ok += 1
                 key = _normalize_phone(to)
@@ -1278,4 +1297,5 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
