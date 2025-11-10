@@ -1137,7 +1137,7 @@ def ext_send_promo_secom():
         use_sheet_message = bool(data.get("use_sheet_message", True))
         limit = data.get("limit")
 
-            if not message_template and not use_sheet_message:
+                if not message_template and not use_sheet_message:
         return jsonify(
             {
                 "ok": False,
@@ -1391,4 +1391,5 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
