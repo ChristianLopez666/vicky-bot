@@ -1137,13 +1137,113 @@ def ext_send_promo_secom():
         use_sheet_message = bool(data.get("use_sheet_message", True))
         limit = data.get("limit")
 
-        if not message_template and not use_sheet_message:
-            return jsonify(
-                {
-                    "ok": False,
-                    "error": "Debes enviar 'message' o activar 'use_sheet_message'.",
-                }
-            ), 400
+            if not message_template and not use_sheet_message:
+        return jsonify(
+            {
+                "ok": False,
+                "error": "Debes enviar 'message' o activar 'use_sheet_message'.",
+            }
+        ), 400
+
+    # 🧩 NUEVO BLOQUE: Envío de plantilla autorizada
+    if "template_name" in data:
+        template_name = data.get("template_name")
+        language = data.get("language", "es_MX")
+        variables = data.get("variables", [])
+        limit = int(data.get("limit", 1))
+
+        def send_template_message():
+            """Envía una plantilla de WhatsApp aprobada por Meta"""
+            try:
+                # Leer prospectos desde la hoja de Google (ya conectada)
+                sheet = get_sheet_client(GOOGLE_SHEET_ID, GOOGLE_SHEET_NAME)
+                rows = sheet.get_all_records()
+                for i, row in enumerate(rows[:limit]):
+                    nombre = row.get("Nombre", "")
+                    numero = str(row.get("WhatsApp", "")).replace("+", "").replace(" ", "")
+                    if not numero:
+                        continue
+                    to_number = f"52{numero[-10:]}"
+                    body_params = [{"type": "text", "text": v} for v in variables]
+
+                    payload = {
+                        "messaging_product": "whatsapp",
+                        "to": to_number,
+                        "type": "template",
+                        "template": {
+                            "name": template_name,
+                            "language": {"code": language},
+                            "components": [{
+                                "type": "body",
+                                "parameters": body_params
+                            }]
+                        }
+                    }
+
+                    url = f"https://graph.facebook.com/v17.0/{WABA_PHONE_ID}/messages"
+                    headers = {
+                        "Authorization": f"Bearer {META_TOKEN}",
+                        "Content-Type": "application/json"
+                    }
+                    response = requests.post(url, headers=headers, json=payload)
+
+                    logging.info(
+                        f"vicky-secom 📤 Plantilla '{template_name}' enviada a {to_number}: {response.text}"
+                    )
+
+            except Exception as e:
+                logging.error(f"vicky-secom ❌ Error al enviar plantilla: {str(e)}")
+
+        threading.Thread(target=send_template_message).start()
+        return jsonify({"ok": True, "template": template_name})
+    
+    # 🧩 NUEVO BLOQUE: Envío de plantilla autorizada
+    if "template_name" in data:
+        template_name = data.get("template_name")
+        language = data.get("language", "es_MX")
+        variables = data.get("variables", [])
+        limit = int(data.get("limit", 1))
+
+        def send_template_message():
+            """Envía una plantilla de WhatsApp aprobada por Meta"""
+            try:
+                # Leer prospectos desde la hoja de Google (ya conectada)
+                sheet = get_sheet_client(GOOGLE_SHEET_ID, GOOGLE_SHEET_NAME)
+                rows = sheet.get_all_records()
+                for i, row in enumerate(rows[:limit]):
+                    nombre = row.get("Nombre", "")
+                    numero = str(row.get("WhatsApp", "")).replace("+", "").replace(" ", "")
+                    if not numero:
+                        continue
+                    to_number = f"52{numero[-10:]}"
+                    body_params = [{"type": "text", "text": v} for v in variables]
+
+                    payload = {
+                        "messaging_product": "whatsapp",
+                        "to": to_number,
+                        "type": "template",
+                        "template": {
+                            "name": template_name,
+                            "language": {"code": language},
+                            "components": [{
+                                "type": "body",
+                                "parameters": body_params
+                            }]
+                        }
+                    }
+
+                    url = f"https://graph.facebook.com/v17.0/{WABA_PHONE_ID}/messages"
+                    headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
+                    response = requests.post(url, headers=headers, json=payload)
+
+                    logging.info(f"vicky-secom 📤 Plantilla '{template_name}' enviada a {to_number}: {response.text}")
+
+            except Exception as e:
+                logging.error(f"vicky-secom ❌ Error al enviar plantilla: {str(e)}")
+
+        threading.Thread(target=send_template_message).start()
+        return jsonify({"ok": True, "template": template_name})
+
 
         t = threading.Thread(
             target=_bulk_send_from_sheets_worker,
@@ -1291,3 +1391,4 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
