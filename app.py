@@ -830,24 +830,9 @@ def webhook_receive():
         match = match_client_in_sheets(phone)
         mtype = msg.get("type")
 
-            if mtype == "text":
-        text = msg.get("text", {}).get("body", "")
-        log.info(f"💬 Texto de {phone}: {text!r}")
-
-        # --- 🔔 Notificación automática al asesor ---
-        try:
-            if ADVISOR_NUMBER and phone:
-                preview = text[:120] if text else "(sin texto)"
-                notify_msg = (
-                    f"📩 *Nuevo mensaje recibido por Vicky*\n"
-                    f"De: +{phone}\n"
-                    f"Mensaje: {preview}"
-                )
-                send_message(ADVISOR_NUMBER, notify_msg)
-                log.info(f"📨 Notificación enviada al asesor: {phone}")
-        except Exception:
-            log.exception("❌ Error al enviar notificación automática al asesor")
-
+        if mtype == "text":
+            text = msg.get("text", {}).get("body", "")
+            log.info(f"💬 Texto de {phone}: {text!r}")
 
             # GPT directo opcional
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
