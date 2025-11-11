@@ -1140,7 +1140,7 @@ def ext_send_promo_secom():
         logging.error(f"Error en envío masivo: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-    if not message_template and not use_sheet_message:
+        if not message_template and not use_sheet_message:
         return jsonify({
             "ok": False,
             "error": "Debes enviar 'message' o activar 'use_sheet_message'."
@@ -1393,6 +1393,7 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
 
 
