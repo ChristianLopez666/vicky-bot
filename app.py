@@ -89,7 +89,7 @@ def get_data(phone: str) -> Dict[str, Any]:
 # WhatsApp helpers
 # ==========================
 WPP_API_URL = (
-    f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
+    f"https://graph.facebook.com/v21.0/{WABA_PHONE_ID}/messages"
     if WABA_PHONE_ID
     else None
 )
@@ -123,6 +123,7 @@ def _headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {META_TOKEN}",
         "Content-Type": "application/json",
+        "User-Agent": "VickyBot-SECOM/1.0",
     }
 
 
@@ -1291,3 +1292,4 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
