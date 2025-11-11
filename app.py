@@ -1136,12 +1136,16 @@ def ext_send_promo_secom():
         message_template = (data.get("message") or "").strip()
         use_sheet_message = bool(data.get("use_sheet_message", True))
         limit = data.get("limit")
+        except Exception as e:
+        logging.error(f"Error en envío masivo: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
     if not message_template and not use_sheet_message:
         return jsonify({
             "ok": False,
             "error": "Debes enviar 'message' o activar 'use_sheet_message'."
         }), 400
+
 
     # 🧩 NUEVO BLOQUE: Envío de plantilla autorizada
     if "template_name" in data:
@@ -1389,6 +1393,7 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
 
 
