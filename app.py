@@ -1043,24 +1043,18 @@ def ext_send_promo():
 
 
 # ==========================
-# Envío masivo SECOM desde Sheets (WAPI)
+# Envío masivo SECOM desde Sheets (WAPI) - MEJORADO
 # ==========================
-def _bulk_send_from_sheets_worker(
+def _bulk_send_from_sheets_worker_updated(
     message_template: str,
+    template_name: str,
+    components: List[Dict[str, Any]],
     use_sheet_message: bool,
     limit: Optional[int] = None,
 ) -> None:
     """
-    Lee la hoja de leads SECOM y envía mensajes uno a uno (60s).
-    Reglas:
-      - Usa columna WhatsApp / Teléfono.
-      - Usa Mensaje_Base si existe y use_sheet_message=True.
-      - Solo envía si:
-          * FirstSentAt vacío
-          * Status/ESTATUS != NO_INTERESADO, CERRADO
-      - Marca:
-          * FirstSentAt = ahora
-          * Status/ESTATUS = ENVIADO_INICIAL
+    Worker mejorado para envío masivo SECOM desde Google Sheets.
+    Soporta tanto mensajes de texto como plantillas Meta.
     """
     if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         log.error("[SECOM-PROMO] Google Sheets no configurado")
@@ -1111,32 +1105,61 @@ def _bulk_send_from_sheets_worker(
 
             name = row[idx_name].strip() if idx_name is not None and len(row) > idx_name else ""
 
+            # Determinar el mensaje a enviar
             msg = ""
             if use_sheet_message and idx_msg_base is not None and len(row) > idx_msg_base:
                 msg = str(row[idx_msg_base] or "").strip()
             if not msg:
                 msg = str(message_template or "").strip()
-            if not msg:
+
+            # Si no hay mensaje ni plantilla, saltar
+            if not msg and not template_name:
                 continue
 
-            msg = msg.replace("{{nombre}}", name if name else "Hola")
+            # Personalizar mensaje con nombre si es texto
+            if msg and not template_name:
+                msg = msg.replace("{{nombre}}", name if name else "Hola")
 
             to = str(phone_raw).strip()
             if not to.startswith("52"):
                 to = f"52{norm}"
 
-            if send_message(to, msg):
+            sent = False
+            if template_name:
+                # Envío de plantilla Meta
+                log.info(f"📤 [SECOM-PROMO] Enviando plantilla '{template_name}' a {to}")
+                sent = send_template_message(to, template_name, components)
+            else:
+                # Envío de mensaje de texto
+                log.info(f"📤 [SECOM-PROMO] Enviando mensaje libre: {msg[:40]}... a {to}")
+                sent = send_message(to, msg)
+
+            if sent:
                 updates = {"FirstSentAt": now_iso}
                 if idx_status is not None:
                     updates[headers[idx_status]] = "ENVIADO_INICIAL"
                 _batch_update_cells(offset, updates, headers)
                 enviados += 1
-                log.info(f"[SECOM-PROMO] Enviado a {to} fila {offset}")
+                
+                # Establecer estado según el tipo de mensaje
+                key = _normalize_phone(to)
+                if template_name:
+                    if "secom_auto" in template_name.lower():
+                        _user_state[key] = "campaign_secom_auto"
+                    elif "imss" in template_name.lower():
+                        _user_state[key] = "campaign_imss_ley73"
+                elif msg:
+                    if "cliente secom" in msg.lower() and "seguro de auto" in msg.lower():
+                        _user_state[key] = "campaign_secom_auto"
+                    elif "préstamo imss" in msg.lower() or "prestamo imss" in msg.lower():
+                        _user_state[key] = "campaign_imss_ley73"
+                        
+                log.info(f"[SECOM-PROMO] ✅ Enviado a {to} fila {offset}")
             else:
                 fallidos += 1
-                log.warning(f"[SECOM-PROMO] Falló envío a {to} fila {offset}")
+                log.warning(f"[SECOM-PROMO] ❌ Falló envío a {to} fila {offset}")
 
-            time.sleep(60)
+            time.sleep(60)  # Rate limiting para evitar bloqueos
 
         log.info(
             f"[SECOM-PROMO] Finalizado. Enviados={enviados} Fallidos={fallidos}"
@@ -1147,17 +1170,28 @@ def _bulk_send_from_sheets_worker(
                 f"📊 Envío masivo SECOM finalizado.\nExitosos: {enviados}\nFallidos: {fallidos}",
             )
     except Exception:
-        log.exception("❌ Error en _bulk_send_from_sheets_worker")
+        log.exception("❌ Error en _bulk_send_from_sheets_worker_updated")
 
 
 @app.post("/ext/send-promo-secom")
 def ext_send_promo_secom():
     """
-    Envío masivo SECOM desde Google Sheets.
+    Envío masivo SECOM desde Google Sheets - MEJORADO.
+    Ahora soporta tanto mensajes de texto como plantillas Meta.
 
     Body JSON:
     {
-      "message": "Texto base con {{nombre}}",   # opcional si se usa Mensaje_Base
+      "message": "Texto base con {{nombre}}",   # opcional si se usa template_name
+      "template_name": "nombre_plantilla",      # opcional si se usa message
+      "components": [                           # solo para plantillas
+        {
+          "type": "body",
+          "parameters": [
+            {"type": "text", "text": "valor1"},
+            {"type": "text", "text": "valor2"}
+          ]
+        }
+      ],
       "use_sheet_message": true,                # por defecto true
       "limit": 100                              # opcional
     }
@@ -1170,20 +1204,29 @@ def ext_send_promo_secom():
 
         data = request.get_json(force=True) or {}
         message_template = (data.get("message") or "").strip()
+        template_name = (data.get("template_name") or "").strip()
+        components = data.get("components") or []
         use_sheet_message = bool(data.get("use_sheet_message", True))
         limit = data.get("limit")
 
-        if not message_template and not use_sheet_message:
+        # Validación flexible: debe tener al menos mensaje o plantilla
+        if not message_template and not template_name:
             return jsonify(
                 {
                     "ok": False,
-                    "error": "Debes enviar 'message' o activar 'use_sheet_message'.",
+                    "error": "Debes enviar 'message' o 'template_name'.",
                 }
             ), 400
 
+        log.info(f"📤 [SECOM-PROMO] Iniciando envío masivo...")
+        if template_name:
+            log.info(f"📤 [SECOM-PROMO] Usando plantilla: {template_name}")
+        else:
+            log.info(f"📤 [SECOM-PROMO] Usando mensaje: {message_template[:60]}...")
+
         t = threading.Thread(
-            target=_bulk_send_from_sheets_worker,
-            args=(message_template, use_sheet_message, limit),
+            target=_bulk_send_from_sheets_worker_updated,
+            args=(message_template, template_name, components, use_sheet_message, limit),
             daemon=True,
         )
         t.start()
@@ -1192,6 +1235,9 @@ def ext_send_promo_secom():
             {
                 "ok": True,
                 "status": "queued",
+                "template_used": bool(template_name),
+                "message_used": bool(message_template),
+                "limit": limit,
                 "timestamp": datetime.utcnow().isoformat(),
             }
         ), 202
