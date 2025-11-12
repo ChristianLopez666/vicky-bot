@@ -918,48 +918,57 @@ def ext_test_send():
 
 
 # ==========================
-# Worker envíos masivos manual (lista explícita)
+# Worker envíos masivos mejorado (soporte plantillas Meta)
 # ==========================
-def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
+def _bulk_send_worker_updated(items: List[Dict[str, Any]]) -> None:
+    """
+    Worker mejorado para envío masivo con soporte para plantillas Meta y mensajes de texto.
+    """
     ok = 0
     fail = 0
     for i, item in enumerate(items, 1):
         try:
             to = str(item.get("to", "")).strip()
             text = str(item.get("text", "")).strip()
-            template = str(item.get("template", "")).strip()
+            template_name = str(item.get("template_name", "")).strip()
             components = item.get("components") or []
+            campaign = str(item.get("campaign", "")).lower()
 
-            if not to or (not text and not template):
+            if not to or (not text and not template_name):
                 log.warning(f"⏭️ Item {i} inválido: {item}")
                 fail += 1
                 continue
 
             sent = False
-            if template:
-                sent = send_template_message(to, template, components)
+            if template_name:
+                # Envío de plantilla Meta
+                sent = send_template_message(to, template_name, components)
             else:
+                # Envío de mensaje de texto
                 sent = send_message(to, text)
 
             if sent:
                 ok += 1
                 key = _normalize_phone(to)
-                low = (text or "").lower()
-                campaign = (item.get("campaign") or "").lower()
-                if "cliente secom" in low and "seguro de auto" in low:
+                
+                # Establecer estado según campaña
+                if "cliente secom" in text.lower() and "seguro de auto" in text.lower():
                     _user_state[key] = "campaign_secom_auto"
-                elif "préstamo imss" in low or "prestamo imss" in low:
+                elif "préstamo imss" in text.lower() or "prestamo imss" in text.lower():
                     _user_state[key] = "campaign_imss_ley73"
                 elif campaign:
                     _user_state[key] = f"campaign_{campaign}"
+                    
+                log.info(f"✅ Item {i} enviado a {to}")
             else:
                 fail += 1
+                log.warning(f"❌ Item {i} falló para {to}")
 
-            time.sleep(0.4)
+            time.sleep(0.4)  # Rate limiting
 
         except Exception:
             fail += 1
-            log.exception(f"❌ Error item {i} en _bulk_send_worker")
+            log.exception(f"❌ Error item {i} en _bulk_send_worker_updated")
 
     log.info(f"🎯 Envío masivo terminado OK={ok} FAIL={fail}")
     if ADVISOR_NUMBER:
@@ -971,7 +980,31 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
 
 @app.post("/ext/send-promo")
 def ext_send_promo():
-    """Endpoint histórico para campañas donde envías la lista completa de items."""
+    """
+    Endpoint histórico para campañas donde envías la lista completa de items.
+    Ahora con soporte para plantillas Meta y mensajes de texto.
+    
+    Body JSON:
+    {
+      "items": [
+        {
+          "to": "521234567890",
+          "text": "Mensaje de texto",  // Opcional si se usa template_name
+          "template_name": "nombre_plantilla",  // Opcional si se usa text
+          "components": [  // Solo para plantillas
+            {
+              "type": "body",
+              "parameters": [
+                {"type": "text", "text": "valor1"},
+                {"type": "text", "text": "valor2"}
+              ]
+            }
+          ],
+          "campaign": "nombre_campaña"  // Opcional para tracking
+        }
+      ]
+    }
+    """
     try:
         if not (META_TOKEN and WABA_PHONE_ID):
             return jsonify(
@@ -989,8 +1022,10 @@ def ext_send_promo():
                 }
             ), 400
 
+        log.info(f"📤 [SECOM-PROMO] Encolando {len(items)} registros...")
+        
         t = threading.Thread(
-            target=_bulk_send_worker, args=(items,), daemon=True
+            target=_bulk_send_worker_updated, args=(items,), daemon=True
         )
         t.start()
 
@@ -1292,4 +1327,3 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
