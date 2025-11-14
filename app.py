@@ -1254,4 +1254,3 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
