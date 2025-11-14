@@ -189,16 +189,30 @@ def send_template_message(
     # Permitir idioma dinámico desde JSON o variable de entorno
     language_code = os.getenv("WPP_TEMPLATE_LANG", "es_MX")
 
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        "template": {
-            "name": template_name,
-            "language": {"code": language_code},
-            "components": components or [{"type": "body", "parameters": []}],
-        },
-    }
+       try:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "text",
+            "text": {"body": text[:4096]},
+        }
+
+        for attempt in range(3):
+            try:
+                r = requests.post(
+                    WPP_API_URL,
+                    headers=_headers(),
+                    json=payload,
+                    timeout=15
+                )
+                if r.status_code in (200, 201):
+                    return True
+            except Exception:
+                time.sleep(1)
+
+        return False
+    except Exception:
+        return False
 
 
     for attempt in range(3):
@@ -1259,5 +1273,6 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
 
