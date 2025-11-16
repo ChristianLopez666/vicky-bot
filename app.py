@@ -172,87 +172,84 @@ def send_message(to: str, text: str) -> bool:
     return False
 
 
+def _normalize_template_name(name: str) -> str:
+    """Normaliza el nombre interno de la plantilla (minúsculas, guiones bajos)."""
+    n = (name or "").strip().lower()
+    n = re.sub(r"\s+", "_", n)
+    return n
+
+
+def _post_template_payload(payload: Dict[str, Any]) -> requests.Response:
+    return requests.post(WPP_API_URL, headers=_headers(), json=payload, timeout=20)
+
+
 def send_template_message(
     to: str, template_name: str, components: List[Dict[str, Any]]
 ) -> bool:
-    """Envía mensaje de plantilla con estructura corregida."""
+    """
+    Envía mensaje de plantilla con fallback automático de idioma.
+    Orden de intento: es_MX → es_ES → en_US → en
+    Maneja error 132001 (translation missing) y reintenta con el siguiente idioma.
+    """
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp API no configurada para plantillas")
         return False
 
-    # Normalizar nombre de plantilla
-    template_name_normalized = template_name.lower().strip().replace(" ", "_")
-    
-    # Validar y construir componentes correctamente
-    if not components:
-        components = [{"type": "body", "parameters": []}]
-    
-    # Validar que cada componente tenga la estructura correcta
-    valid_components = []
-    for comp in components:
-        if comp.get("type") == "body":
-            parameters = comp.get("parameters", [])
-            valid_params = []
-            for param in parameters:
-                if isinstance(param, dict) and param.get("type") == "text":
-                    valid_params.append({"type": "text", "text": str(param.get("text", ""))})
-            valid_components.append({
-                "type": "body",
-                "parameters": valid_params
-            })
-        elif comp.get("type") == "header":
-            parameters = comp.get("parameters", [])
-            valid_params = []
-            for param in parameters:
-                if isinstance(param, dict):
-                    if param.get("type") == "text":
-                        valid_params.append({"type": "text", "text": str(param.get("text", ""))})
-                    elif param.get("type") == "image":
-                        valid_params.append({"type": "image", "image": param.get("image", {})})
-            if valid_params:
-                valid_components.append({
-                    "type": "header",
-                    "parameters": valid_params
-                })
+    tname = _normalize_template_name(template_name)
 
-    payload = {
+    # Si no hay componentes, crear uno vacío de tipo body
+    comps = components[:] if components else [{"type": "body", "parameters": []}]
+    payload_base = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "template",
         "template": {
-            "name": template_name_normalized,
+            "name": tname,
             "language": {"code": "es_MX"},
-            "components": valid_components,
+            "components": comps,
         },
     }
 
+    lang_chain = ["es_MX", "es_ES", "en_US", "en"]
+    last_err = ""
+
     for attempt in range(3):
-        try:
-            r = requests.post(
-                WPP_API_URL, headers=_headers(), json=payload, timeout=15
-            )
-            response_data = r.json() if r.content else {}
-            if r.status_code == 200:
-                log.info(f"📤 Plantilla '{template_name_normalized}' enviada a {to}")
-                return True
-                
-            # Log detallado del error
-            log.error(
-                f"❌ Error plantilla {template_name_normalized} - Status: {r.status_code} - "
-                f"Response: {json.dumps(response_data, ensure_ascii=False)} - "
-                f"Payload: {json.dumps(payload, ensure_ascii=False)[:500]}"
-            )
-            
-            if _should_retry(r.status_code) and attempt < 2:
-                _backoff(attempt)
-                continue
-            return False
-        except Exception as e:
-            log.exception(f"❌ Error en send_template_message: {str(e)}")
-            if attempt < 2:
-                _backoff(attempt)
-                continue
-            return False
+        for idx, lang in enumerate(lang_chain):
+            try:
+                payload = json.loads(json.dumps(payload_base))
+                payload["template"]["language"]["code"] = lang
+
+                r = _post_template_payload(payload)
+                if r.status_code == 200:
+                    log.info(f"📤 Plantilla '{tname}' enviada a {to} (lang={lang})")
+                    return True
+
+                txt = r.text[:500]
+                last_err = f"{r.status_code} {txt}"
+                log.warning(f"⚠️ Error plantilla {tname} lang={lang} {last_err}")
+
+                # Error 132001 => el nombre no existe para esa traducción → probar siguiente idioma
+                if (
+                    r.status_code in (400, 404)
+                    and "132001" in txt
+                    and idx < len(lang_chain) - 1
+                ):
+                    continue
+
+                # Otros errores → si es reintento elegible, backoff
+                if _should_retry(r.status_code):
+                    break  # romper loop de idiomas y hacer backoff de intento
+
+            except Exception:
+                last_err = "exception posting template"
+                log.exception("❌ Error en send_template_message (post)")
+                break  # salir para backoff
+
+        # backoff de intento
+        if attempt < 2:
+            _backoff(attempt)
+
+    log.error(f"❌ Falló plantilla '{tname}' a {to}. Último error: {last_err}")
     return False
 
 
@@ -688,7 +685,7 @@ def auto_next(phone: str, text: str) -> None:
 
 
 # ==========================
-# Router principal
+# Router principal (bugfix de retorno inalcanzable)
 # ==========================
 def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = (text or "").strip().lower()
@@ -808,28 +805,32 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
     # Flujos activos
     if st.startswith("imss_"):
         imss_next(phone, text)
-    elif st.startswith("emp_"):
+        return
+    if st.startswith("emp_"):
         emp_next(phone, text)
-    elif st.startswith("fp_"):
+        return
+    if st.startswith("fp_"):
         fp_next(phone, text)
-    elif st.startswith("auto_"):
+        return
+    if st.startswith("auto_"):
         auto_next(phone, text)
-    else:
-        # Sin estado y sin comando válido
-        if not st and intent == "positive" and match:
-            send_message(
-                phone,
-                "Perfecto ✅ Iniciemos con la revisión gratuita de tu seguro de auto."
-            )
-            auto_start(phone, match)
-            return
+        return
+
+    # Sin estado y sin comando válido → activar embudo Auto por defecto
+    if not st and intent == "positive" and match:
         send_message(
             phone,
             "Perfecto ✅ Iniciemos con la revisión gratuita de tu seguro de auto."
         )
         auto_start(phone, match)
         return
-        send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
+
+    send_message(
+        phone,
+        "Perfecto ✅ Iniciemos con la revisión gratuita de tu seguro de auto."
+    )
+    auto_start(phone, match)
+    return
 
 
 # ==========================
@@ -977,38 +978,18 @@ def _bulk_send_worker_updated(items: List[Dict[str, Any]]) -> None:
                 fail += 1
                 continue
 
-            # Validación estricta de template_name
-            template_name_clean = template_name.lower().strip() if template_name else ""
-            has_valid_template = bool(template_name_clean and template_name_clean not in ["null", "none", ""])
-            
-            if not text and not has_valid_template:
-                log.warning(f"⏭️ Item {i} inválido: missing both 'text' and valid 'template_name'")
+            if not text and not template_name:
+                log.warning(f"⏭️ Item {i} inválido: missing both 'text' and 'template_name'")
                 fail += 1
                 continue
 
             sent = False
-            if has_valid_template:
-                # Validar y normalizar componentes
-                valid_components = []
-                if components:
-                    for comp in components:
-                        if comp.get("type") == "body":
-                            parameters = comp.get("parameters", [])
-                            valid_params = []
-                            for param in parameters:
-                                if isinstance(param, dict) and param.get("type") == "text":
-                                    valid_params.append({"type": "text", "text": str(param.get("text", ""))})
-                            valid_components.append({
-                                "type": "body",
-                                "parameters": valid_params
-                            })
-                
-                # Si no hay componentes válidos, crear uno vacío
-                if not valid_components:
-                    valid_components = [{"type": "body", "parameters": []}]
-                    
-                sent = send_template_message(to, template_name_clean, valid_components)
-                log.info(f"📤 [BULK] Enviando plantilla '{template_name_clean}' a {to}")
+            if template_name:
+                # Si no hay componentes, crear uno vacío
+                if not components:
+                    components = [{"type": "body", "parameters": []}]
+                sent = send_template_message(to, template_name, components)
+                log.info(f"📤 [BULK] Enviando plantilla '{template_name}' a {to}")
             else:
                 sent = send_message(to, text)
                 log.info(f"📤 [BULK] Enviando texto a {to}")
@@ -1087,13 +1068,10 @@ def ext_send_promo():
                     "error": f"Item {i+1} falta campo 'to'"
                 }), 400
                 
-            template_name_clean = template_name.lower().strip() if template_name else ""
-            has_valid_template = bool(template_name_clean and template_name_clean not in ["null", "none", ""])
-            
-            if not text and not has_valid_template:
+            if not text and not template_name:
                 return jsonify({
                     "queued": False,
-                    "error": f"Item {i+1} falta 'text' o 'template_name' válido"
+                    "error": f"Item {i+1} falta 'text' o 'template_name'"
                 }), 400
 
         t = threading.Thread(
@@ -1152,10 +1130,6 @@ def _bulk_send_from_sheets_worker_updated(
         enviados = 0
         fallidos = 0
 
-        # Validar y normalizar template_name
-        template_name_clean = template_name.lower().strip() if template_name else ""
-        has_valid_template = bool(template_name_clean and template_name_clean not in ["null", "none", ""])
-
         for offset, row in enumerate(rows, start=2):
             if limit is not None and enviados >= limit:
                 break
@@ -1187,21 +1161,12 @@ def _bulk_send_from_sheets_worker_updated(
 
             sent = False
             
-            # PRIORIDAD: Plantilla Meta válida
-            if has_valid_template:
-                # Preparar componentes con nombre si está disponible
-                current_components = []
-                if components:
-                    current_components = components.copy()
-                else:
-                    # Crear componente body con nombre si está disponible
-                    body_params = []
-                    if name:
-                        body_params.append({"type": "text", "text": name})
-                    current_components = [{"type": "body", "parameters": body_params}]
-                    
-                sent = send_template_message(to, template_name_clean, current_components)
-                log.info(f"📤 [SECOM-PROMO] Enviando plantilla '{template_name_clean}' a {to}")
+            # PRIORIDAD: Plantilla Meta
+            if template_name:
+                # Si no hay componentes, crear uno vacío
+                current_components = components or [{"type": "body", "parameters": []}]
+                sent = send_template_message(to, template_name, current_components)
+                log.info(f"📤 [SECOM-PROMO] Enviando plantilla '{template_name}' a {to}")
                 
             # SEGUNDA OPCIÓN: Mensaje de texto
             elif message_template or use_sheet_message:
@@ -1269,15 +1234,11 @@ def ext_send_promo_secom():
         use_sheet_message = bool(data.get("use_sheet_message", True))
         limit = data.get("limit")
 
-        # Validación mejorada de template_name
-        template_name_clean = template_name.lower().strip() if template_name else ""
-        has_valid_template = bool(template_name_clean and template_name_clean not in ["null", "none", ""])
-        
-        if not message_template and not has_valid_template:
+        if not message_template and not template_name:
             return jsonify(
                 {
                     "ok": False,
-                    "error": "Debes enviar 'message' o 'template_name' válido.",
+                    "error": "Debes enviar 'message' o 'template_name'.",
                 }
             ), 400
 
