@@ -3,7 +3,6 @@ from __future__ import annotations
 import os, re, json, time, logging, threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from flask import Flask, request, jsonify
@@ -176,48 +175,80 @@ def send_message(to: str, text: str) -> bool:
 def send_template_message(
     to: str, template_name: str, components: List[Dict[str, Any]]
 ) -> bool:
-    """Envía mensaje de plantilla."""
+    """Envía mensaje de plantilla con estructura corregida."""
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp API no configurada para plantillas")
         return False
 
-    # Si no hay componentes, crear uno vacío de tipo body
+    # Normalizar nombre de plantilla
+    template_name_normalized = template_name.lower().strip().replace(" ", "_")
+    
+    # Validar y construir componentes correctamente
     if not components:
         components = [{"type": "body", "parameters": []}]
-
     
-    # Permitir idioma dinámico desde JSON o variable de entorno
-    language_code = os.getenv("WPP_TEMPLATE_LANG", "es_MX")
+    # Validar que cada componente tenga la estructura correcta
+    valid_components = []
+    for comp in components:
+        if comp.get("type") == "body":
+            parameters = comp.get("parameters", [])
+            valid_params = []
+            for param in parameters:
+                if isinstance(param, dict) and param.get("type") == "text":
+                    valid_params.append({"type": "text", "text": str(param.get("text", ""))})
+            valid_components.append({
+                "type": "body",
+                "parameters": valid_params
+            })
+        elif comp.get("type") == "header":
+            parameters = comp.get("parameters", [])
+            valid_params = []
+            for param in parameters:
+                if isinstance(param, dict):
+                    if param.get("type") == "text":
+                        valid_params.append({"type": "text", "text": str(param.get("text", ""))})
+                    elif param.get("type") == "image":
+                        valid_params.append({"type": "image", "image": param.get("image", {})})
+            if valid_params:
+                valid_components.append({
+                    "type": "header",
+                    "parameters": valid_params
+                })
 
-           payload = {
+    payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "template",
         "template": {
-            "name": template_name,
-            "language": {"code": language_code},
-            "components": components,
+            "name": template_name_normalized,
+            "language": {"code": "es_MX"},
+            "components": valid_components,
         },
     }
-
 
     for attempt in range(3):
         try:
             r = requests.post(
                 WPP_API_URL, headers=_headers(), json=payload, timeout=15
             )
+            response_data = r.json() if r.content else {}
             if r.status_code == 200:
-                log.info(f"📤 Plantilla '{template_name}' enviada a {to}")
+                log.info(f"📤 Plantilla '{template_name_normalized}' enviada a {to}")
                 return True
-            log.warning(
-                f"⚠️ Error plantilla {template_name} {r.status_code} {r.text[:300]!r}"
+                
+            # Log detallado del error
+            log.error(
+                f"❌ Error plantilla {template_name_normalized} - Status: {r.status_code} - "
+                f"Response: {json.dumps(response_data, ensure_ascii=False)} - "
+                f"Payload: {json.dumps(payload, ensure_ascii=False)[:500]}"
             )
+            
             if _should_retry(r.status_code) and attempt < 2:
                 _backoff(attempt)
                 continue
             return False
-        except Exception:
-            log.exception("❌ Error en send_template_message")
+        except Exception as e:
+            log.exception(f"❌ Error en send_template_message: {str(e)}")
             if attempt < 2:
                 _backoff(attempt)
                 continue
@@ -928,18 +959,174 @@ def ext_test_send():
 
 
 # ==========================
-# WORKER MEJORADO: Envío masivo SECOM desde Sheets
+# Worker envíos masivos manual (lista explícita)
 # ==========================
-def _bulk_send_from_sheets_worker_enhanced(
-    template_name: str = "",
-    message_template: str = "",
-    components: List[Dict[str, Any]] = None,
-    use_sheet_message: bool = False,
+def _bulk_send_worker_updated(items: List[Dict[str, Any]]) -> None:
+    ok = 0
+    fail = 0
+    for i, item in enumerate(items, 1):
+        try:
+            to = str(item.get("to", "")).strip()
+            text = str(item.get("text", "")).strip()
+            template_name = str(item.get("template_name") or item.get("template", "")).strip()
+            components = item.get("components") or []
+
+            # Validación mejorada con logs detallados
+            if not to:
+                log.warning(f"⏭️ Item {i} inválido: missing 'to'")
+                fail += 1
+                continue
+
+            # Validación estricta de template_name
+            template_name_clean = template_name.lower().strip() if template_name else ""
+            has_valid_template = bool(template_name_clean and template_name_clean not in ["null", "none", ""])
+            
+            if not text and not has_valid_template:
+                log.warning(f"⏭️ Item {i} inválido: missing both 'text' and valid 'template_name'")
+                fail += 1
+                continue
+
+            sent = False
+            if has_valid_template:
+                # Validar y normalizar componentes
+                valid_components = []
+                if components:
+                    for comp in components:
+                        if comp.get("type") == "body":
+                            parameters = comp.get("parameters", [])
+                            valid_params = []
+                            for param in parameters:
+                                if isinstance(param, dict) and param.get("type") == "text":
+                                    valid_params.append({"type": "text", "text": str(param.get("text", ""))})
+                            valid_components.append({
+                                "type": "body",
+                                "parameters": valid_params
+                            })
+                
+                # Si no hay componentes válidos, crear uno vacío
+                if not valid_components:
+                    valid_components = [{"type": "body", "parameters": []}]
+                    
+                sent = send_template_message(to, template_name_clean, valid_components)
+                log.info(f"📤 [BULK] Enviando plantilla '{template_name_clean}' a {to}")
+            else:
+                sent = send_message(to, text)
+                log.info(f"📤 [BULK] Enviando texto a {to}")
+
+            if sent:
+                ok += 1
+                key = _normalize_phone(to)
+                low = (text or "").lower()
+                campaign = (item.get("campaign") or "").lower()
+                if "cliente secom" in low and "seguro de auto" in low:
+                    _user_state[key] = "campaign_secom_auto"
+                elif "préstamo imss" in low or "prestamo imss" in low:
+                    _user_state[key] = "campaign_imss_ley73"
+                elif campaign:
+                    _user_state[key] = f"campaign_{campaign}"
+            else:
+                fail += 1
+                log.warning(f"❌ Falló envío a {to}")
+
+            time.sleep(0.4)
+
+        except Exception:
+            fail += 1
+            log.exception(f"❌ Error item {i} en _bulk_send_worker_updated")
+
+    log.info(f"🎯 Envío masivo terminado OK={ok} FAIL={fail}")
+    if ADVISOR_NUMBER:
+        send_message(
+            ADVISOR_NUMBER,
+            f"📊 Envío masivo finalizado.\nExitosos: {ok}\nFallidos: {fail}\nTotal: {len(items)}",
+        )
+
+
+@app.post("/ext/send-promo")
+def ext_send_promo():
+    """Endpoint para campañas con soporte para plantillas Meta."""
+    try:
+        if not (META_TOKEN and WABA_PHONE_ID):
+            return jsonify(
+                {"queued": False, "error": "WhatsApp API no configurada"}
+            ), 500
+
+        data = request.get_json(force=True) or {}
+        items = data.get("items")
+
+        # Soporte para formato plano (sin items array)
+        if not isinstance(items, list):
+            # Si viene template_name directamente, crear un array de un elemento
+            if "template_name" in data or "template" in data:
+                items = [data]
+            else:
+                return jsonify(
+                    {
+                        "queued": False,
+                        "error": "Se requiere lista 'items' con mensajes o campos directos 'template_name'/'to'",
+                    }
+                ), 400
+
+        if not items:
+            return jsonify(
+                {
+                    "queued": False,
+                    "error": "Lista 'items' vacía o sin campos requeridos",
+                }
+            ), 400
+
+        # Validar que cada item tenga los campos requeridos
+        for i, item in enumerate(items):
+            to = str(item.get("to", "")).strip()
+            text = str(item.get("text", "")).strip()
+            template_name = str(item.get("template_name") or item.get("template", "")).strip()
+            
+            if not to:
+                return jsonify({
+                    "queued": False, 
+                    "error": f"Item {i+1} falta campo 'to'"
+                }), 400
+                
+            template_name_clean = template_name.lower().strip() if template_name else ""
+            has_valid_template = bool(template_name_clean and template_name_clean not in ["null", "none", ""])
+            
+            if not text and not has_valid_template:
+                return jsonify({
+                    "queued": False,
+                    "error": f"Item {i+1} falta 'text' o 'template_name' válido"
+                }), 400
+
+        t = threading.Thread(
+            target=_bulk_send_worker_updated, args=(items,), daemon=True
+        )
+        t.start()
+
+        return jsonify(
+            {
+                "queued": True,
+                "count": len(items),
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        ), 202
+
+    except Exception as e:
+        log.exception("❌ Error en /ext/send-promo")
+        return jsonify({"queued": False, "error": str(e)}), 500
+
+
+# ==========================
+# Envío masivo SECOM desde Sheets (WAPI) con soporte para plantillas
+# ==========================
+def _bulk_send_from_sheets_worker_updated(
+    message_template: str,
+    template_name: str,
+    components: List[Dict[str, Any]],
+    use_sheet_message: bool,
     limit: Optional[int] = None,
 ) -> None:
     """
-    Worker mejorado para envío masivo desde Google Sheets.
-    Soporta plantillas Meta y mensajes de texto con control robusto de errores.
+    Lee la hoja de leads SECOM y envía mensajes uno a uno (60s).
+    Soporta tanto plantillas Meta como mensajes de texto.
     """
     if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         log.error("[SECOM-PROMO] Google Sheets no configurado")
@@ -964,13 +1151,13 @@ def _bulk_send_from_sheets_worker_enhanced(
         now_iso = datetime.utcnow().isoformat()
         enviados = 0
         fallidos = 0
-        total_procesados = 0
 
-        log.info(f"[SECOM-PROMO] Iniciando envío masivo. Template: {template_name}, Mensaje: {bool(message_template)}")
+        # Validar y normalizar template_name
+        template_name_clean = template_name.lower().strip() if template_name else ""
+        has_valid_template = bool(template_name_clean and template_name_clean not in ["null", "none", ""])
 
         for offset, row in enumerate(rows, start=2):
             if limit is not None and enviados >= limit:
-                log.info(f"[SECOM-PROMO] Límite alcanzado: {limit}")
                 break
 
             if len(row) <= idx_wa:
@@ -979,46 +1166,42 @@ def _bulk_send_from_sheets_worker_enhanced(
             phone_raw = row[idx_wa]
             norm = _normalize_phone(str(phone_raw))
             if not norm:
-                log.warning(f"[SECOM-PROMO] Fila {offset}: Número inválido {phone_raw}")
                 continue
 
-            # Validar formato internacional
+            status_val = row[idx_status] if idx_status is not None and len(row) > idx_status else ""
+            status_up = str(status_val).strip().upper()
+
+            first_val = row[idx_first] if idx_first is not None and len(row) > idx_first else ""
+            first_exists = bool(str(first_val).strip())
+
+            if first_exists:
+                continue
+            if status_up in ("NO_INTERESADO", "NO INTERESADO", "CERRADO"):
+                continue
+
+            name = row[idx_name].strip() if idx_name is not None and len(row) > idx_name else ""
+
             to = str(phone_raw).strip()
             if not to.startswith("52"):
                 to = f"52{norm}"
 
-            # Verificar estatus
-            status_val = row[idx_status] if idx_status is not None and len(row) > idx_status else ""
-            status_up = str(status_val).strip().upper()
-            if status_up in ("NO_INTERESADO", "NO INTERESADO", "CERRADO", "NOINTERESADO"):
-                log.info(f"[SECOM-PROMO] Fila {offset}: Saltando - estatus {status_up}")
-                continue
-
-            # Verificar si ya se envió
-            first_val = row[idx_first] if idx_first is not None and len(row) > idx_first else ""
-            first_exists = bool(str(first_val).strip())
-            if first_exists:
-                log.info(f"[SECOM-PROMO] Fila {offset}: Ya enviado anteriormente")
-                continue
-
-            total_procesados += 1
-            name = row[idx_name].strip() if idx_name is not None and len(row) > idx_name else ""
-
             sent = False
             
-            # PRIORIDAD: Plantilla Meta
-            if template_name:
-                current_components = components or [{"type": "body", "parameters": []}]
-                
-                # Personalizar componentes con nombre si está disponible
-                for comp in current_components:
-                    if comp.get("type") == "body" and name:
-                        for param in comp.get("parameters", []):
-                            if param.get("type") == "text" and "{{nombre}}" in param.get("text", ""):
-                                param["text"] = param["text"].replace("{{nombre}}", name)
-                
-                sent = send_template_message(to, template_name, current_components)
-                log.info(f"📤 [SECOM-PROMO] Enviando plantilla '{template_name}' a {to}")
+            # PRIORIDAD: Plantilla Meta válida
+            if has_valid_template:
+                # Preparar componentes con nombre si está disponible
+                current_components = []
+                if components:
+                    current_components = components.copy()
+                else:
+                    # Crear componente body con nombre si está disponible
+                    body_params = []
+                    if name:
+                        body_params.append({"type": "text", "text": name})
+                    current_components = [{"type": "body", "parameters": body_params}]
+                    
+                sent = send_template_message(to, template_name_clean, current_components)
+                log.info(f"📤 [SECOM-PROMO] Enviando plantilla '{template_name_clean}' a {to}")
                 
             # SEGUNDA OPCIÓN: Mensaje de texto
             elif message_template or use_sheet_message:
@@ -1028,60 +1211,48 @@ def _bulk_send_from_sheets_worker_enhanced(
                 if not msg:
                     msg = str(message_template or "").strip()
                 if not msg:
-                    log.warning(f"[SECOM-PROMO] Fila {offset}: Sin mensaje disponible")
                     continue
 
-                # Personalizar mensaje
                 msg = msg.replace("{{nombre}}", name if name else "Hola")
                 sent = send_message(to, msg)
                 log.info(f"📤 [SECOM-PROMO] Enviando texto a {to}")
 
             if sent:
-                # Actualizar hoja
                 updates = {"FirstSentAt": now_iso}
                 if idx_status is not None:
                     updates[headers[idx_status]] = "ENVIADO_INICIAL"
                 _batch_update_cells(offset, updates, headers)
                 enviados += 1
-                log.info(f"✅ [SECOM-PROMO] Enviado a {to} fila {offset}")
+                log.info(f"[SECOM-PROMO] Enviado a {to} fila {offset}")
             else:
                 fallidos += 1
-                log.warning(f"❌ [SECOM-PROMO] Falló envío a {to} fila {offset}")
+                log.warning(f"[SECOM-PROMO] Falló envío a {to} fila {offset}")
 
-            # Esperar entre envíos para evitar bloqueos
-            time.sleep(1)
+            time.sleep(60)
 
-        # Notificar resultados al asesor
-        log.info(f"🎯 [SECOM-PROMO] Finalizado. Procesados={total_procesados}, Enviados={enviados}, Fallidos={fallidos}")
+        log.info(
+            f"[SECOM-PROMO] Finalizado. Enviados={enviados} Fallidos={fallidos}"
+        )
         if ADVISOR_NUMBER:
-            summary_msg = (
-                f"📊 Envío masivo finalizado.\n"
-                f"Exitosos: {enviados}\n"
-                f"Fallidos: {fallidos}\n"
-                f"Total: {total_procesados}"
+            send_message(
+                ADVISOR_NUMBER,
+                f"📊 Envío masivo SECOM finalizado.\nExitosos: {enviados}\nFallidos: {fallidos}",
             )
-            send_message(ADVISOR_NUMBER, summary_msg)
-
-    except Exception as e:
-        log.exception("❌ Error en _bulk_send_from_sheets_worker_enhanced")
-        if ADVISOR_NUMBER:
-            send_message(ADVISOR_NUMBER, f"❌ Error en envío masivo: {str(e)}")
+    except Exception:
+        log.exception("❌ Error en _bulk_send_from_sheets_worker_updated")
 
 
-# ==========================
-# ENDPOINT UNIFICADO: Envío masivo SECOM
-# ==========================
 @app.post("/ext/send-promo-secom")
 def ext_send_promo_secom():
     """
-    Endpoint unificado para envío masivo SECOM desde Google Sheets.
-    
+    Envío masivo SECOM desde Google Sheets con soporte para plantillas Meta.
+
     Body JSON:
     {
       "message": "Texto base con {{nombre}}",   # opcional si se usa template_name
       "template_name": "auto_inbursa_70",       # opcional, prioridad sobre message
       "components": [{"type": "body", "parameters": [{"type": "text", "text": "Christian"}]}],
-      "use_sheet_message": true,                # por defecto false
+      "use_sheet_message": true,                # por defecto true
       "limit": 100                              # opcional
     }
     """
@@ -1095,38 +1266,35 @@ def ext_send_promo_secom():
         message_template = (data.get("message") or "").strip()
         template_name = (data.get("template_name") or "").strip()
         components = data.get("components") or []
-        use_sheet_message = bool(data.get("use_sheet_message", False))
+        use_sheet_message = bool(data.get("use_sheet_message", True))
         limit = data.get("limit")
 
-        if not message_template and not template_name:
-            return jsonify({
-                "ok": False,
-                "error": "Debes enviar 'message' o 'template_name'."
-            }), 400
-
-        # Validar componentes si se usa plantilla
-        if template_name and components:
-            if not isinstance(components, list):
-                return jsonify({
+        # Validación mejorada de template_name
+        template_name_clean = template_name.lower().strip() if template_name else ""
+        has_valid_template = bool(template_name_clean and template_name_clean not in ["null", "none", ""])
+        
+        if not message_template and not has_valid_template:
+            return jsonify(
+                {
                     "ok": False,
-                    "error": "'components' debe ser una lista"
-                }), 400
+                    "error": "Debes enviar 'message' o 'template_name' válido.",
+                }
+            ), 400
 
-        # Iniciar worker en segundo plano
         t = threading.Thread(
-            target=_bulk_send_from_sheets_worker_enhanced,
-            args=(template_name, message_template, components, use_sheet_message, limit),
-            daemon=True
+            target=_bulk_send_from_sheets_worker_updated,
+            args=(message_template, template_name, components, use_sheet_message, limit),
+            daemon=True,
         )
         t.start()
 
-        return jsonify({
-            "ok": True,
-            "status": "queued",
-            "message": "Envío masivo iniciado en segundo plano",
-            "timestamp": datetime.utcnow().isoformat(),
-            "type": "template" if template_name else "text"
-        }), 202
+        return jsonify(
+            {
+                "ok": True,
+                "status": "queued",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        ), 202
 
     except Exception as e:
         log.exception("❌ Error en /ext/send-promo-secom")
@@ -1259,7 +1427,3 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
-
-
-
