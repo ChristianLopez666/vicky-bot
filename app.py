@@ -168,7 +168,7 @@ def _normalize_template_name(name: str) -> str:
     return n
 
 def send_template_message(to: str, template_name: str, components: List[Dict[str, Any]]) -> bool:
-    """Plantilla con fallback de idioma. No bloquea por envs faltantes."""
+    """Plantilla con idioma corregido para promoseguros_auto_70 (inglés). No bloquea por envs faltantes."""
     url = _wpp_api_url()
     if not url:
         log.warning("⚠️ PHONE_ID vacío; intento igualmente para ver respuesta del Graph.")
@@ -176,14 +176,21 @@ def send_template_message(to: str, template_name: str, components: List[Dict[str
 
     tname = _normalize_template_name(template_name)
     comps = components[:] if components else [{"type": "body", "parameters": []}]
+    
+    # CORRECCIÓN: La plantilla promoseguros_auto_70 está en inglés
     payload_base = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "template",
-        "template": {"name": tname, "language": {"code": "es_MX"}, "components": comps},
+        "template": {
+            "name": tname, 
+            "language": {"code": "en"},  # ← CAMBIADO de "es_MX" a "en"
+            "components": comps
+        },
     }
 
-    lang_chain = ["es_MX", "es_ES", "en_US", "en"]
+    # Simplificar cadena de idiomas - priorizar inglés
+    lang_chain = ["en", "en_US", "en_GB"]
     last_err = ""
 
     for attempt in range(3):
@@ -763,6 +770,100 @@ def ext_whatsapp_info():
         "phone_id_loaded": bool(_current_phone_id()),
         "api_url": _wpp_api_url() or "",
     }), 200
+
+# ==========================
+# Endpoints de diagnóstico para plantillas
+# ==========================
+@app.get("/ext/check-template")
+def ext_check_template():
+    """Verifica el estado exacto de una plantilla específica"""
+    try:
+        template_name = request.args.get("name", "promoseguros_auto_70")
+        url = f"https://graph.facebook.com/v21.0/{_current_phone_id()}/message_templates"
+        headers = _headers()
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            templates = response.json().get('data', [])
+            target_template = None
+            
+            for t in templates:
+                if t.get('name') == template_name:
+                    target_template = t
+                    break
+            
+            if target_template:
+                # Extraer información de componentes body
+                body_components = []
+                for comp in target_template.get('components', []):
+                    if comp.get('type') == 'BODY':
+                        body_components.append({
+                            'text': comp.get('text', ''),
+                            'example': comp.get('example', {}).get('body_text', []),
+                            'required_params': comp.get('text', '').count('{{1}}')
+                        })
+                
+                return jsonify({
+                    'ok': True,
+                    'template_found': True,
+                    'name': target_template.get('name'),
+                    'status': target_template.get('status'),
+                    'language': target_template.get('language'),
+                    'category': target_template.get('category'),
+                    'components': body_components,
+                    'required_parameters': body_components[0]['required_params'] if body_components else 0
+                })
+            else:
+                return jsonify({
+                    'ok': True,
+                    'template_found': False,
+                    'available_templates': [t.get('name') for t in templates],
+                    'message': f"Plantilla '{template_name}' no encontrada. Plantillas disponibles listadas."
+                })
+        else:
+            return jsonify({
+                'ok': False,
+                'error': f"Error {response.status_code}: {response.text}"
+            }), 400
+            
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.post("/ext/test-template")
+def ext_test_template():
+    """Endpoint para probar el envío de plantilla a un número específico"""
+    try:
+        data = request.get_json(force=True) or {}
+        to = str(data.get("to", "")).strip()
+        template_name = str(data.get("template_name", "promoseguros_auto_70")).strip()
+        
+        if not to:
+            return jsonify({"ok": False, "error": "Falta 'to'"}), 400
+        
+        # Probar con diferentes combinaciones de parámetros
+        test_components = [
+            {
+                "type": "body", 
+                "parameters": [
+                    {"type": "text", "text": "Juan Carlos"}  # Parámetro de nombre
+                ]
+            }
+        ]
+        
+        ok = send_template_message(to, template_name, test_components)
+        
+        return jsonify({
+            "ok": bool(ok),
+            "tested_with": {
+                "template": template_name,
+                "parameters": 1,
+                "language": "en"
+            }
+        }), 200 if ok else 400
+        
+    except Exception as e:
+        log.exception("❌ Error en /ext/test-template")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ==========================
 # Worker envíos masivos manual (lista explícita)
