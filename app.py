@@ -333,7 +333,9 @@ def _drive_search_folder(name: str, parent_id: str) -> Optional[str]:
     if not (google_ready and drive):
         return None
     try:
-        q = f"name = '{name.replace(\"'\",\"\\'\")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and '{parent_id}' in parents"
+        # Build a safe query string without backslashes inside f-string expressions
+        safe_name = name.replace("'", "\\'")
+        q = "name = '{}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and '{}' in parents".format(safe_name, parent_id)
         res = drive.files().list(q=q, spaces='drive', fields='files(id,name)', pageSize=10).execute()
         files = res.get("files", [])
         if files:
@@ -590,7 +592,7 @@ def process_text_message(phone: str, text: str, match: Optional[Dict[str, Any]])
         else:
             send_message(phone, "No pude acceder al manual IMSS ahora. Intenta más tarde.")
         return
-    # Intentual flows similar a la app: quick routing
+    # Intentual flows similar to the app: quick routing
     if t in ("1", "imss", "ley 73", "prestamo imss", "préstamo imss", "pension", "pensión"):
         send_message(phone, "🟩 *Préstamo IMSS Ley 73*\n¿Te interesa que revisemos si calificas? Responde sí o no.")
         return
