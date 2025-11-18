@@ -1,3 +1,4 @@
+# app.py — Vicky SECOM (Vicky WAPI + Campañas + Recordatorios + Forward Docs)
 from __future__ import annotations
 import os, re, json, time, logging, threading
 from datetime import datetime, timedelta
@@ -22,21 +23,25 @@ except Exception:
     openai = None
 
 # ==========================
-# Configuración y Entorno
+# Carga entorno
 # ==========================
 load_dotenv()
 
+
 def _get(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or "").strip()
+
 
 META_TOKEN = _get("META_TOKEN") or _get("WHATSAPP_TOKEN")
 WABA_PHONE_ID = _get("WABA_PHONE_ID") or _get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = _get("VERIFY_TOKEN")
 ADVISOR_NUMBER = _get("ADVISOR_NUMBER") or _get("ADVISOR_WHATSAPP")
 PORT = int(_get("PORT", "5000"))
+
 SHEETS_ID_LEADS = _get("SHEETS_ID_LEADS") or _get("SHEET_ID_SECOM")
 SHEETS_TITLE_LEADS = _get("SHEETS_TITLE_LEADS") or _get("SHEET_TITLE_SECOM", "Prospectos SECOM Auto")
 GOOGLE_CREDENTIALS_JSON = _get("GOOGLE_CREDENTIALS_JSON")
+
 OPENAI_API_KEY = _get("OPENAI_API_KEY")
 if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
@@ -55,12 +60,15 @@ app = Flask(__name__)
 _user_state: Dict[str, str] = {}
 _user_data: Dict[str, Dict[str, Any]] = {}
 
+
 def _normalize_phone(phone: str) -> str:
     digits = re.sub(r"\D", "", phone or "")
     return digits[-10:] if len(digits) >= 10 else digits or phone
 
+
 def get_state(phone: str) -> str:
     return _user_state.get(_normalize_phone(phone), "")
+
 
 def set_state(phone: str, value: str) -> None:
     key = _normalize_phone(phone)
@@ -69,11 +77,13 @@ def set_state(phone: str, value: str) -> None:
     elif key in _user_state:
         del _user_state[key]
 
+
 def get_data(phone: str) -> Dict[str, Any]:
     key = _normalize_phone(phone)
     if key not in _user_data:
         _user_data[key] = {}
     return _user_data[key]
+
 
 # ==========================
 # WhatsApp helpers
@@ -83,6 +93,7 @@ WPP_API_URL = (
     if WABA_PHONE_ID
     else None
 )
+
 
 def interpret_response(text: str) -> str:
     if not text:
@@ -96,6 +107,7 @@ def interpret_response(text: str) -> str:
         return "negative"
     return "neutral"
 
+
 def extract_number(text: str) -> Optional[float]:
     if not text:
         return None
@@ -106,6 +118,7 @@ def extract_number(text: str) -> Optional[float]:
     except Exception:
         return None
 
+
 def _headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {META_TOKEN}",
@@ -113,13 +126,17 @@ def _headers() -> Dict[str, str]:
         "User-Agent": "VickyBot-SECOM/1.0"
     }
 
+
 def _should_retry(status: int) -> bool:
     return status == 429 or 500 <= status < 600
+
 
 def _backoff(attempt: int) -> None:
     time.sleep(2**attempt)
 
+
 def send_message(to: str, text: str) -> bool:
+    """Envía mensaje de texto simple."""
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp API no configurada")
         return False
@@ -154,13 +171,16 @@ def send_message(to: str, text: str) -> bool:
             return False
     return False
 
+
 def send_template_message(
     to: str, template_name: str, components: List[Dict[str, Any]]
 ) -> bool:
+    """Envía mensaje de plantilla."""
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp API no configurada para plantillas")
         return False
 
+    # Si no hay componentes, crear uno vacío de tipo body
     if not components:
         components = [{"type": "body", "parameters": []}]
 
@@ -198,7 +218,12 @@ def send_template_message(
             return False
     return False
 
+
 def _send_media(to: str, mtype: str, media_id: str, filename: Optional[str] = None, caption: str = "") -> bool:
+    """
+    Reenvía un media existente (id) al número indicado.
+    Soporta image, document, audio, video.
+    """
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp API no configurada para media")
         return False
@@ -231,7 +256,12 @@ def _send_media(to: str, mtype: str, media_id: str, filename: Optional[str] = No
         log.exception("❌ Error en _send_media")
         return False
 
+
 def forward_media_to_advisor(origin_phone: str, mtype: str, msg: Dict[str, Any]) -> None:
+    """
+    Reenvía el archivo recibido al asesor (ADVISOR_NUMBER) usando el mismo media_id.
+    Esto asegura que tengas los documentos para cotizar.
+    """
     if not ADVISOR_NUMBER:
         return
     try:
@@ -245,6 +275,7 @@ def forward_media_to_advisor(origin_phone: str, mtype: str, msg: Dict[str, Any])
         _send_media(ADVISOR_NUMBER, mtype, media_id, filename=filename, caption=caption)
     except Exception:
         log.exception("❌ Error reenviando media al asesor")
+
 
 # ==========================
 # Google Sheets (SECOM) - lectura/escritura
@@ -267,12 +298,14 @@ if GOOGLE_CREDENTIALS_JSON and ServiceAccountCredentials and gbuild and SHEETS_I
     except Exception:
         log.exception("❌ Error configurando Google Sheets")
 
+
 def _col_letter(col: int) -> str:
     res = ""
     while col > 0:
         col, rem = divmod(col - 1, 26)
         res = chr(65 + rem) + res
     return res
+
 
 def _find_col(headers: List[str], names: List[str]) -> Optional[int]:
     if not headers:
@@ -283,6 +316,7 @@ def _find_col(headers: List[str], names: List[str]) -> Optional[int]:
         if n in low:
             return low.index(n)
     return None
+
 
 def _get_sheet_headers_and_rows() -> tuple[List[str], List[List[str]]]:
     if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
@@ -298,7 +332,12 @@ def _get_sheet_headers_and_rows() -> tuple[List[str], List[List[str]]]:
     data_rows = rows[1:]
     return headers, data_rows
 
+
 def _batch_update_cells(row_index: int, updates: Dict[str, str], headers: List[str]) -> None:
+    """
+    Actualiza celdas por nombre de columna en la fila indicada (2 = primera fila de datos).
+    Ignora columnas que no existan.
+    """
     if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         return
     if row_index < 2:
@@ -331,7 +370,9 @@ def _batch_update_cells(row_index: int, updates: Dict[str, str], headers: List[s
     except Exception:
         log.exception("❌ Error en _batch_update_cells")
 
+
 def match_client_in_sheets(phone: str) -> Optional[Dict[str, Any]]:
+    """Devuelve nombre del cliente si el WhatsApp coincide en la hoja de leads."""
     if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         return None
     try:
@@ -357,7 +398,11 @@ def match_client_in_sheets(phone: str) -> Optional[Dict[str, Any]]:
         log.exception("❌ Error en match_client_in_sheets")
         return None
 
+
 def _touch_last_inbound(phone: str) -> None:
+    """
+    Marca la última actividad entrante (cliente → bot) en LAST_MESSAGE_AT / LastInboundAt si existen.
+    """
     if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         return
     try:
@@ -393,6 +438,7 @@ def _touch_last_inbound(phone: str) -> None:
     except Exception:
         log.exception("❌ Error registrando LAST_MESSAGE_AT")
 
+
 # ==========================
 # Menú y helpers
 # ==========================
@@ -411,13 +457,16 @@ def send_main_menu(phone: str) -> None:
     )
     send_message(phone, menu)
 
+
 def notify_advisor(msg: str) -> None:
     if ADVISOR_NUMBER:
         send_message(ADVISOR_NUMBER, msg)
 
+
 # ==========================
-# Flujos Embudo SECOM
+# Embudos
 # ==========================
+# IMSS
 def imss_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     set_state(phone, "imss_beneficios")
     send_message(
@@ -426,6 +475,7 @@ def imss_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
         "Te ayudo a revisar si calificas para un préstamo con tasa preferencial. "
         "¿Te interesa conocer requisitos? (responde *sí* o *no*).",
     )
+
 
 def imss_next(phone: str, text: str) -> None:
     st = get_state(phone)
@@ -460,6 +510,8 @@ def imss_next(phone: str, text: str) -> None:
             f"🔔 Lead IMSS\nWhatsApp: {phone}\nNombre: {data.get('imss_nombre','')}\nPensión: {data.get('imss_pension','')}"
         )
 
+
+# Empresarial
 def emp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     set_state(phone, "emp_confirma")
     send_message(
@@ -467,6 +519,7 @@ def emp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
         "🏢 *Crédito Empresarial*\n"
         "¿Eres empresario(a) o representante de una empresa? (responde *sí* o *no*).",
     )
+
 
 def emp_next(phone: str, text: str) -> None:
     st = get_state(phone)
@@ -516,11 +569,14 @@ def emp_next(phone: str, text: str) -> None:
             f"🔔 Lead Empresarial\nWhatsApp: {phone}\n{resumen}"
         )
 
+
+# Financiamiento Práctico
 def fp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     set_state(phone, "fp_monto")
     send_message(
         phone, "💳 *Financiamiento Práctico*\n¿Qué monto necesitas?"
     )
+
 
 def fp_next(phone: str, text: str) -> None:
     st = get_state(phone)
@@ -541,6 +597,8 @@ def fp_next(phone: str, text: str) -> None:
             f"🔔 Lead Financiamiento Práctico\nWhatsApp: {phone}\nMonto: ${monto:,.0f}"
         )
 
+
+# Auto
 def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     set_state(phone, "auto_intro")
     send_message(
@@ -552,6 +610,7 @@ def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
         "• Si tienes póliza actual, foto donde se vea la fecha de vencimiento.\n"
         "Cuando lo envíes, te confirmaré recepción y procesaré la cotización.",
     )
+
 
 def auto_next(phone: str, text: str) -> None:
     st = get_state(phone)
@@ -589,6 +648,7 @@ def auto_next(phone: str, text: str) -> None:
         notify_advisor(
             f"🔔 Cliente SECOM {phone} indicó fecha de vencimiento: {text}"
         )
+
 
 # ==========================
 # Router principal
@@ -656,6 +716,7 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
         send_main_menu(phone)
         return
 
+    # No es comando directo → revisar estado
     st = get_state(phone)
     intent = interpret_response(text)
 
@@ -707,6 +768,7 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
             )
         return
 
+    # Flujos activos
     if st.startswith("imss_"):
         imss_next(phone, text)
     elif st.startswith("emp_"):
@@ -716,6 +778,7 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
     elif st.startswith("auto_"):
         auto_next(phone, text)
     else:
+        # Sin estado y sin comando válido
         if not st and intent == "positive" and match:
             send_message(
                 phone,
@@ -729,6 +792,8 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
         )
         auto_start(phone, match)
         return
+        send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
+
 
 # ==========================
 # Webhook
@@ -744,6 +809,7 @@ def webhook_verify():
     log.warning("❌ Webhook verification failed")
     return "forbidden", 403
 
+
 @app.post("/webhook")
 def webhook_receive():
     try:
@@ -754,6 +820,7 @@ def webhook_receive():
         value = changes.get("value", {})
         messages = value.get("messages", [])
 
+        # Si no hay messages (solo statuses), salimos
         if not messages:
             return jsonify({"ok": True}), 200
 
@@ -762,6 +829,7 @@ def webhook_receive():
         if not phone:
             return jsonify({"ok": True}), 200
 
+        # Registrar última actividad
         _touch_last_inbound(phone)
 
         match = match_client_in_sheets(phone)
@@ -771,6 +839,7 @@ def webhook_receive():
             text = msg.get("text", {}).get("body", "")
             log.info(f"💬 Texto de {phone}: {text!r}")
 
+            # GPT directo opcional
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
@@ -799,6 +868,7 @@ def webhook_receive():
                 phone,
                 "✅ Archivo recibido. Lo revisaré junto con tu solicitud.",
             )
+            # Reenvía el mismo media al asesor para que tenga la documentación
             forward_media_to_advisor(phone, mtype, msg)
             return jsonify({"ok": True}), 200
 
@@ -808,6 +878,7 @@ def webhook_receive():
     except Exception:
         log.exception("❌ Error en webhook_receive")
         return jsonify({"ok": True}), 200
+
 
 # ==========================
 # Endpoints externos básicos
@@ -822,6 +893,7 @@ def health():
         }
     )
 
+
 @app.get("/ext/health")
 def ext_health():
     return jsonify(
@@ -832,6 +904,7 @@ def ext_health():
             "openai_ready": bool(openai and OPENAI_API_KEY),
         }
     )
+
 
 @app.post("/ext/test-send")
 def ext_test_send():
@@ -847,6 +920,7 @@ def ext_test_send():
         log.exception("❌ Error en /ext/test-send")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 # ==========================
 # Worker envíos masivos manual (lista explícita)
 # ==========================
@@ -860,6 +934,7 @@ def _bulk_send_worker_updated(items: List[Dict[str, Any]]) -> None:
             template_name = str(item.get("template_name") or item.get("template", "")).strip()
             components = item.get("components") or []
 
+            # Validación mejorada con logs detallados
             if not to:
                 log.warning(f"⏭️ Item {i} inválido: missing 'to'")
                 fail += 1
@@ -872,6 +947,7 @@ def _bulk_send_worker_updated(items: List[Dict[str, Any]]) -> None:
 
             sent = False
             if template_name:
+                # Si no hay componentes, crear uno vacío
                 if not components:
                     components = [{"type": "body", "parameters": []}]
                 sent = send_template_message(to, template_name, components)
@@ -908,8 +984,10 @@ def _bulk_send_worker_updated(items: List[Dict[str, Any]]) -> None:
             f"📊 Envío masivo finalizado.\nExitosos: {ok}\nFallidos: {fail}\nTotal: {len(items)}",
         )
 
+
 @app.post("/ext/send-promo")
 def ext_send_promo():
+    """Endpoint para campañas con soporte para plantillas Meta."""
     try:
         if not (META_TOKEN and WABA_PHONE_ID):
             return jsonify(
@@ -919,7 +997,9 @@ def ext_send_promo():
         data = request.get_json(force=True) or {}
         items = data.get("items")
 
+        # Soporte para formato plano (sin items array)
         if not isinstance(items, list):
+            # Si viene template_name directamente, crear un array de un elemento
             if "template_name" in data or "template" in data:
                 items = [data]
             else:
@@ -938,6 +1018,7 @@ def ext_send_promo():
                 }
             ), 400
 
+        # Validar que cada item tenga los campos requeridos
         for i, item in enumerate(items):
             to = str(item.get("to", "")).strip()
             text = str(item.get("text", "")).strip()
@@ -972,6 +1053,7 @@ def ext_send_promo():
         log.exception("❌ Error en /ext/send-promo")
         return jsonify({"queued": False, "error": str(e)}), 500
 
+
 # ==========================
 # Envío masivo SECOM desde Sheets (WAPI) con soporte para plantillas
 # ==========================
@@ -982,6 +1064,10 @@ def _bulk_send_from_sheets_worker_updated(
     use_sheet_message: bool,
     limit: Optional[int] = None,
 ) -> None:
+    """
+    Lee la hoja de leads SECOM y envía mensajes uno a uno (60s).
+    Soporta tanto plantillas Meta como mensajes de texto.
+    """
     if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         log.error("[SECOM-PROMO] Google Sheets no configurado")
         return
@@ -1037,10 +1123,14 @@ def _bulk_send_from_sheets_worker_updated(
 
             sent = False
             
+            # PRIORIDAD: Plantilla Meta
             if template_name:
+                # Si no hay componentes, crear uno vacío
                 current_components = components or [{"type": "body", "parameters": []}]
                 sent = send_template_message(to, template_name, current_components)
                 log.info(f"📤 [SECOM-PROMO] Enviando plantilla '{template_name}' a {to}")
+                
+            # SEGUNDA OPCIÓN: Mensaje de texto
             elif message_template or use_sheet_message:
                 msg = ""
                 if use_sheet_message and idx_msg_base is not None and len(row) > idx_msg_base:
@@ -1078,6 +1168,7 @@ def _bulk_send_from_sheets_worker_updated(
     except Exception:
         log.exception("❌ Error en _bulk_send_from_sheets_worker_updated")
 
+
 @app.post("/ext/send-promo-secom")
 def ext_send_promo_secom():
     """
@@ -1085,11 +1176,11 @@ def ext_send_promo_secom():
 
     Body JSON:
     {
-      "message": "Texto base con {{nombre}}",
-      "template_name": "auto_inbursa_70",
+      "message": "Texto base con {{nombre}}",   # opcional si se usa template_name
+      "template_name": "auto_inbursa_70",       # opcional, prioridad sobre message
       "components": [{"type": "body", "parameters": [{"type": "text", "text": "Christian"}]}],
-      "use_sheet_message": true,
-      "limit": 100
+      "use_sheet_message": true,                # por defecto true
+      "limit": 100                              # opcional
     }
     """
     try:
@@ -1132,6 +1223,7 @@ def ext_send_promo_secom():
         log.exception("❌ Error en /ext/send-promo-secom")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
 # ==========================
 # Recordatorios 3 y 5 días
 # ==========================
@@ -1143,7 +1235,13 @@ def _parse_iso(dt_str: str) -> Optional[datetime]:
     except Exception:
         return None
 
+
 def _start_reminders_worker() -> None:
+    """
+    Worker que cada hora revisa la hoja y envía recordatorios:
+      - 3 días después de FirstSentAt (si no respondió).
+      - 5 días después de FirstSentAt (si no respondió).
+    """
     if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         log.info("[REMINDERS] Sheets no configurado; worker no iniciado")
         return
@@ -1206,6 +1304,7 @@ def _start_reminders_worker() -> None:
                     if not to.startswith("52"):
                         to = f"52{norm}"
 
+                    # Recordatorio 3 días
                     if days >= 3 and str(rem3_val).strip().upper() != "YES" and inactive:
                         msg3 = (
                             f"{name}, solo para recordarte que tenemos lista tu propuesta de seguro de auto "
@@ -1217,6 +1316,7 @@ def _start_reminders_worker() -> None:
                                 updates[headers[idx_status]] = "RECORDATORIO_3D"
                             _batch_update_cells(offset, updates, headers)
 
+                    # Recordatorio 5 días
                     if days >= 5 and str(rem5_val).strip().upper() != "YES" and inactive:
                         msg5 = (
                             f"{name}, confirmo si aún te interesa aprovechar tu beneficio preferencial "
@@ -1236,7 +1336,10 @@ def _start_reminders_worker() -> None:
 
     threading.Thread(target=worker, daemon=True).start()
 
+
+# Iniciar worker de recordatorios al cargar la app
 _start_reminders_worker()
+
 
 # ==========================
 # Arranque local
@@ -1247,5 +1350,3 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
-
