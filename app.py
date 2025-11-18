@@ -1,959 +1,748 @@
-# ============================================================
-# VICKY BOT SECOM/WAPI — app.py FINAL
-# Arquitectura unificada FASE 3
-# SECOM + WAPI + GPT + RAG + DRIVE + Worker SECOM
-# ============================================================
-
+#!/usr/bin/env python3
+from __future__ import annotations
 import os
+import re
+import io
 import json
 import time
-import base64
+import math
 import logging
 import threading
-from datetime import datetime
+import requests
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+from collections import Counter, defaultdict
+from functools import wraps
+
+# Google APIs
+try:
+    from google.oauth2.service_account import Credentials as ServiceAccountCredentials
+    from googleapiclient.discovery import build as gbuild
+    from googleapiclient.http import MediaIoBaseUpload
+except Exception:
+    ServiceAccountCredentials = None
+    gbuild = None
+    MediaIoBaseUpload = None
+
+# PDF parsing
+try:
+    import PyPDF2
+except Exception:
+    PyPDF2 = None
+
+# OpenAI
+try:
+    import openai
+except Exception:
+    openai = None
+
 from flask import Flask, request, jsonify
 
-import requests
-import pytz
+# -----------------------
+# Config / Env
+# -----------------------
+def _get(key: str, default: str = "") -> str:
+    return (os.getenv(key, default) or "").strip()
 
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+META_TOKEN = _get("META_TOKEN")
+VERIFY_TOKEN = _get("VERIFY_TOKEN")
+WABA_PHONE_ID = _get("WABA_PHONE_ID")
+WA_API_VERSION = _get("WA_API_VERSION", "v17.0")
+ADVISOR_WHATSAPP = _get("ADVISOR_WHATSAPP")
+OPENAI_API_KEY = _get("OPENAI_API_KEY")
+GOOGLE_CREDENTIALS_JSON = _get("GOOGLE_CREDENTIALS_JSON")
+GSHEET_PROSPECTS_ID = _get("GSHEET_PROSPECTS_ID")
+SHEET_TITLE_SECOM = _get("SHEET_TITLE_SECOM")
+DRIVE_FOLDER_ID = _get("DRIVE_FOLDER_ID")
+ID_MANUAL_IMSS = _get("ID_MANUAL_IMSS")
 
-import openai
+PORT = int(_get("PORT", "5000"))
 
+if openai and OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
 
-# ============================================================
-# CONFIG: FLASK
-# ============================================================
-app = Flask(__name__)
-app.config["JSON_AS_ASCII"] = False
-
-
-# ============================================================
-# LOAD ENV VARIABLES (RENDER)
-# ============================================================
-
-META_TOKEN = os.getenv("META_TOKEN")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
-WA_API_VERSION = os.getenv("WA_API_VERSION", "v20.0")
-
-ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER")
-ADVISOR_WHATSAPP = os.getenv("ADVISOR_WHATSAPP")
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GPT_MODEL = os.getenv("GPT_MODEL", "gpt-4o-mini")
-
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-
-SHEET_ID_SECOM = os.getenv("SHEET_ID_SECOM")
-SHEET_TITLE_SECOM = os.getenv("SHEET_TITLE_SECOM")
-
-GSHEET_PROSPECTS_ID = os.getenv("GSHEET_PROSPECTS_ID")
-GSHEET_SOLICITUDES_ID = os.getenv("GSHEET_SOLICITUDES_ID")
-SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Hoja1")
-
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-ID_MANUAL_IMSS = os.getenv("ID_MANUAL_IMSS")
-
-TZ = os.getenv("TZ", "America/Mazatlan")
-
-
-# ============================================================
-# TIMEZONE
-# ============================================================
-tz = pytz.timezone(TZ)
-
-
-# ============================================================
-# LOGGING
-# ============================================================
+# Logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-logging.info("🔥 Vicky SECOM/WAPI — FASE 3 iniciando…")
+log = logging.getLogger("vicky-secom")
 
+app = Flask(__name__)
 
-# ============================================================
-# GOOGLE CREDS (JSON embebido como string)
-# ============================================================
-try:
-    google_creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    GOOGLE_CREDS = Credentials.from_service_account_info(
-        google_creds_dict,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-    )
-    logging.info("✔ Credenciales Google cargadas correctamente.")
-except Exception as e:
-    logging.error(f"❌ Error cargando credenciales Google: {e}")
-    GOOGLE_CREDS = None
-
-
-# ============================================================
-# HELPER: ENVIAR MENSAJE SIMPLE A WHATSAPP
-# ============================================================
-def send_message(to: str, text: str):
-    """
-    Enviar un mensaje de texto simples usando la API oficial de Meta.
-    """
-    try:
-        url = f"https://graph.facebook.com/{WA_API_VERSION}/{WABA_PHONE_ID}/messages"
-
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": {"body": text}
-        }
-
-        headers = {
-            "Authorization": f"Bearer {META_TOKEN}",
-            "Content-Type": "application/json"
-        }
-
-        r = requests.post(url, json=payload, headers=headers)
-        if r.status_code in [200, 201]:
-            logging.info(f"✔ Mensaje enviado a {to}")
-            return True
-        else:
-            logging.error(f"❌ Error enviando mensaje: {r.text}")
-            return False
-
-    except Exception as e:
-        logging.error(f"❌ Excepción en send_message: {e}")
-        return False
-# ============================================================
-# BLOQUE 2 — HELPERS UNIVERSALES + META HELPERS
-# ============================================================
-
-# -------------------------------
-# Helper: Normalizar número
-# -------------------------------
-def normalize_number(num: str) -> str:
-    """
-    Asegura que el número está en formato internacional 521XXXXXXXXXX
-    y elimina espacios o caracteres no válidos.
-    """
-    n = "".join([c for c in num if c.isdigit()])
-    if n.startswith("52"):
-        return n
-    if len(n) == 10:
-        return "521" + n
-    return n
-
-
-# -------------------------------
-# Helper: Fecha/hora con TZ
-# -------------------------------
-def now_str():
-    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-
-
-# -------------------------------
-# Helper: Rate limit (Básico)
-# -------------------------------
-last_request_time = 0
-
-def respect_rate_limit(min_seconds=1):
-    """
-    Evita hacer requests consecutivos que puedan gatillar rate limit de Meta.
-    Tu worker SECOM usa 60 segundos, aquí solo aplicamos un mínimo de seguridad.
-    """
-    global last_request_time
-    now = time.time()
-
-    if now - last_request_time < min_seconds:
-        time.sleep(min_seconds - (now - last_request_time))
-
-    last_request_time = time.time()
-
-
-# -------------------------------
-# Helper: Enviar plantilla de WhatsApp
-# -------------------------------
-def send_template_message(to: str, template_name: str, components: list):
-    """
-    Enviar una plantilla aprobada por Meta.
-    """
-    try:
-        respect_rate_limit()
-
-        url = f"https://graph.facebook.com/{WA_API_VERSION}/{WABA_PHONE_ID}/messages"
-
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "template",
-            "template": {
-                "name": template_name,
-                "language": {"code": "es_MX"},
-                "components": components
-            }
-        }
-
-        headers = {
-            "Authorization": f"Bearer {META_TOKEN}",
-            "Content-Type": "application/json"
-        }
-
-        r = requests.post(url, json=payload, headers=headers)
-        resp = r.json()
-
-        if r.status_code in [200, 201]:
-            logging.info(f"✔ Plantilla '{template_name}' enviada a {to}")
-            return True
-
-        logging.error(f"❌ Error plantilla {template_name} → {resp}")
-        return False
-
-    except Exception as e:
-        logging.error(f"❌ Excepción en send_template_message: {e}")
-        return False
-
-
-# -------------------------------
-# Helper: Descargar archivo desde Meta
-# -------------------------------
-def download_media(media_id: str):
-    """
-    Descarga archivo desde Meta (imagen/PDF/audio/video)
-    y regresa bytes + MIME type.
-    """
-    try:
-        # 1) Obtener URL temporal
-        url = f"https://graph.facebook.com/{WA_API_VERSION}/{media_id}"
-        headers = {"Authorization": f"Bearer {META_TOKEN}"}
-        r = requests.get(url, headers=headers)
-
-        if r.status_code != 200:
-            logging.error(f"❌ Error obteniendo media URL: {r.text}")
-            return None, None
-
-        media_url = r.json().get("url")
-
-        # 2) Descargar contenido binario
-        r2 = requests.get(media_url, headers=headers)
-
-        if r2.status_code != 200:
-            logging.error(f"❌ Error descargando media: {r2.text}")
-            return None, None
-
-        return r2.content, r2.headers.get("Content-Type")
-
-    except Exception as e:
-        logging.error(f"❌ Excepción en download_media: {e}")
-        return None, None
-
-# -------------------------------
-# Helper: Respuesta segura
-# -------------------------------
-def safe_reply(text: str) -> str:
-    """
-    Garantiza que nunca se responda con None o vacío.
-    """
-    if not text or text.strip() == "":
-        return "Estoy leyendo tu mensaje, dame un momento por favor."
-    return text
-# ============================================================
-# BLOQUE 3 — GOOGLE SHEETS CLIENT (Lectura, Escritura, Matching)
-# ============================================================
-
-def get_sheets_service():
-    """
-    Devuelve el cliente de Google Sheets.
-    """
-    try:
-        service = build("sheets", "v4", credentials=GOOGLE_CREDS)
-        return service.spreadsheets()
-    except Exception as e:
-        logging.error(f"❌ Error creando cliente de Google Sheets: {e}")
-        return None
-
-
-# -------------------------------
-# Sanitizar encabezados
-# -------------------------------
-def clean_header(h):
-    if not h:
+# -----------------------
+# Utilities
+# -----------------------
+def _normalize_phone(phone: str) -> str:
+    if not phone:
         return ""
-    h = h.strip().lower()
-    h = h.replace(" ", "_")
-    h = h.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
-    return h
+    digits = re.sub(r"\D", "", phone)
+    return digits[-10:] if len(digits) >= 10 else digits
 
+def _short_key(phone: str, n: int = 4) -> str:
+    norm = _normalize_phone(phone)
+    return norm[-n:] if norm else "xxxx"
 
-# -------------------------------
-# Leer una hoja completa
-# -------------------------------
-def read_sheet(sheet_id: str, sheet_title: str):
-    """
-    Regresa (rows, header)
-    """
+def safe_json(o: Any) -> str:
     try:
-        service = get_sheets_service()
-        if not service:
+        return json.dumps(o, default=str, ensure_ascii=False)
+    except Exception:
+        return str(o)
+
+# -----------------------
+# Rate limit: 60s per recipient
+# -----------------------
+_last_sent: Dict[str, datetime] = {}
+RATE_LIMIT_SECONDS = 60
+
+def rate_limited(phone: str) -> bool:
+    key = _normalize_phone(phone)
+    now = datetime.utcnow()
+    last = _last_sent.get(key)
+    if last and (now - last).total_seconds() < RATE_LIMIT_SECONDS:
+        return True
+    _last_sent[key] = now
+    return False
+
+# -----------------------
+# WhatsApp Cloud API helpers
+# -----------------------
+if WABA_PHONE_ID and WA_API_VERSION:
+    WPP_API_URL = f"https://graph.facebook.com/{WA_API_VERSION}/{WABA_PHONE_ID}/messages"
+else:
+    WPP_API_URL = None
+
+def _headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {META_TOKEN}" if META_TOKEN else "",
+        "Content-Type": "application/json",
+        "User-Agent": "VickyBot-SECOM/1.0"
+    }
+
+def _should_retry(status: int) -> bool:
+    return status == 429 or 500 <= status < 600
+
+def _backoff(attempt: int) -> None:
+    time.sleep(min(60, 2 ** attempt))
+
+def send_message(to: str, text: str) -> bool:
+    if not (META_TOKEN and WPP_API_URL):
+        log.error("WhatsApp API not configured")
+        return False
+    if rate_limited(to):
+        log.warning("Rate limited send_message to %s", to)
+        return False
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text[:4096]},
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(WPP_API_URL, headers=_headers(), json=payload, timeout=15)
+            if r.status_code in (200, 201):
+                log.info("Sent text to %s", to)
+                return True
+            log.warning("send_message error %s %s", r.status_code, r.text[:400])
+            if _should_retry(r.status_code) and attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+        except Exception:
+            log.exception("Exception in send_message")
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+    return False
+
+def send_template_message(to: str, template_name: str, components: List[Dict[str, Any]]) -> bool:
+    if not (META_TOKEN and WPP_API_URL):
+        log.error("WhatsApp API not configured for templates")
+        return False
+    if rate_limited(to):
+        log.warning("Rate limited send_template_message to %s", to)
+        return False
+    if not components:
+        components = [{"type": "body", "parameters": []}]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": "es_MX"},
+            "components": components,
+        },
+    }
+    for attempt in range(3):
+        try:
+            r = requests.post(WPP_API_URL, headers=_headers(), json=payload, timeout=15)
+            if r.status_code in (200, 201):
+                log.info("Sent template %s to %s", template_name, to)
+                return True
+            log.warning("send_template_message error %s %s", r.status_code, r.text[:400])
+            if _should_retry(r.status_code) and attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+        except Exception:
+            log.exception("Exception in send_template_message")
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+    return False
+
+# -----------------------
+# Google Sheets + Drive init
+# -----------------------
+sheets = None
+drive = None
+google_ready = False
+if GOOGLE_CREDENTIALS_JSON and ServiceAccountCredentials and gbuild:
+    try:
+        info = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds = ServiceAccountCredentials.from_service_account_info(
+            info,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+        sheets = gbuild("sheets", "v4", credentials=creds)
+        drive = gbuild("drive", "v3", credentials=creds)
+        google_ready = True
+        log.info("Google Sheets and Drive configured")
+    except Exception:
+        log.exception("Error initializing Google APIs")
+
+# -----------------------
+# Sheets helpers
+# -----------------------
+def _col_letter(col: int) -> str:
+    res = ""
+    while col > 0:
+        col, rem = divmod(col - 1, 26)
+        res = chr(65 + rem) + res
+    return res
+
+def _find_col(headers: List[str], candidates: List[str]) -> Optional[int]:
+    if not headers:
+        return None
+    low = [h.strip().lower() for h in headers]
+    for name in candidates:
+        n = name.strip().lower()
+        if n in low:
+            return low.index(n)
+    return None
+
+def _get_sheet_headers_and_rows() -> Tuple[List[str], List[List[str]]]:
+    if not (google_ready and sheets and GSHEET_PROSPECTS_ID and SHEET_TITLE_SECOM):
+        return [], []
+    rng = f"{SHEET_TITLE_SECOM}!A:Z"
+    try:
+        res = sheets.spreadsheets().values().get(spreadsheetId=GSHEET_PROSPECTS_ID, range=rng).execute()
+        rows = res.get("values", [])
+        if not rows:
             return [], []
-
-        range_name = f"{sheet_title}!A1:Z9999"
-        result = service.values().get(
-            spreadsheetId=sheet_id,
-            range=range_name
-        ).execute()
-
-        values = result.get("values", [])
-        if not values:
-            return [], []
-
-        header = [clean_header(h) for h in values[0]]
-        rows = values[1:]
-
-        return rows, header
-
-    except Exception as e:
-        logging.error(f"❌ Error leyendo hoja {sheet_title}: {e}")
+        headers = rows[0]
+        data_rows = rows[1:]
+        return headers, data_rows
+    except Exception:
+        log.exception("Error reading sheet")
         return [], []
 
-
-# -------------------------------
-# Update row (escritura en SECOM)
-# -------------------------------
-def update_secom_row(row_number: int, data: dict):
-    """
-    Escribe diccionario en una fila específica de SECOM.
-    row_number es 1-based en Sheets.
-    """
+def _batch_update_cells(row_index: int, updates: Dict[str, str], headers: List[str]) -> None:
+    if not (google_ready and sheets and GSHEET_PROSPECTS_ID and SHEET_TITLE_SECOM):
+        return
+    if row_index < 2:
+        return
+    header_low = [h.strip().lower() for h in headers]
+    data_ranges = []
+    for key, value in updates.items():
+        key_low = key.strip().lower()
+        if key_low in header_low:
+            idx = header_low.index(key_low) + 1
+        else:
+            continue
+        col_letter = _col_letter(idx)
+        cell_range = f"{SHEET_TITLE_SECOM}!{col_letter}{row_index}"
+        data_ranges.append({"range": cell_range, "values": [[str(value)]]})
+    if not data_ranges:
+        return
+    body = {"valueInputOption": "RAW", "data": data_ranges}
     try:
-        values = [[data.get(k, "") for k in data.keys()]]
-        range_name = f"{SHEET_TITLE_SECOM}!A{row_number}:Z{row_number}"
+        sheets.spreadsheets().values().batchUpdate(spreadsheetId=GSHEET_PROSPECTS_ID, body=body).execute()
+    except Exception:
+        log.exception("Error in _batch_update_cells")
 
-        body = {"values": values}
-
-        service = get_sheets_service()
-        service.values().update(
-            spreadsheetId=SHEET_ID_SECOM,
-            range=range_name,
-            valueInputOption="RAW",
-            body=body
-        ).execute()
-
-        logging.info(f"✔ Fila SECOM actualizada: {row_number}")
-
-    except Exception as e:
-        logging.error(f"❌ Error actualizando fila SECOM {row_number}: {e}")
-
-
-# -------------------------------
-# Convertir una fila a diccionario
-# -------------------------------
-def row_to_dict(row, header):
-    d = {}
-    for i, h in enumerate(header):
-        d[h] = row[i] if i < len(row) else ""
-    return d
-
-
-# -------------------------------
-# Matching híbrido SECOM
-# -------------------------------
-def match_secom_number(phone: str):
-    """
-    Coincidencia híbrida:
-    1. Match exacto del número completo
-    2. Match por últimos 10 dígitos
-    """
+def match_client_in_sheets(phone: str) -> Optional[Dict[str, Any]]:
+    if not (google_ready and sheets and GSHEET_PROSPECTS_ID and SHEET_TITLE_SECOM):
+        return None
     try:
-        rows, header = read_sheet(SHEET_ID_SECOM, SHEET_TITLE_SECOM)
-        if not rows:
-            return None, None, None
-
-        phone = normalize_number(phone)
-        last10 = phone[-10:]
-
-        exact_match = None
-        partial_match = None
-
-        for idx, row in enumerate(rows):
-            data = row_to_dict(row, header)
-            ws = data.get("whatsapp", "").strip()
-
-            if not ws:
+        headers, rows = _get_sheet_headers_and_rows()
+        if not headers or not rows:
+            return None
+        idx_name = _find_col(headers, ["Nombre", "CLIENTE", "Cliente"])
+        idx_wa = _find_col(headers, ["WhatsApp", "Whatsapp", "WHATSAPP", "Telefono", "Teléfono", "CELULAR"])
+        if idx_wa is None:
+            return None
+        target = _normalize_phone(phone)
+        for row in rows:
+            if len(row) <= idx_wa:
                 continue
-
-            ws_norm = normalize_number(ws)
-
-            # 1. Exact match
-            if ws_norm == phone:
-                exact_match = (idx, data, ws_norm)
-                break
-
-            # 2. Last 10 match si no hay exacto
-            if ws_norm.endswith(last10):
-                partial_match = (idx, data, ws_norm)
-
-        return exact_match or partial_match or (None, None, None)
-
-    except Exception as e:
-        logging.error(f"❌ Error en match_secom_number: {e}")
-        return None, None, None
-
-# -------------------------------
-# Lectores adicionales (Prospectos / Solicitudes)
-# -------------------------------
-def read_prospects_sheet():
-    return read_sheet(GSHEET_PROSPECTS_ID, SHEETS_TITLE_LEADS)
-
-
-def read_solicitudes_sheet():
-    return read_sheet(GSHEET_SOLICITUDES_ID, SHEETS_TITLE_LEADS)
-# ============================================================
-# BLOQUE 4 — GPT ENGINE (Identidad + Respuesta Inteligente)
-# ============================================================
-
-# Inicializar cliente OpenAI
-openai.api_key = OPENAI_API_KEY
-
-
-# -------------------------------
-# Identidad oficial de Vicky
-# -------------------------------
-VICKY_IDENTITY = """
-Eres Vicky, asistente inteligente de Christian López (asesor financiero en México).
-Tu trabajo es atender clientes con calidez, claridad y profesionalismo.
-
-Reglas de comportamiento:
-- Responde siempre con empatía y tono humano.
-- Sé breve si la pregunta es simple. Sé detallada si el cliente lo requiere.
-- No uses tecnicismos innecesarios.
-- Mantén atención al contexto financiero (seguros, préstamos, TPV, autos).
-- Evita sonar robótica.
-- No exageres ni prometas cosas que no puedas cumplir.
-- No digas 'soy un modelo de lenguaje'. Tú eres Vicky, punto.
-- Si el usuario es un prospecto SECOM, ofrece apoyo inmediato y personalizado.
-- Si el usuario pide información técnica del IMSS o seguros → activa RAG cuando esté disponible.
-- No compartas información sensible.
-- Mantén siempre una actitud de servicio y resolución.
-
-Objetivo:
-Ayudar, guiar y convertir prospectos en clientes de forma natural y profesional.
-"""
-
-
-# -------------------------------
-# GPT Reply Engine
-# -------------------------------
-def gpt_reply(user_input: str, context: str = "") -> str:
-    """
-    Genera una respuesta inteligente basada en:
-    - identidad de Vicky
-    - mensaje del usuario
-    - contexto opcional
-    Si GPT falla, regresa un fallback seguro.
-    """
-    try:
-        prompt = f"""
-        {VICKY_IDENTITY}
-
-        Contexto:
-        {context}
-
-        Mensaje del usuario:
-        {user_input}
-
-        Responde como Vicky.
-        """
-
-        completion = openai.chat.completions.create(
-            model=GPT_MODEL,
-            messages=[
-                {"role": "system", "content": VICKY_IDENTITY},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.55,
-            max_tokens=350
-        )
-
-        reply = completion.choices[0].message["content"]
-        if reply:
-            return reply.strip()
-
-        return "Estoy procesando tu mensaje, dame un momento por favor."
-
-    except Exception as e:
-        logging.error(f"❌ Error en GPT: {e}")
-        return "Estoy analizando tu mensaje, dame un momento por favor."
-# ============================================================
-# BLOQUE 5 — PROCESADOR PRINCIPAL DEL MENSAJE
-# ============================================================
-
-# -------------------------------
-# Guardar archivos en Google Drive
-# -------------------------------
-def save_file_to_drive(content: bytes, mime: str, filename: str):
-    try:
-        service = build("drive", "v3", credentials=GOOGLE_CREDS)
-
-        file_metadata = {
-            "name": filename,
-            "parents": [DRIVE_FOLDER_ID]
-        }
-
-        media = googleapiclient.http.MediaInMemoryUpload(content, mimetype=mime)
-
-        f = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id"
-        ).execute()
-
-        logging.info(f"📁 Archivo guardado en Drive: {filename}")
-        return f.get("id")
-
-    except Exception as e:
-        logging.error(f"❌ Error guardando archivo en Drive: {e}")
+            tel = _normalize_phone(row[idx_wa])
+            if tel == target:
+                nombre = row[idx_name] if idx_name is not None and len(row) > idx_name else ""
+                return {"nombre": nombre}
+        return None
+    except Exception:
+        log.exception("Error in match_client_in_sheets")
         return None
 
+def _touch_last_inbound(phone: str) -> None:
+    if not (google_ready and sheets and GSHEET_PROSPECTS_ID and SHEET_TITLE_SECOM):
+        return
+    try:
+        headers, rows = _get_sheet_headers_and_rows()
+        if not headers or not rows:
+            return
+        idx_wa = _find_col(headers, ["WhatsApp", "Whatsapp", "WHATSAPP", "Telefono", "Teléfono", "CELULAR"])
+        idx_last = _find_col(headers, ["LastInboundAt", "LAST_INBOUND_AT", "LAST_MESSAGE_AT"])
+        if idx_wa is None or idx_last is None:
+            return
+        target = _normalize_phone(phone)
+        for offset, row in enumerate(rows, start=2):
+            if len(row) <= idx_wa:
+                continue
+            if _normalize_phone(row[idx_wa]) == target:
+                col_letter = _col_letter(idx_last + 1)
+                cell_range = f"{SHEET_TITLE_SECOM}!{col_letter}{offset}"
+                body = {"range": cell_range, "majorDimension": "ROWS", "values": [[datetime.utcnow().isoformat()]]}
+                sheets.spreadsheets().values().update(spreadsheetId=GSHEET_PROSPECTS_ID, range=cell_range, valueInputOption="RAW", body=body).execute()
+                break
+    except Exception:
+        log.exception("Error registering LastInboundAt")
 
-# -------------------------------
-# Procesar mensaje principal
-# -------------------------------
-def process_user_message(phone: str, message: str, media_id=None) -> str:
+# -----------------------
+# Drive helpers: folder per client, upload
+# -----------------------
+def _drive_search_folder(name: str, parent_id: str) -> Optional[str]:
+    if not (google_ready and drive):
+        return None
+    try:
+        q = f"name = '{name.replace(\"'\",\"\\'\")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and '{parent_id}' in parents"
+        res = drive.files().list(q=q, spaces='drive', fields='files(id,name)', pageSize=10).execute()
+        files = res.get("files", [])
+        if files:
+            return files[0].get("id")
+    except Exception:
+        log.exception("Error searching folder in Drive")
+    return None
+
+def _drive_create_folder(name: str, parent_id: str) -> Optional[str]:
+    if not (google_ready and drive):
+        return None
+    try:
+        metadata = {'name': name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
+        f = drive.files().create(body=metadata, fields='id').execute()
+        return f.get('id')
+    except Exception:
+        log.exception("Error creating folder in Drive")
+        return None
+
+def _drive_upload_bytes(filename: str, content: bytes, mime_type: str, parent_id: str) -> Optional[str]:
+    if not (google_ready and drive and MediaIoBaseUpload):
+        return None
+    try:
+        fh = io.BytesIO(content)
+        media = MediaIoBaseUpload(fh, mimetype=mime_type, resumable=False)
+        metadata = {'name': filename, 'parents': [parent_id]}
+        file = drive.files().create(body=metadata, media_body=media, fields='id,webViewLink').execute()
+        return file.get('id')
+    except Exception:
+        log.exception("Error uploading file to Drive")
+        return None
+
+def ensure_client_folder(phone: str) -> Optional[str]:
+    if not DRIVE_FOLDER_ID:
+        return None
+    short = _short_key(phone, 4)
+    folder_name = f"{short}_Cliente"
+    try:
+        fid = _drive_search_folder(folder_name, DRIVE_FOLDER_ID)
+        if fid:
+            return fid
+        return _drive_create_folder(folder_name, DRIVE_FOLDER_ID)
+    except Exception:
+        log.exception("Error ensuring client folder")
+        return None
+
+# -----------------------
+# Media download from WhatsApp Cloud API
+# -----------------------
+def download_media_from_whatsapp(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """
-    Este es el núcleo de Vicky SECOM/WAPI.
-    Decide cómo responder según:
-    - tipo de mensaje
-    - coincidencia SECOM
-    - flujo comercial
-    - RAG
-    - GPT
+    Returns (content_bytes, mime_type, filename)
     """
+    if not (META_TOKEN and WA_API_VERSION):
+        log.error("WhatsApp API not configured for media download")
+        return None, None, None
+    try:
+        # Get media URL + mime
+        meta_url = f"https://graph.facebook.com/{WA_API_VERSION}/{media_id}"
+        params = {"fields": "url,filename,mime_type"}
+        r = requests.get(meta_url, headers={"Authorization": f"Bearer {META_TOKEN}"}, params=params, timeout=15)
+        if r.status_code != 200:
+            log.warning("Media meta fetch failed %s %s", r.status_code, r.text[:400])
+            return None, None, None
+        meta = r.json()
+        url = meta.get("url")
+        mime = meta.get("mime_type") or meta.get("mimeType") or "application/octet-stream"
+        filename = meta.get("filename") or f"media_{media_id}"
+        if not url:
+            log.warning("No media url returned for %s", media_id)
+            return None, None, None
+        # Download binary
+        r2 = requests.get(url, headers={"Authorization": f"Bearer {META_TOKEN}"}, stream=True, timeout=30)
+        if r2.status_code != 200:
+            log.warning("Media download failed %s", r2.status_code)
+            return None, None, None
+        content = r2.content
+        return content, mime, filename
+    except Exception:
+        log.exception("Error downloading media from WhatsApp")
+        return None, None, None
 
-    phone_norm = normalize_number(phone)
-    logging.info(f"📥 Mensaje de {phone_norm}: {message}")
+# -----------------------
+# Minimal BM25-like retriever for PDF manual (RAG)
+# -----------------------
+def _extract_text_from_pdf_bytes(content: bytes) -> str:
+    if PyPDF2 is None:
+        # Fallback: return empty
+        log.warning("PyPDF2 not available, cannot parse PDF")
+        return ""
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(content))
+        texts = []
+        for p in reader.pages:
+            try:
+                texts.append(p.extract_text() or "")
+            except Exception:
+                continue
+        return "\n".join(texts)
+    except Exception:
+        log.exception("Error parsing PDF bytes")
+        return ""
 
-    # ---------------------------------------------------------
-    # 1. Si envía archivo → Guardar en Drive
-    # ---------------------------------------------------------
-    if media_id:
-        content, mime = download_media(media_id)
-        if content and mime:
-            ext = mime.split("/")[-1]
-            filename = f"file_{phone_norm}_{int(time.time())}.{ext}"
-            save_file_to_drive(content, mime, filename)
+def _chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = words[i:i+chunk_size]
+        chunks.append(" ".join(chunk))
+        i += chunk_size - overlap
+    return chunks
 
-        return "📄 Archivo recibido correctamente, gracias. ¿En qué más te puedo apoyar?"
+def _bm25_score(query: str, docs: List[str]) -> List[Tuple[int, float]]:
+    # Simplified BM25-like scoring
+    k1 = 1.5
+    b = 0.75
+    docs_tokens = [d.split() for d in docs]
+    N = len(docs)
+    avgdl = sum(len(t) for t in docs_tokens) / max(1, N)
+    df = Counter()
+    for tokens in docs_tokens:
+        df.update(set(tokens))
+    scores = []
+    q_terms = query.split()
+    for idx, tokens in enumerate(docs_tokens):
+        score = 0.0
+        freqs = Counter(tokens)
+        dl = len(tokens)
+        for term in q_terms:
+            if not term:
+                continue
+            f = freqs.get(term, 0)
+            n_q = df.get(term, 0)
+            if n_q == 0:
+                continue
+            idf = math.log((N - n_q + 0.5) / (n_q + 0.5) + 1)
+            denom = f + k1 * (1 - b + b * (dl / avgdl))
+            score += idf * ((f * (k1 + 1)) / (denom + 1e-9))
+        scores.append((idx, score))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return scores
 
-    # ---------------------------------------------------------
-    # 2. Matching SECOM híbrido
-    # ---------------------------------------------------------
-    idx, data, ws = match_secom_number(phone_norm)
-
-    secom_context = None
-    es_cliente_secom = False
-
-    if idx is not None and data:
-        es_cliente_secom = True
-        secom_context = f"Eres un prospecto en SECOM. Datos: {data}"
-    else:
-        secom_context = "Usuario nuevo. No está en SECOM."
-
-    # ---------------------------------------------------------
-    # 3. Menú automático SIEMPRE (tu selección 2A)
-    # ---------------------------------------------------------
-    menu_text = (
-        "Hola 👋 Soy *Vicky*, asistente de Christian.\n"
-        "Aquí tienes las opciones disponibles:\n\n"
-        "1️⃣ Seguro de Auto\n"
-        "2️⃣ Seguro de Vida\n"
-        "3️⃣ Préstamos IMSS\n"
-        "4️⃣ Terminal Punto de Venta (TPV)\n"
-        "5️⃣ Tarjeta Médica VRIM\n"
-        "6️⃣ Créditos Empresariales\n"
-        "7️⃣ Contactar con Christian\n\n"
-        "¿En qué puedo ayudarte?"
-    )
-
-    # Caso especial: saludo o inicio
-    if message.lower() in ["hola", "buenos días", "buenas tardes", "menu", "hey", "buenas", "inicio"]:
-        return menu_text
-
-    # ---------------------------------------------------------
-    # 4. RAG automático si detecta temas técnicos
-    # ---------------------------------------------------------
-    temas_rag = ["imss", "modalidad", "semanas", "ley 73", "prestamo", "requisitos", "beneficios"]
-
-    if any(t in message.lower() for t in temas_rag):
+def retrieve_manual_passages(query: str, top_k: int = 3) -> List[str]:
+    if not (google_ready and drive and ID_MANUAL_IMSS):
+        return []
+    try:
+        # Download file bytes from Drive
+        request_media = drive.files().get_media(fileId=ID_MANUAL_IMSS)
+        fh = io.BytesIO()
+        downloader = None
         try:
-            rag_response = rag_manual_search(message)
-            if rag_response:
-                return rag_response
-        except:
-            pass
+            # googleapiclient's MediaIoBaseDownload may be present
+            from googleapiclient.http import MediaIoBaseDownload
+            downloader = MediaIoBaseDownload(fh, request_media)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+        except Exception:
+            # fallback to execute -> get directly
+            fh = io.BytesIO(request_media.execute())
+        content = fh.getvalue()
+        text = _extract_text_from_pdf_bytes(content)
+        if not text:
+            return []
+        chunks = _chunk_text(text, chunk_size=350, overlap=50)
+        scores = _bm25_score(query.lower(), [c.lower() for c in chunks])
+        top = [chunks[idx] for idx, _ in scores[:top_k]]
+        return top
+    except Exception:
+        log.exception("Error retrieving manual IMSS from Drive")
+        return []
 
-    # ---------------------------------------------------------
-    # 5. Si es prospecto SECOM → priorizar atención
-    # ---------------------------------------------------------
-    if es_cliente_secom:
-        # GPT con contexto SECOM
-        return gpt_reply(message, context=secom_context)
+# -----------------------
+# GPT Engine / Intent
+# -----------------------
+def interpret_response(text: str) -> str:
+    if not text:
+        return "neutral"
+    t = text.lower()
+    pos = ["sí", "si", "claro", "ok", "de acuerdo", "vale", "afirmativo", "correcto", "s"]
+    neg = ["no", "nel", "nop", "negativo", "no quiero", "no gracias", "no interesa", "n"]
+    if any(p in t for p in pos):
+        return "positive"
+    if any(n in t for n in neg):
+        return "negative"
+    return "neutral"
 
-    # ---------------------------------------------------------
-    # 6. Cliente nuevo → GPT con contexto general
-    # ---------------------------------------------------------
-    return gpt_reply(message, context="Usuario nuevo sin coincidencia en SECOM.")
-# ============================================================
-# BLOQUE 6 — WORKER SECOM (ENVÍO MASIVO)
-# ============================================================
-
-def load_secom_sheet():
-    """
-    Carga la hoja SECOM y regresa:
-    (rows, header, raw_values)
-    """
-    rows, header = read_sheet(SHEET_ID_SECOM, SHEET_TITLE_SECOM)
-    return rows, header
-
-
-# ------------------------------------------------------------
-# Filtro de prospectos válidos
-# ------------------------------------------------------------
-def filter_valid_secom_prospects(rows):
-    """
-    Reglas:
-    - Debe tener WhatsApp
-    - Estado distinto de 'NO_INTERESADO' y 'CERRADO'
-    - Si tiene FirstSentAt, NO reenviar
-    """
-    valid = []
-
-    for idx, row in enumerate(rows):
-        data = row_to_dict(row, ["whatsapp", "nombre", "estado", "intentoss", "firstsentat", "plantilla", "promo"])
-
-        phone = data.get("whatsapp", "").strip()
-        if not phone:
-            continue
-
-        estado = data.get("estado", "").upper()
-
-        if estado in ["NO_INTERESADO", "CERRADO"]:
-            continue
-
-        # No volver a enviar si ya tiene FirstSentAt
-        first_sent = data.get("firstsentat", "").strip()
-        if first_sent:
-            continue
-
-        valid.append((idx, data, phone))
-
-    return valid
-
-
-# ------------------------------------------------------------
-# WORKER PRINCIPAL SECOM
-# ------------------------------------------------------------
-def secom_worker():
-    """
-    Flujo completo:
-    1) Cargar SECOM
-    2) Filtrar prospectos válidos
-    3) Enviar plantilla 1x1
-    4) Respetar rate limit de Meta (seguridad adicional)
-    5) Actualizar estado en Google Sheets
-    6) Notificar al asesor
-    """
-
-    rows, header = load_secom_sheet()
-    if not rows:
-        logging.warning("⚠ No hay filas en SECOM.")
-        return {"ok": False, "msg": "No hay filas SECOM"}
-
-    valid = filter_valid_secom_prospects(rows)
-    total = len(valid)
-    logging.info(f"🔍 Prospectos válidos: {total}")
-
-    enviados = 0
-    fallidos = 0
-
-    for idx, data, phone in valid:
-
-        nombre = data.get("nombre", "").strip()
-        plantilla = data.get("plantilla", "").strip()
-        promo = data.get("promo", "").strip()
-
-        if not plantilla:
-            logging.warning(f"⚠ Sin plantilla en fila {idx+1}")
-            continue
-
-        phone_norm = normalize_number(phone)
-        now = datetime.utcnow().strftime("%Y-%m-%d")
-
-        # Componentes dinámicos
-        components = [
-            {
-                "type": "body",
-                "parameters": [
-                    {"type": "text", "text": nombre or "amigo"}
-                ]
-            }
-        ]
-
-        ok = send_template_message(phone_norm, plantilla, components)
-
-        # ------------------------
-        # Actualizar fila
-        # ------------------------
-        updated = {
-            "Nombre": nombre,
-            "Whatsapp": phone_norm,
-            "Estado": "ENVIADO" if ok else "ERROR_ENVIO",
-            "Intentos": str(int(data.get("intentoss", "0") or "0") + 1),
-            "LastSentAt": now,
-            "Plantilla": plantilla,
-            "Promo": promo
-        }
-
-        # Guardar FirstSentAt solo si fue exitoso
-        if ok:
-            updated["FirstSentAt"] = now
-
-        update_secom_row(idx + 1, updated)
-
-        if ok:
-            enviados += 1
-        else:
-            fallidos += 1
-
-        # RATE LIMIT real → 60 segundos
-        logging.info("⏱️ Esperando 60 segundos para evitar baneo…")
-        time.sleep(60)
-
-    # ------------------------
-    # Notificar al asesor
-    # ------------------------
+def extract_number(text: str) -> Optional[float]:
+    if not text:
+        return None
+    clean = text.replace(",", "").replace("$", "")
+    m = re.search(r"(\d+(\.\d+)?)", clean)
     try:
-        msg = (
-            f"🟢 *SECOM Finalizado*\n"
-            f"Enviados: {enviados}\n"
-            f"Fallidos: {fallidos}"
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+def call_gpt_system_prompt(user_prompt: str, system_prompt: str = "Eres un asistente en español.") -> str:
+    if not openai or not OPENAI_API_KEY:
+        log.warning("OpenAI not configured")
+        return ""
+    try:
+        # Use chat completion
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=800,
         )
-        send_message(ADVISOR_WHATSAPP, msg)
-    except:
-        logging.warning("⚠ No se pudo notificar al asesor")
+        # Newer API returns choices with message
+        out = ""
+        if resp and resp.get("choices"):
+            choice = resp["choices"][0]
+            if "message" in choice:
+                out = choice["message"].get("content", "")
+            else:
+                out = choice.get("text", "")
+        return out.strip()
+    except Exception:
+        log.exception("Error calling OpenAI")
+        return ""
 
-    return {
-        "ok": True,
-        "enviados": enviados,
-        "fallidos": fallidos
-    }
+# Cognitive processor: intent + pipeline
+def process_text_message(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
+    txt = (text or "").strip()
+    st = interpret_response(txt)
+    norm_phone = _normalize_phone(phone)
+    # Commands
+    t = txt.lower()
+    if t.startswith("sgpt:") and openai:
+        prompt = txt.split("sgpt:", 1)[1].strip()
+        if prompt:
+            ans = call_gpt_system_prompt(prompt, system_prompt="Eres un asistente conversacional en español.")
+            if ans:
+                send_message(phone, ans)
+            else:
+                send_message(phone, "Lo siento, hubo un problema procesando tu petición.")
+        return
+    # Read manual IMSS via RAG
+    if "manual imss" in t or "ley 73 manual" in t or ("imss" in t and "manual" in t):
+        passages = retrieve_manual_passages(txt, top_k=3)
+        if passages:
+            context = "\n\n".join(passages)
+            prompt = f"Contexto extraído del manual IMSS:\n\n{context}\n\nPregunta: {txt}\nResponde de forma breve y clara en español."
+            ans = call_gpt_system_prompt(prompt, system_prompt="Eres un asistente experto en IMSS.")
+            if ans:
+                send_message(phone, ans)
+            else:
+                send_message(phone, "No pude obtener una respuesta del manual en este momento.")
+        else:
+            send_message(phone, "No pude acceder al manual IMSS ahora. Intenta más tarde.")
+        return
+    # Intentual flows similar a la app: quick routing
+    if t in ("1", "imss", "ley 73", "prestamo imss", "préstamo imss", "pension", "pensión"):
+        send_message(phone, "🟩 *Préstamo IMSS Ley 73*\n¿Te interesa que revisemos si calificas? Responde sí o no.")
+        return
+    if t in ("2", "auto", "seguro auto", "seguro de auto"):
+        send_message(phone, "🚗 *Seguro de Auto*\nEnvíame tu INE y tarjeta de circulación (foto) y te ayudo con la cotización.")
+        return
+    if t in ("menu", "menú", "inicio", "hola"):
+        send_message(phone, "Menú principal:\n1) Préstamo IMSS\n2) Seguro de Auto\n3) Vida/Salud\nEscribe el número o la opción.")
+        return
+    # Default: if matched in sheets, be personalized
+    name = match.get("nombre") if match else None
+    if name:
+        send_message(phone, f"Hola {name}, recibí tu mensaje: {txt[:240]}. ¿En qué te ayudo?")
+    else:
+        send_message(phone, f"Hola, recibí tu mensaje: {txt[:240]}. ¿En qué te puedo ayudar?")
+    # Optionally notify advisor
+    if ADVISOR_WHATSAPP:
+        try:
+            send_message(ADVISOR_WHATSAPP, f"Mensaje de {phone}: {txt[:400]}")
+        except Exception:
+            log.exception("Error notifying advisor")
 
-# ------------------------------------------------------------
-# ENDPOINT: Iniciar Worker SECOM
-# ------------------------------------------------------------
-@app.post("/ext/send-promo-secom")
-def ext_send_promo_secom():
-    """
-    Lanza el SECOM Worker en background,
-    para no bloquear el request.
-    """
-    threading.Thread(target=secom_worker).start()
-    return jsonify({"ok": True, "msg": "Worker SECOM iniciado"})
-    # ============================================================
-# BLOQUE 7 — WEBHOOK WHATSAPP (VERIFICACIÓN + RECEPCIÓN)
-# ============================================================
+# -----------------------
+# Media processor: save to Drive and notify
+# -----------------------
+def process_media_message(phone: str, mtype: str, msg: Dict[str, Any]) -> None:
+    media = msg.get(mtype) or {}
+    media_id = media.get("id")
+    if not media_id:
+        log.warning("No media id for message from %s", phone)
+        return
+    content, mime, filename = download_media_from_whatsapp(media_id)
+    if not content:
+        log.warning("Failed to download media %s", media_id)
+        return
+    client_folder = ensure_client_folder(phone) or DRIVE_FOLDER_ID
+    if not client_folder:
+        log.warning("No Drive folder to upload media")
+        return
+    # Ensure filename has safe extension
+    if not filename:
+        ext = ""
+        if "/" in mime:
+            ext = "." + mime.split("/")[-1]
+        filename = f"{mtype}_{media_id}{ext}"
+    # Upload
+    fid = _drive_upload_bytes(filename, content, mime or "application/octet-stream", client_folder)
+    if fid:
+        log.info("Uploaded media to Drive id=%s for phone=%s", fid, phone)
+        if ADVISOR_WHATSAPP:
+            send_message(ADVISOR_WHATSAPP, f"Documento recibido de {phone} subido a Drive en carpeta {_short_key(phone,4)}_Cliente")
+    else:
+        log.warning("Failed uploading media to Drive for %s", phone)
 
-
-# ------------------------------------------------------------
-# VERIFICACIÓN DEL WEBHOOK (GET)
-# ------------------------------------------------------------
-@app.get("/webhook")
-def verify_webhook():
-    """
-    Meta verifica el webhook enviando GET.
-    Debemos responder con 'hub.challenge' si el token coincide.
-    """
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-
-    if token == VERIFY_TOKEN:
-        return challenge
-
-    return "Token inválido", 403
-
-
-# ------------------------------------------------------------
-# WEBHOOK PRINCIPAL (POST)
-# ------------------------------------------------------------
-@app.post("/webhook")
-def webhook():
+# -----------------------
+# Webhook processing: background worker per event to return 200 quickly
+# -----------------------
+def _process_whatsapp_event(payload: Dict[str, Any]) -> None:
     try:
-        data = request.get_json(silent=True)
-
-        if not data:
-            return jsonify({"status": "no_data"}), 200
-
-        entry = data.get("entry", [])
-        if not entry:
-            return jsonify({"status": "no_entry"}), 200
-
-        changes = entry[0].get("changes", [])
-        if not changes:
-            return jsonify({"status": "no_changes"}), 200
-
-        value = changes[0].get("value", {})
+        entry = (payload.get("entry") or [{}])[0]
+        changes = (entry.get("changes") or [{}])[0]
+        value = changes.get("value", {})
         messages = value.get("messages", [])
-
         if not messages:
-            return jsonify({"status": "no_messages"}), 200
-
+            log.info("No messages in webhook")
+            return
         msg = messages[0]
-        phone = msg.get("from", "")
-        msg_type = msg.get("type", "")
+        phone = msg.get("from")
+        if not phone:
+            log.info("No phone in message")
+            return
+        log.info("Processing message from %s: type=%s", phone, msg.get("type"))
+        # Touch sheets
+        _touch_last_inbound(phone)
+        match = match_client_in_sheets(phone)
+        mtype = msg.get("type")
+        # If text
+        if mtype == "text":
+            text = msg.get("text", {}).get("body", "")
+            log.info("Text from %s: %s", phone, text[:300])
+            process_text_message(phone, text, match)
+            return
+        # If media
+        if mtype in ("image", "document", "audio", "video", "sticker"):
+            log.info("Media from %s type=%s", phone, mtype)
+            # Acknowledge quickly
+            send_message(phone, "✅ Archivo recibido. Lo guardo y lo reviso en un momento.")
+            # Process media: download and upload to Drive
+            try:
+                process_media_message(phone, mtype, msg)
+            except Exception:
+                log.exception("Error processing media message")
+            return
+        # Other types: statuses, contacts, etc.
+        log.info("Unhandled message type: %s", mtype)
+    except Exception:
+        log.exception("Error in _process_whatsapp_event")
 
-        user_text = ""
-        media_id = None
+# -----------------------
+# Flask endpoints (single /webhook GET & POST) and ext/health
+# -----------------------
+@app.get("/webhook")
+def webhook_verify():
+    try:
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge", "")
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            log.info("Webhook verified")
+            return challenge, 200
+        log.warning("Webhook verification failed")
+        return "forbidden", 403
+    except Exception:
+        log.exception("Error in webhook_verify")
+        return "forbidden", 403
 
-        # ----------------------------------------------------
-        # 1. Texto
-        # ----------------------------------------------------
-        if msg_type == "text":
-            user_text = msg["text"]["body"]
-
-        # ----------------------------------------------------
-        # 2. Multimedia (imagen, documento, audio)
-        # ----------------------------------------------------
-        elif msg_type in ["image", "document", "audio", "video"]:
-            media = msg.get(msg_type, {})
-            media_id = media.get("id")
-            mime = media.get("mime_type", "")
-            user_text = f"Archivo recibido ({msg_type})."
-
-        # ----------------------------------------------------
-        # 3. Botones y listas de Meta
-        # ----------------------------------------------------
-        elif msg_type == "interactive":
-            inter = msg.get("interactive", {})
-            if "button_reply" in inter:
-                user_text = inter["button_reply"]["title"]
-            elif "list_reply" in inter:
-                user_text = inter["list_reply"]["title"]
-
-        # ----------------------------------------------------
-        # 4. No reconocido
-        # ----------------------------------------------------
-        else:
-            user_text = "No pude procesar tu mensaje, ¿podrías repetirlo?"
-
-        # ----------------------------------------------------
-        # 5. PROCESAR MENSAJE (BLOQUE 5)
-        # ----------------------------------------------------
-        reply = process_user_message(
-            phone=phone,
-            message=user_text,
-            media_id=media_id
-        )
-
-        # Enviar la respuesta
-        send_message(phone, reply)
-
+@app.post("/webhook")
+def webhook_receive():
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        log.info("Webhook received: %s", safe_json(payload)[:800])
+        # Kick off processing in background and return 200 immediately
+        t = threading.Thread(target=_process_whatsapp_event, args=(payload,), daemon=True)
+        t.start()
+        return jsonify({"status": "ok"}), 200
+    except Exception:
+        log.exception("Error in webhook_receive")
+        # Always respond ok per requirements
         return jsonify({"status": "ok"}), 200
 
-    except Exception as e:
-        logging.error(f"❌ Error en webhook: {e}")
-        return jsonify({"status": "error"}), 200
-        # ============================================================
-# BLOQUE 8 — ENDPOINTS AUXILIARES /ext/*
-# ============================================================
-
-
-# ------------------------------------------------------------
-# /ext/health → usado por Render
-# ------------------------------------------------------------
 @app.get("/ext/health")
 def ext_health():
-    """
-    Render llama este endpoint para verificar que el servicio
-    está activo y responde sin errores.
-    """
-    return jsonify({"status": "ok"}), 200
-
-
-
-# ------------------------------------------------------------
-# /ext/test-send → enviar mensaje manual
-# ------------------------------------------------------------
-@app.get("/ext/test-send")
-def ext_test_send():
-    """
-    Envía un mensaje manual vía URL:
-    /ext/test-send?to=5216682478005&msg=Hola
-    """
-    to = request.args.get("to")
-    msg = request.args.get("msg", "Mensaje de prueba ✔️")
-
-    if not to:
-        return jsonify({"ok": False, "error": "Falta parámetro 'to'"}), 400
-
-    ok = send_message(to, msg)
-
-    return jsonify({
-        "ok": ok,
-        "to": to,
-        "msg": msg
-    }), 200
-
-
-
-# ------------------------------------------------------------
-# /ext/manuales → Consulta RAG del manual IMSS
-# ------------------------------------------------------------
-@app.post("/ext/manuales")
-def ext_manual_rag():
-    """
-    Permite consultar manual IMSS Ley 73 vía POST:
-    {
-        "query": "¿Cuáles son los requisitos?"
-    }
-    """
-    body = request.get_json() or {}
-    query = body.get("query", "")
-
-    if not query:
-        return jsonify({"ok": False, "msg": "Falta 'query'"}), 400
-
     try:
-        respuesta = rag_manual_search(query)
-        return jsonify({"ok": True, "respuesta": respuesta})
-    except Exception as e:
-        logging.error(f"❌ Error RAG manual: {e}")
-        return jsonify({"ok": False, "error": "Error procesando manual"}), 500
-
-
-
-# ------------------------------------------------------------
-# /ext/drive-files → listar archivos del folder de Drive
-# ------------------------------------------------------------
-@app.get("/ext/drive-files")
-def ext_drive_files():
-    """
-    Lista archivos de la carpeta principal en Google Drive.
-    """
-    try:
-        service = build("drive", "v3", credentials=GOOGLE_CREDS)
-        results = service.files().list(
-            q=f"'{DRIVE_FOLDER_ID}' in parents",
-            fields="files(id, name, mimeType)"
-        ).execute()
-
         return jsonify({
-            "ok": True,
-            "files": results.get("files", [])
-        })
+            "status": "ok",
+            "service": "Vicky Bot SECOM",
+            "timestamp": datetime.utcnow().isoformat(),
+            "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID and WA_API_VERSION),
+            "google_ready": google_ready,
+            "openai_ready": bool(openai and OPENAI_API_KEY),
+        }), 200
+    except Exception:
+        log.exception("Error in ext_health")
+        return jsonify({"status": "ok"}), 200
 
-    except Exception as e:
-        logging.error(f"❌ Error listando archivos Drive: {e}")
-        return jsonify({"ok": False, "error": "No se pudieron listar archivos"}), 500
-
-
+# -----------------------
+# Application entrypoint
+# -----------------------
+if __name__ == "__main__":
+    log.info("Starting Vicky Bot SECOM on port %s", PORT)
+    log.info("WhatsApp configured: %s", bool(META_TOKEN and WABA_PHONE_ID and WA_API_VERSION))
+    log.info("Google ready: %s", google_ready)
+    log.info("OpenAI ready: %s", bool(openai and OPENAI_API_KEY))
+    # Note: Render uses gunicorn; this allows running locally via python app.py
+    app.run(host="0.0.0.0", port=PORT, debug=False)
