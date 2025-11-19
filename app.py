@@ -411,7 +411,7 @@ def _batch_update_cells(row_index: int, updates: Dict[str, str], headers: List[s
             continue
         col_letter = _col_letter(idx)
         cell_range = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_index}"
-        data_ranges.append({"range": cell_range, "values": [[str(value]]})
+        data_ranges.append({"range": cell_range, "values": [[str(value)]]})
 
     if not data_ranges:
         return
@@ -1401,3 +1401,4 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
