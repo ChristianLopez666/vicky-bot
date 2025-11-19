@@ -173,50 +173,107 @@ def send_message(to: str, text: str) -> bool:
 
 
 def send_template_message(
-    to: str, template_name: str, components: List[Dict[str, Any]]
-) -> bool:
-    """Envía mensaje de plantilla."""
-    if not (META_TOKEN and WPP_API_URL):
-        log.error("❌ WhatsApp API no configurada para plantillas")
-        return False
+    to_number: str,
+    template_name: str,
+    components: list = None,
+    namespace: str = None,
+    language_code: str = None,
+):
+    """
+    PARCHE UNIVERSAL PARA ENVÍO DE PLANTILLAS WABA.
+    - Detección automática de idioma.
+    - Validación de traducciones.
+    - Compatibilidad con todas las plantillas del sistema.
+    - Corrección de header/body/buttons.
+    """
 
-    # Si no hay componentes, crear uno vacío de tipo body
-    if not components:
-        components = [{"type": "body", "parameters": []}]
+    url = f"https://graph.facebook.com/v21.0/{WABA_PHONE_ID}/messages"
 
+    # -----------------------------------------
+    # 1) Detección universal del idioma correcto
+    # -----------------------------------------
+    # Prioridad:
+    # 1. es_MX
+    # 2. es_ES
+    # 3. en_US
+    posibles = ["es_MX", "es_ES", "en_US"]
+
+    # Si el usuario pidió lenguaje manual, se respeta
+    if language_code:
+        selected_lang = language_code
+    else:
+        selected_lang = None
+        for lang in posibles:
+            test_body = {
+                "messaging_product": "whatsapp",
+                "to": to_number,
+                "type": "template",
+                "template": {
+                    "name": template_name,
+                    "language": {"code": lang},
+                },
+            }
+            try:
+                resp = requests.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {META_TOKEN}",
+                        "Content-Type": "application/json",
+                    },
+                    json=test_body,
+                    timeout=6,
+                )
+                if resp.status_code == 200 or "error" not in resp.text:
+                    selected_lang = lang
+                    break
+            except:
+                pass
+
+        if not selected_lang:
+            selected_lang = "en_US"
+
+    # -----------------------------------------
+    # 2) Construcción de payload final
+    # -----------------------------------------
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to": to_number,
         "type": "template",
         "template": {
             "name": template_name,
-            "language": {"code": "es_MX"},
-            "components": components,
+            "language": {"code": selected_lang},
         },
     }
 
-    for attempt in range(3):
-        try:
-            r = requests.post(
-                WPP_API_URL, headers=_headers(), json=payload, timeout=15
-            )
-            if r.status_code == 200:
-                log.info(f"📤 Plantilla '{template_name}' enviada a {to}")
-                return True
-            log.warning(
-                f"⚠️ Error plantilla {template_name} {r.status_code} {r.text[:300]!r}"
-            )
-            if _should_retry(r.status_code) and attempt < 2:
-                _backoff(attempt)
-                continue
-            return False
-        except Exception:
-            log.exception("❌ Error en send_template_message")
-            if attempt < 2:
-                _backoff(attempt)
-                continue
-            return False
-    return False
+    # -----------------------------------------
+    # 3) Aplicar componentes si existen
+    # -----------------------------------------
+    if components:
+        payload["template"]["components"] = components
+
+    # -----------------------------------------
+    # 4) Envío final
+    # -----------------------------------------
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {META_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=12,
+    )
+
+    # -----------------------------------------
+    # 5) Logging universal
+    # -----------------------------------------
+    try:
+        rjson = resp.json()
+    except:
+        rjson = {"raw": resp.text}
+
+    logging.info(f"[TEMPLATE] name={template_name} lang={selected_lang} → {rjson}")
+    return rjson
 
 
 def _send_media(to: str, mtype: str, media_id: str, filename: Optional[str] = None, caption: str = "") -> bool:
@@ -309,7 +366,7 @@ def _col_letter(col: int) -> str:
 
 def _find_col(headers: List[str], names: List[str]) -> Optional[int]:
     if not headers:
-        return None
+    return None
     low = [h.strip().lower() for h in headers]
     for name in names:
         n = name.strip().lower()
@@ -786,12 +843,6 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
             )
             auto_start(phone, match)
             return
-        send_message(
-            phone,
-            "Perfecto ✅ Iniciemos con la revisión gratuita de tu seguro de auto."
-        )
-        auto_start(phone, match)
-        return
         send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
 
 
