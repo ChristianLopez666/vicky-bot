@@ -366,7 +366,7 @@ def _col_letter(col: int) -> str:
 
 def _find_col(headers: List[str], names: List[str]) -> Optional[int]:
     if not headers:
-    return None
+        return None
     low = [h.strip().lower() for h in headers]
     for name in names:
         n = name.strip().lower()
@@ -411,7 +411,7 @@ def _batch_update_cells(row_index: int, updates: Dict[str, str], headers: List[s
             continue
         col_letter = _col_letter(idx)
         cell_range = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_index}"
-        data_ranges.append({"range": cell_range, "values": [[str(value)]]})
+        data_ranges.append({"range": cell_range, "values": [[str(value]]})
 
     if not data_ranges:
         return
