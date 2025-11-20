@@ -962,10 +962,23 @@ def ext_test_send():
     try:
         data = request.get_json(force=True) or {}
         to = str(data.get("to", "")).strip()
-        text = str(data.get("text", "Prueba desde Vicky SECOM")).strip()
+        text = str(data.get("text", "")).strip()
+        template_name = str(data.get("template_name") or "").strip()
+        
         if not to:
             return jsonify({"ok": False, "error": "Falta 'to'"}), 400
-        ok = send_message(to, text)
+        
+        # DETECTAR SI ES PLANTILLA O TEXTO NORMAL
+        if template_name:
+            # Enviar plantilla
+            components = data.get("components") or []
+            result = send_template_message(to, template_name, components)
+            ok = "error" not in str(result).lower()
+        else:
+            # Enviar texto normal
+            text = text or "Prueba desde Vicky SECOM"
+            ok = send_message(to, text)
+            
         return jsonify({"ok": bool(ok)}), 200
     except Exception as e:
         log.exception("❌ Error en /ext/test-send")
@@ -1401,4 +1414,5 @@ if __name__ == "__main__":
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
