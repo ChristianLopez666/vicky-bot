@@ -120,7 +120,7 @@ def _should_retry(status: int) -> bool:
     return status == 429 or 500 <= status < 600
 
 def _backoff(attempt: int) -> None:
-    time.sleep(2**attempt)
+    time.sleep(min(2**attempt, 10))  # Cap máximo 10 segundos
 
 def send_message(to: str, text: str) -> bool:
     """Envía mensaje de texto simple."""
@@ -162,6 +162,10 @@ def _detect_template_language(template_name: str, to_number: str) -> Optional[st
     """
     CORREGIDO: Detección estricta de idioma - solo 200 es válido
     """
+    if not WABA_PHONE_ID:
+        log.error("❌ WABA_PHONE_ID no configurado para detección de idioma")
+        return None
+        
     posibles = ["es_MX", "es_ES", "en_US"]
     selected_lang = None
 
@@ -265,6 +269,10 @@ def send_template_message(
     """
     VERSIÓN COMPLETAMENTE CORREGIDA - Detección robusta + reconstrucción completa
     """
+    if not WABA_PHONE_ID:
+        log.error("❌ WABA_PHONE_ID no configurado para enviar plantilla")
+        return {"error": "WABA_PHONE_ID not configured"}
+        
     url = f"https://graph.facebook.com/v21.0/{WABA_PHONE_ID}/messages"
 
     # -----------------------------------------
@@ -308,32 +316,39 @@ def send_template_message(
     # -----------------------------------------
     # 4) Envío final con manejo robusto de errores
     # -----------------------------------------
-    try:
-        resp = requests.post(
-            url,
-            headers=_headers(),
-            json=payload,
-            timeout=12,
-        )
-
-        # -----------------------------------------
-        # 5) Logging universal y manejo de respuesta
-        # -----------------------------------------
+    for attempt in range(3):
         try:
-            rjson = resp.json()
-        except:
-            rjson = {"raw": resp.text}
+            resp = requests.post(
+                url,
+                headers=_headers(),
+                json=payload,
+                timeout=12,
+            )
 
-        if resp.status_code == 200:
-            log.info(f"✅ Plantilla {template_name} enviada a {to_number} en {selected_lang}")
-        else:
-            log.error(f"❌ Error enviando plantilla {template_name}: {resp.status_code} - {rjson}")
+            # -----------------------------------------
+            # 5) Logging universal y manejo de respuesta
+            # -----------------------------------------
+            try:
+                rjson = resp.json()
+            except:
+                rjson = {"raw": resp.text}
 
-        return rjson
-        
-    except Exception as e:
-        log.error(f"❌ Error en envío de plantilla: {e}")
-        return {"error": str(e)}
+            if resp.status_code == 200:
+                log.info(f"✅ Plantilla {template_name} enviada a {to_number} en {selected_lang}")
+                return rjson
+            else:
+                log.error(f"❌ Error enviando plantilla {template_name}: {resp.status_code} - {rjson}")
+                if _should_retry(resp.status_code) and attempt < 2:
+                    _backoff(attempt)
+                    continue
+                return rjson
+                
+        except Exception as e:
+            log.error(f"❌ Error en envío de plantilla (intento {attempt+1}): {e}")
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return {"error": str(e)}
 
 def _send_media(to: str, mtype: str, media_id: str, filename: Optional[str] = None, caption: str = "") -> bool:
     """
@@ -361,16 +376,24 @@ def _send_media(to: str, mtype: str, media_id: str, filename: Optional[str] = No
         mtype: media_obj,
     }
 
-    try:
-        r = requests.post(WPP_API_URL, headers=_headers(), json=payload, timeout=20)
-        if r.status_code == 200:
-            log.info(f"📤 Media reenviado a {to} ({mtype}, id={media_id})")
-            return True
-        log.warning(f"⚠️ Error al reenviar media {r.status_code} {r.text[:300]!r}")
-        return False
-    except Exception:
-        log.exception("❌ Error en _send_media")
-        return False
+    for attempt in range(3):
+        try:
+            r = requests.post(WPP_API_URL, headers=_headers(), json=payload, timeout=20)
+            if r.status_code == 200:
+                log.info(f"📤 Media reenviado a {to} ({mtype}, id={media_id})")
+                return True
+            log.warning(f"⚠️ Error al reenviar media {r.status_code} {r.text[:300]!r}")
+            if _should_retry(r.status_code) and attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+        except Exception:
+            log.exception("❌ Error en _send_media")
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+    return False
 
 def forward_media_to_advisor(origin_phone: str, mtype: str, msg: Dict[str, Any]) -> None:
     """
@@ -433,15 +456,19 @@ def _get_sheet_headers_and_rows() -> tuple[List[str], List[List[str]]]:
     if not (google_ready and sheets and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         return [], []
     rng = f"{SHEETS_TITLE_LEADS}!A:Z"
-    res = sheets.spreadsheets().values().get(
-        spreadsheetId=SHEETS_ID_LEADS, range=rng
-    ).execute()
-    rows = res.get("values", [])
-    if not rows:
+    try:
+        res = sheets.spreadsheets().values().get(
+            spreadsheetId=SHEETS_ID_LEADS, range=rng
+        ).execute()
+        rows = res.get("values", [])
+        if not rows:
+            return [], []
+        headers = rows[0]
+        data_rows = rows[1:]
+        return headers, data_rows
+    except Exception:
+        log.exception("❌ Error obteniendo datos de Google Sheets")
         return [], []
-    headers = rows[0]
-    data_rows = rows[1:]
-    return headers, data_rows
 
 def _batch_update_cells(row_index: int, updates: Dict[str, str], headers: List[str]) -> None:
     """
@@ -904,7 +931,7 @@ def route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> Non
         if intent == "positive":
             send_message(
                 phone,
-                "Perfecto ✅ Revisemos tu opción de *Préstamo IMSS Ley 73*.",
+                "Perfecto ✅ Revisemos tu opción de *Préstamo IMSS Ley 73*. ",
             )
             set_state(phone, "")
             imss_start(phone, match)
@@ -1499,4 +1526,16 @@ if __name__ == "__main__":
     log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
     log.info(f"📊 Google listo: {google_ready}")
     log.info(f"🧠 OpenAI listo: {bool(openai and OPENAI_API_KEY)}")
+    
+    # Verificación básica de entorno
+    if not META_TOKEN:
+        log.warning("⚠️ META_TOKEN no configurado")
+    if not WABA_PHONE_ID:
+        log.warning("⚠️ WABA_PHONE_ID no configurado")
+    if not VERIFY_TOKEN:
+        log.warning("⚠️ VERIFY_TOKEN no configurado")
+    if not ADVISOR_NUMBER:
+        log.warning("⚠️ ADVISOR_NUMBER no configurado")
+        
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
