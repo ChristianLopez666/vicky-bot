@@ -944,197 +944,233 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
-# ============================================================
-# ===============  MÓDULO MASIVO PROMO_TPV  ==================
-# ============================================================
+# ============================
+#   MÓDULO UNIVERSAL MASIVO
+# ============================
 
-import threading
-from datetime import datetime, timedelta
+import os
+import json
 import time
+import threading
+import requests
+from datetime import datetime, timedelta
+from flask import request, jsonify
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
-MASSIVE_SHEET_ID = os.getenv("LEADS_SHEET_ID", "")
-MASSIVE_SHEET_NAME = "Leads Vicky"
-MASSIVE_TEMPLATE_NAME = "promo_tpv"
-ADVISOR_NUMBER = os.getenv("ADVISOR_WHATSAPP", "5216682478005")
-SEND_INTERVAL_MINUTES = 5
-
-massive_worker_running = False
-massive_lock = threading.Lock()
-
-
-def _should_run_massive_now():
-    """Solo permite ejecución entre 9:00 am y 6:00 pm, lunes–viernes."""
-    now = datetime.now()
-
-    if now.weekday() >= 5:
-        return False
-
-    start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    end = now.replace(hour=18, minute=0, second=0, microsecond=0)
-
-    return start <= now <= end
+META_TOKEN = os.getenv("META_TOKEN")
+WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
+GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+ADVISOR_WHATSAPP = os.getenv("ADVISOR_WHATSAPP")
 
 
-def _read_massive_sheet():
+# ----------------------------
+# Google Sheets Service
+# ----------------------------
+def get_sheets_service():
+    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return build("sheets", "v4", credentials=creds).spreadsheets()
+
+
+# ----------------------------
+# Leer hoja completa
+# ----------------------------
+def read_sheet(hoja):
     try:
-        creds = ServiceAccountCredentials.from_service_account_info(
-            json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON", "{}")),
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-        service = gbuild("sheets", "v4", credentials=creds)
-        sheet = service.spreadsheets()
-
-        result = sheet.values().get(
-            spreadsheetId=MASSIVE_SHEET_ID,
-            range=f"{MASSIVE_SHEET_NAME}!A:Z"
+        service = get_sheets_service()
+        result = service.values().get(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            range=f"{hoja}!A:H"
         ).execute()
-
         values = result.get("values", [])
-        if not values:
-            return []
-
-        headers = values[0]
-        rows = []
-        for row in values[1:]:
-            rows.append({headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))})
-
-        return rows
-
+        cleaned = []
+        for idx, row in enumerate(values[1:], start=2):
+            if len(row) < 3:
+                continue
+            cleaned.append({
+                "row": idx,
+                "nombre": row[0] if len(row) > 0 else "",
+                "rfc": row[1] if len(row) > 1 else "",
+                "whatsapp": row[2] if len(row) > 2 else "",
+                "estatus": row[3] if len(row) > 3 else "",
+                "producto": row[4] if len(row) > 4 else "",
+                "ultimo": row[5] if len(row) > 5 else "",
+                "notas": row[6] if len(row) > 6 else "",
+                "beneficio": row[7] if len(row) > 7 else ""
+            })
+        return cleaned
     except Exception as e:
-        print("ERROR leyendo Leads Vicky:", e)
+        print("Error leyendo Google Sheets:", e)
         return []
 
 
-def _update_massive_sheet(row_number, updates: dict):
-    """row_number es 1-based (incluye encabezado), updates es dict {'col': 'valor'}."""
-    try:
-        creds = ServiceAccountCredentials.from_service_account_info(
-            json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON", "{}")),
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-        service = gbuild("sheets", "v4", credentials=creds)
-        sheet = service.spreadsheets()
-
-        body = {"values": [[updates[k] for k in updates]]}
-
-        columns = list(updates.keys())
-        first_col = columns[0]
-        col_index = ord(first_col.lower()) - 96
-
-        range_str = f"{MASSIVE_SHEET_NAME}!{first_col}{row_number}"
-
-        sheet.values().update(
-            spreadsheetId=MASSIVE_SHEET_ID,
-            range=range_str,
-            valueInputOption="USER_ENTERED",
-            body={"values": [[updates[first_col]]}
-        ).execute()
-
-    except Exception as e:
-        print("ERROR actualizando hoja masiva:", e)
+# ----------------------------
+# Limpieza de número
+# ----------------------------
+def clean_phone(num):
+    digits = "".join([c for c in num if c.isdigit()])
+    if len(digits) == 10:
+        return "521" + digits
+    if len(digits) == 12 and digits.startswith("52"):
+        return digits
+    return None
 
 
-def _send_template_massive(phone, name):
-    """Envía plantilla promo_tpv con parámetro nombre."""
-    url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
-
-    payload = {
+# ----------------------------
+# Construir payload Meta Template
+# ----------------------------
+def build_template_payload(plantilla, idioma, nombre):
+    return {
         "messaging_product": "whatsapp",
-        "to": phone,
+        "to": "",
         "type": "template",
         "template": {
-            "name": MASSIVE_TEMPLATE_NAME,
-            "language": {"code": "es_MX"},
+            "name": plantilla,
+            "language": {"code": idioma},
             "components": [
                 {
                     "type": "body",
-                    "parameters": [
-                        {"type": "text", "text": name}
-                    ]
+                    "parameters": [{"type": "text", "text": nombre}]
                 }
             ]
         }
     }
 
+
+# ----------------------------
+# Enviar mensaje WhatsApp
+# ----------------------------
+def send_whatsapp_message(phone, payload):
+    url = f"https://graph.facebook.com/v21.0/{WABA_PHONE_ID}/messages"
+    payload["to"] = phone
     headers = {
-        "Content-Type": "application/json",
         "Authorization": f"Bearer {META_TOKEN}",
+        "Content-Type": "application/json"
     }
 
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        return r.status_code, r.text
-    except Exception as e:
-        return 500, str(e)
-
-
-def _massive_send_worker():
-    global massive_worker_running
-    with massive_lock:
-        if massive_worker_running:
-            return
-        massive_worker_running = True
-
-    print(">>> Massive worker PROMO_TPV iniciado...")
-
-    while True:
+    for attempt in range(4):
         try:
-            if not _should_run_massive_now():
-                time.sleep(30)
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
+            if r.status_code == 200:
+                return True, "OK"
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                time.sleep(10 * (attempt + 1))
+                continue
+            return False, f"ERR {r.status_code}: {r.text}"
+        except Exception as e:
+            time.sleep(5 * (attempt + 1))
+            err = str(e)
+
+    return False, f"FAIL: {err}"
+
+
+# ----------------------------
+# Actualizar hoja
+# ----------------------------
+def update_sheet_after_send(row_index, hoja, estatus, nota):
+    try:
+        service = get_sheets_service()
+        service.values().update(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            range=f"{hoja}!D{row_index}:G{row_index}",
+            valueInputOption="RAW",
+            body={"values": [[estatus, "", note_clean(nota), ""]]}
+        ).execute()
+    except Exception as e:
+        print("Error actualizando Google Sheets:", e)
+
+
+def note_clean(txt):
+    return (txt or "").replace("\n", " ")[:400]
+
+
+# ----------------------------
+# Worker masivo
+# ----------------------------
+def worker_masivo(lista, plantilla, idioma, hoja):
+    enviados = 0
+    errores = 0
+    total = len(lista)
+
+    for item in lista:
+        try:
+            # Validar horario laboral
+            while True:
+                ahora = datetime.now()
+                if ahora.weekday() < 5 and 9 <= ahora.hour < 18:
+                    break
+                time.sleep(60)
+
+            phone = clean_phone(item["whatsapp"])
+            if not phone:
+                errores += 1
+                update_sheet_after_send(item["row"], hoja, "ERROR", "Número inválido")
                 continue
 
-            rows = _read_massive_sheet()
-            if not rows:
-                time.sleep(30)
-                continue
+            payload = build_template_payload(plantilla, idioma, item["nombre"])
+            ok, msg = send_whatsapp_message(phone, payload)
 
-            for idx, row in enumerate(rows, start=2):
-                status = row.get("estado", "").strip().lower()
-                wa_id = row.get("wa_id (WhatsApp del cliente)", "").strip()
-                name = row.get("nombre", "").strip()
+            if ok:
+                enviados += 1
+                update_sheet_after_send(item["row"], hoja, "ENVIADO", msg)
+            else:
+                errores += 1
+                update_sheet_after_send(item["row"], hoja, "ERROR", msg)
 
-                if not wa_id or status in ["enviado", "cerrado", "no interesado"]:
-                    continue
-
-                print(f" Enviando plantilla promo_tpv → {wa_id}")
-
-                code, resp = _send_template_massive(wa_id, name)
-
-                now_iso = datetime.now().isoformat()
-
-                new_status = "ENVIADO" if code in [200, 201] else "ERROR"
-
-                _update_massive_sheet(idx, {
-                    "estado": new_status,
-                    "LAST_MESSAGE_AT": now_iso,
-                    "LAST_TEMPLATE": MASSIVE_TEMPLATE_NAME,
-                })
-
-                notif_text = (
-                    f"VICKY NOTIFICACIÓN:\n"
-                    f"Plantilla enviada a {name} ({wa_id})\n"
-                    f"Status: {new_status}"
-                )
-                send_whatsapp_text(ADVISOR_NUMBER, notif_text)
-
-                time.sleep(SEND_INTERVAL_MINUTES * 60)
+            time.sleep(300)
 
         except Exception as e:
-            print("Error en worker masivo:", e)
-            time.sleep(10)
+            errores += 1
+            update_sheet_after_send(item["row"], hoja, "ERROR", f"EXC: {e}")
 
-    massive_worker_running = False
+    # Notificación final al asesor
+    notif_payload = {
+        "messaging_product": "whatsapp",
+        "to": ADVISOR_WHATSAPP,
+        "type": "text",
+        "text": {
+            "body": f"Campaña finalizada.\nHoja: {hoja}\nPlantilla: {plantilla}\nTotal: {total}\nEnviados: {enviados}\nErrores: {errores}"
+        }
+    }
+    try:
+        send_whatsapp_message(ADVISOR_WHATSAPP, notif_payload)
+    except:
+        pass
 
 
-@app.route("/ext/massive/start", methods=["POST"])
-def start_massive_campaign():
-    """Inicia el worker masivo manualmente."""
-    threading.Thread(target=_massive_send_worker, daemon=True).start()
-    return jsonify({"ok": True, "msg": "Massive worker PROMO_TPV iniciado"})
+# ----------------------------
+# ENDPOINT PARA INICIO MASIVO
+# ----------------------------
+@app.route("/ext/send-masivo", methods=["GET"])
+def send_masivo():
+    plantilla = request.args.get("plantilla")
+    hoja = request.args.get("hoja")
+    idioma = request.args.get("idioma")
 
+    if not plantilla or not hoja or not idioma:
+        return jsonify({"error": "Faltan parámetros"}), 400
 
-@app.route("/ext/massive/status", methods=["GET"])
-def status_massive_campaign():
-    return jsonify({"running": massive_worker_running})
-    
+    lista = read_sheet(hoja)
+    if not lista:
+        return jsonify({"error": "Hoja vacía o no encontrada"}), 400
 
+    hilo = threading.Thread(
+        target=worker_masivo,
+        args=(lista, plantilla, idioma, hoja),
+        daemon=True
+    )
+    hilo.start()
+
+    return jsonify({
+        "status": "OK",
+        "message": "Worker iniciado",
+        "hoja": hoja,
+        "plantilla": plantilla,
+        "idioma": idioma,
+        "total_registros": len(lista)
+    })
