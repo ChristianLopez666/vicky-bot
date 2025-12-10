@@ -944,3 +944,197 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
+# ============================================================
+# ===============  MÓDULO MASIVO PROMO_TPV  ==================
+# ============================================================
+
+import threading
+from datetime import datetime, timedelta
+import time
+
+MASSIVE_SHEET_ID = os.getenv("LEADS_SHEET_ID", "")
+MASSIVE_SHEET_NAME = "Leads Vicky"
+MASSIVE_TEMPLATE_NAME = "promo_tpv"
+ADVISOR_NUMBER = os.getenv("ADVISOR_WHATSAPP", "5216682478005")
+SEND_INTERVAL_MINUTES = 5
+
+massive_worker_running = False
+massive_lock = threading.Lock()
+
+
+def _should_run_massive_now():
+    """Solo permite ejecución entre 9:00 am y 6:00 pm, lunes–viernes."""
+    now = datetime.now()
+
+    if now.weekday() >= 5:
+        return False
+
+    start = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    end = now.replace(hour=18, minute=0, second=0, microsecond=0)
+
+    return start <= now <= end
+
+
+def _read_massive_sheet():
+    try:
+        creds = ServiceAccountCredentials.from_service_account_info(
+            json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON", "{}")),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        service = gbuild("sheets", "v4", credentials=creds)
+        sheet = service.spreadsheets()
+
+        result = sheet.values().get(
+            spreadsheetId=MASSIVE_SHEET_ID,
+            range=f"{MASSIVE_SHEET_NAME}!A:Z"
+        ).execute()
+
+        values = result.get("values", [])
+        if not values:
+            return []
+
+        headers = values[0]
+        rows = []
+        for row in values[1:]:
+            rows.append({headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))})
+
+        return rows
+
+    except Exception as e:
+        print("ERROR leyendo Leads Vicky:", e)
+        return []
+
+
+def _update_massive_sheet(row_number, updates: dict):
+    """row_number es 1-based (incluye encabezado), updates es dict {'col': 'valor'}."""
+    try:
+        creds = ServiceAccountCredentials.from_service_account_info(
+            json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON", "{}")),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        service = gbuild("sheets", "v4", credentials=creds)
+        sheet = service.spreadsheets()
+
+        body = {"values": [[updates[k] for k in updates]]}
+
+        columns = list(updates.keys())
+        first_col = columns[0]
+        col_index = ord(first_col.lower()) - 96
+
+        range_str = f"{MASSIVE_SHEET_NAME}!{first_col}{row_number}"
+
+        sheet.values().update(
+            spreadsheetId=MASSIVE_SHEET_ID,
+            range=range_str,
+            valueInputOption="USER_ENTERED",
+            body={"values": [[updates[first_col]]}
+        ).execute()
+
+    except Exception as e:
+        print("ERROR actualizando hoja masiva:", e)
+
+
+def _send_template_massive(phone, name):
+    """Envía plantilla promo_tpv con parámetro nombre."""
+    url = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages"
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "template",
+        "template": {
+            "name": MASSIVE_TEMPLATE_NAME,
+            "language": {"code": "es_MX"},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": name}
+                    ]
+                }
+            ]
+        }
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {META_TOKEN}",
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        return r.status_code, r.text
+    except Exception as e:
+        return 500, str(e)
+
+
+def _massive_send_worker():
+    global massive_worker_running
+    with massive_lock:
+        if massive_worker_running:
+            return
+        massive_worker_running = True
+
+    print(">>> Massive worker PROMO_TPV iniciado...")
+
+    while True:
+        try:
+            if not _should_run_massive_now():
+                time.sleep(30)
+                continue
+
+            rows = _read_massive_sheet()
+            if not rows:
+                time.sleep(30)
+                continue
+
+            for idx, row in enumerate(rows, start=2):
+                status = row.get("estado", "").strip().lower()
+                wa_id = row.get("wa_id (WhatsApp del cliente)", "").strip()
+                name = row.get("nombre", "").strip()
+
+                if not wa_id or status in ["enviado", "cerrado", "no interesado"]:
+                    continue
+
+                print(f" Enviando plantilla promo_tpv → {wa_id}")
+
+                code, resp = _send_template_massive(wa_id, name)
+
+                now_iso = datetime.now().isoformat()
+
+                new_status = "ENVIADO" if code in [200, 201] else "ERROR"
+
+                _update_massive_sheet(idx, {
+                    "estado": new_status,
+                    "LAST_MESSAGE_AT": now_iso,
+                    "LAST_TEMPLATE": MASSIVE_TEMPLATE_NAME,
+                })
+
+                notif_text = (
+                    f"VICKY NOTIFICACIÓN:\n"
+                    f"Plantilla enviada a {name} ({wa_id})\n"
+                    f"Status: {new_status}"
+                )
+                send_whatsapp_text(ADVISOR_NUMBER, notif_text)
+
+                time.sleep(SEND_INTERVAL_MINUTES * 60)
+
+        except Exception as e:
+            print("Error en worker masivo:", e)
+            time.sleep(10)
+
+    massive_worker_running = False
+
+
+@app.route("/ext/massive/start", methods=["POST"])
+def start_massive_campaign():
+    """Inicia el worker masivo manualmente."""
+    threading.Thread(target=_massive_send_worker, daemon=True).start()
+    return jsonify({"ok": True, "msg": "Massive worker PROMO_TPV iniciado"})
+
+
+@app.route("/ext/massive/status", methods=["GET"])
+def status_massive_campaign():
+    return jsonify({"running": massive_worker_running})
+    
+
