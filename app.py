@@ -933,6 +933,167 @@ def ext_send_promo():
             "error": f"Error interno: {str(e)}"
         }), 500
 
+# ============================================================
+# MÓDULO MASIVO ÚNICO — GOOGLE SHEETS → WHATSAPP TEMPLATE
+# ============================================================
+
+import os
+import json
+import time
+import threading
+import re
+import requests
+from datetime import datetime
+from flask import request, jsonify
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+META_TOKEN = os.getenv("META_TOKEN")
+WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
+GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+ADVISOR_WHATSAPP = os.getenv("ADVISOR_WHATSAPP")
+
+WPP_URL = f"https://graph.facebook.com/v21.0/{WABA_PHONE_ID}/messages"
+HEADERS = {
+    "Authorization": f"Bearer {META_TOKEN}",
+    "Content-Type": "application/json"
+}
+
+# -----------------------------
+# Google Sheets
+# -----------------------------
+def get_sheets():
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(GOOGLE_CREDENTIALS_JSON),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return build("sheets", "v4", credentials=creds).spreadsheets()
+
+def read_sheet(hoja):
+    svc = get_sheets()
+    res = svc.values().get(
+        spreadsheetId=GOOGLE_SHEETS_ID,
+        range=f"{hoja}!A:H"
+    ).execute()
+    rows = res.get("values", [])
+    data = []
+    for idx, r in enumerate(rows[1:], start=2):
+        if len(r) < 3:
+            continue
+        data.append({
+            "row": idx,
+            "nombre": r[0],
+            "whatsapp": r[2],
+        })
+    return data
+
+def update_sheet(row, hoja, estatus, nota):
+    svc = get_sheets()
+    svc.values().update(
+        spreadsheetId=GOOGLE_SHEETS_ID,
+        range=f"{hoja}!D{row}:G{row}",
+        valueInputOption="RAW",
+        body={"values": [[estatus, "", nota[:300], ""]]}
+    ).execute()
+
+# -----------------------------
+# WhatsApp
+# -----------------------------
+def clean_phone(p):
+    d = re.sub(r"\D", "", p)
+    if len(d) == 10:
+        return "521" + d
+    if len(d) == 12 and d.startswith("52"):
+        return d
+    return None
+
+def send_template(phone, plantilla, idioma, nombre):
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "template",
+        "template": {
+            "name": plantilla,
+            "language": {"code": idioma},
+            "components": [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": nombre}]
+            }]
+        }
+    }
+    r = requests.post(WPP_URL, headers=HEADERS, json=payload, timeout=20)
+    return r.status_code == 200, r.text
+
+# -----------------------------
+# Worker
+# -----------------------------
+def worker_masivo(registros, plantilla, idioma, hoja):
+    ok = 0
+    err = 0
+
+    for item in registros:
+        while True:
+            now = datetime.now()
+            if now.weekday() < 5 and 9 <= now.hour < 18:
+                break
+            time.sleep(60)
+
+        phone = clean_phone(item["whatsapp"])
+        if not phone:
+            update_sheet(item["row"], hoja, "ERROR", "Número inválido")
+            err += 1
+            continue
+
+        success, msg = send_template(phone, plantilla, idioma, item["nombre"])
+        if success:
+            update_sheet(item["row"], hoja, "ENVIADO", "OK")
+            ok += 1
+        else:
+            update_sheet(item["row"], hoja, "ERROR", msg)
+            err += 1
+
+        time.sleep(300)  # 5 minutos
+
+    try:
+        send_template(
+            ADVISOR_WHATSAPP,
+            plantilla,
+            idioma,
+            f"Campaña terminada OK:{ok} ERR:{err}"
+        )
+    except:
+        pass
+
+# -----------------------------
+# Endpoint
+# -----------------------------
+@app.get("/ext/send-masivo")
+def send_masivo():
+    plantilla = request.args.get("plantilla")
+    hoja = request.args.get("hoja")
+    idioma = request.args.get("idioma")
+
+    if not plantilla or not hoja or not idioma:
+        return jsonify({"error": "Parámetros faltantes"}), 400
+
+    registros = read_sheet(hoja)
+    if not registros:
+        return jsonify({"error": "Hoja vacía"}), 400
+
+    threading.Thread(
+        target=worker_masivo,
+        args=(registros, plantilla, idioma, hoja),
+        daemon=True
+    ).start()
+
+    return jsonify({
+        "status": "OK",
+        "total": len(registros),
+        "plantilla": plantilla,
+        "hoja": hoja
+    }), 202
+
 # ==========================
 # Arranque (para desarrollo local)
 # En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
@@ -944,3 +1105,4 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
