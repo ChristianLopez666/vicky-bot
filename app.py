@@ -162,102 +162,143 @@ def _backoff(attempt: int) -> None:
     time.sleep(2 ** attempt)
 
 def send_message(to: str, text: str) -> bool:
-    """Envía mensaje de texto WPP. Reintentos exponenciales en 429/5xx."""
+    """Envía mensaje de texto WPP con E.164 y reintentos."""
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID faltan).")
         return False
-    
+
+    # Normalizar a E.164 (México)
+    digits = re.sub(r"\D", "", to or "")
+    if len(digits) == 10:
+        to_e164 = "521" + digits
+    elif digits.startswith("52") and len(digits) == 12:
+        to_e164 = digits
+    elif digits.startswith("1") and len(digits) >= 11:
+        to_e164 = "52" + digits[-10:]
+    else:
+        to_e164 = to
+
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to": to_e164,
         "type": "text",
         "text": {"body": text[:4096]},
     }
-    
-    for attempt in range(3):
+
+    for attempt in range(4):
         try:
-            log.info(f"📤 Enviando mensaje a {to} (intento {attempt + 1})")
-            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-            
+            log.info(f"📤 [{attempt+1}/4] Mensaje a {to_e164}")
+            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=30)
+
             if resp.status_code == 200:
-                log.info(f"✅ Mensaje enviado exitosamente a {to}")
+                msg_id = (resp.json().get("messages") or [{}])[0].get("id", "unknown")
+                log.info(f"✅ Mensaje ENVIADO | ID: {msg_id} | To: {to_e164}")
                 return True
-            
-            log.warning(f"⚠️ WPP send_message fallo {resp.status_code}: {resp.text[:200]}")
-            if _should_retry(resp.status_code) and attempt < 2:
-                log.info(f"🔄 Reintentando en {2 ** attempt} segundos...")
-                _backoff(attempt)
+
+            err = resp.json() if resp.text else {}
+            code = err.get("error", {}).get("code", "unknown")
+            msg = err.get("error", {}).get("message", resp.text[:200])
+            log.warning(f"⚠️ Fallo {resp.status_code} (code:{code}): {msg}")
+
+            if resp.status_code == 429:
+                wait = min(int(resp.headers.get("Retry-After", "300")), 600)
+                time.sleep(wait)
                 continue
+
+            if 500 <= resp.status_code < 600 and attempt < 3:
+                time.sleep(2 ** (attempt + 2))
+                continue
+
             return False
         except requests.exceptions.Timeout:
-            log.error(f"⏰ Timeout enviando mensaje a {to} (intento {attempt + 1})")
-            if attempt < 2:
-                _backoff(attempt)
+            if attempt < 3:
+                time.sleep(2 ** (attempt + 2))
                 continue
             return False
-        except Exception as e:
-            log.exception(f"❌ Error en send_message a {to}")
-            if attempt < 2:
-                _backoff(attempt)
+        except Exception:
+            if attempt < 3:
+                time.sleep(2 ** (attempt + 2))
                 continue
             return False
     return False
 
-def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
-    """Envía plantilla preaprobada."""
+def send_template_message(to: str, template_name: str, params: list) -> bool:
+    """Envía plantilla WPP con PAYLOAD CORRECTO (un solo body) + E.164."""
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
         return False
-    
+
+    # Normalizar a E.164 (México)
+    digits = re.sub(r"\D", "", to or "")
+    if len(digits) == 10:
+        to_e164 = "521" + digits
+    elif digits.startswith("52") and len(digits) == 12:
+        to_e164 = digits
+    elif digits.startswith("1") and len(digits) >= 11:
+        to_e164 = "52" + digits[-10:]
+    else:
+        to_e164 = to
+
+    # Construir UN SOLO body con TODOS los parameters
     components = []
-    if isinstance(params, dict):
-        for k, v in params.items():
-            components.append({"type": "body", "parameters": [{"type": "text", "text": str(v)}]})
-    elif isinstance(params, list):
-        components.append({
-            "type": "body",
-            "parameters": [{"type": "text", "text": str(x)} for x in params]
-        })
-    
+    parameters = []
+    for p in (params or []):
+        if p is not None and str(p).strip():
+            parameters.append({"type": "text", "text": str(p).strip()[:32768]})
+    if parameters:
+        components.append({"type": "body", "parameters": parameters})
+
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to": to_e164,
         "type": "template",
         "template": {
-            "name": template_name, 
-            "language": {"code": "es_MX"}, 
+            "name": template_name,
+            "language": {"code": "es_MX"},
             "components": components
         }
     }
-    
-    for attempt in range(3):
+
+    for attempt in range(4):
         try:
-            log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
-            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-            
+            log.info(f"📤 [{attempt+1}/4] Plantilla '{template_name}' a {to_e164}")
+            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=30)
+
             if resp.status_code == 200:
-                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
+                msg_id = (resp.json().get("messages") or [{}])[0].get("id", "unknown")
+                log.info(f"✅ Plantilla ENVIADA | ID: {msg_id} | To: {to_e164}")
                 return True
-            
-            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
-            if _should_retry(resp.status_code) and attempt < 2:
-                log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
-                _backoff(attempt)
+
+            err = resp.json() if resp.text else {}
+            code = err.get("error", {}).get("code", "unknown")
+            msg = err.get("error", {}).get("message", resp.text[:200])
+            log.warning(f"⚠️ Fallo {resp.status_code} (code:{code}): {msg}")
+
+            if resp.status_code == 429:
+                wait = min(int(resp.headers.get("Retry-After", "300")), 600)
+                time.sleep(wait)
                 continue
+
+            if resp.status_code == 400 and "parameter" in str(msg).lower():
+                return False
+
+            if 500 <= resp.status_code < 600 and attempt < 3:
+                time.sleep(2 ** (attempt + 2))
+                continue
+
             return False
         except requests.exceptions.Timeout:
-            log.error(f"⏰ Timeout enviando plantilla a {to} (intento {attempt + 1})")
-            if attempt < 2:
-                _backoff(attempt)
+            if attempt < 3:
+                time.sleep(2 ** (attempt + 2))
                 continue
             return False
         except Exception:
-            log.exception(f"❌ Error en send_template_message a {to}")
-            if attempt < 2:
-                _backoff(attempt)
+            if attempt < 3:
+                time.sleep(2 ** (attempt + 2))
                 continue
             return False
     return False
+
 
 # ==========================
 # Google Helpers
@@ -933,167 +974,6 @@ def ext_send_promo():
             "error": f"Error interno: {str(e)}"
         }), 500
 
-# ============================================================
-# MÓDULO MASIVO ÚNICO — GOOGLE SHEETS → WHATSAPP TEMPLATE
-# ============================================================
-
-import os
-import json
-import time
-import threading
-import re
-import requests
-from datetime import datetime
-from flask import request, jsonify
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-
-META_TOKEN = os.getenv("META_TOKEN")
-WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
-GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-ADVISOR_WHATSAPP = os.getenv("ADVISOR_WHATSAPP")
-
-WPP_URL = f"https://graph.facebook.com/v21.0/{WABA_PHONE_ID}/messages"
-HEADERS = {
-    "Authorization": f"Bearer {META_TOKEN}",
-    "Content-Type": "application/json"
-}
-
-# -----------------------------
-# Google Sheets
-# -----------------------------
-def get_sheets():
-    creds = service_account.Credentials.from_service_account_info(
-        json.loads(GOOGLE_CREDENTIALS_JSON),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    return build("sheets", "v4", credentials=creds).spreadsheets()
-
-def read_sheet(hoja):
-    svc = get_sheets()
-    res = svc.values().get(
-        spreadsheetId=GOOGLE_SHEETS_ID,
-        range=f"{hoja}!A:H"
-    ).execute()
-    rows = res.get("values", [])
-    data = []
-    for idx, r in enumerate(rows[1:], start=2):
-        if len(r) < 3:
-            continue
-        data.append({
-            "row": idx,
-            "nombre": r[0],
-            "whatsapp": r[2],
-        })
-    return data
-
-def update_sheet(row, hoja, estatus, nota):
-    svc = get_sheets()
-    svc.values().update(
-        spreadsheetId=GOOGLE_SHEETS_ID,
-        range=f"{hoja}!D{row}:G{row}",
-        valueInputOption="RAW",
-        body={"values": [[estatus, "", nota[:300], ""]]}
-    ).execute()
-
-# -----------------------------
-# WhatsApp
-# -----------------------------
-def clean_phone(p):
-    d = re.sub(r"\D", "", p)
-    if len(d) == 10:
-        return "521" + d
-    if len(d) == 12 and d.startswith("52"):
-        return d
-    return None
-
-def send_template(phone, plantilla, idioma, nombre):
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "template",
-        "template": {
-            "name": plantilla,
-            "language": {"code": idioma},
-            "components": [{
-                "type": "body",
-                "parameters": [{"type": "text", "text": nombre}]
-            }]
-        }
-    }
-    r = requests.post(WPP_URL, headers=HEADERS, json=payload, timeout=20)
-    return r.status_code == 200, r.text
-
-# -----------------------------
-# Worker
-# -----------------------------
-def worker_masivo(registros, plantilla, idioma, hoja):
-    ok = 0
-    err = 0
-
-    for item in registros:
-        while True:
-            now = datetime.now()
-            if now.weekday() < 5 and 9 <= now.hour < 18:
-                break
-            time.sleep(60)
-
-        phone = clean_phone(item["whatsapp"])
-        if not phone:
-            update_sheet(item["row"], hoja, "ERROR", "Número inválido")
-            err += 1
-            continue
-
-        success, msg = send_template(phone, plantilla, idioma, item["nombre"])
-        if success:
-            update_sheet(item["row"], hoja, "ENVIADO", "OK")
-            ok += 1
-        else:
-            update_sheet(item["row"], hoja, "ERROR", msg)
-            err += 1
-
-        time.sleep(300)  # 5 minutos
-
-    try:
-        send_template(
-            ADVISOR_WHATSAPP,
-            plantilla,
-            idioma,
-            f"Campaña terminada OK:{ok} ERR:{err}"
-        )
-    except:
-        pass
-
-# -----------------------------
-# Endpoint
-# -----------------------------
-@app.get("/ext/send-masivo")
-def send_masivo():
-    plantilla = request.args.get("plantilla")
-    hoja = request.args.get("hoja")
-    idioma = request.args.get("idioma")
-
-    if not plantilla or not hoja or not idioma:
-        return jsonify({"error": "Parámetros faltantes"}), 400
-
-    registros = read_sheet(hoja)
-    if not registros:
-        return jsonify({"error": "Hoja vacía"}), 400
-
-    threading.Thread(
-        target=worker_masivo,
-        args=(registros, plantilla, idioma, hoja),
-        daemon=True
-    ).start()
-
-    return jsonify({
-        "status": "OK",
-        "total": len(registros),
-        "plantilla": plantilla,
-        "hoja": hoja
-    }), 202
-
 # ==========================
 # Arranque (para desarrollo local)
 # En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
@@ -1105,4 +985,3 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
