@@ -119,6 +119,15 @@ def _normalize_phone_last10(phone: str) -> str:
     digits = re.sub(r"\D", "", phone or "")
     return digits[-10:] if len(digits) >= 10 else digits
 
+def _a1_sheet(title: str) -> str:
+    """Nombre de pestaña en A1 notation, siempre entre comillas simples.
+    Evita errores 'Unable to parse range' cuando hay espacios, p.ej. Hoja 1.
+    """
+    t = (title or "").strip()
+    if t.startswith("'") and t.endswith("'"):
+        return t
+    return "'" + t.replace("'", "''") + "'"
+
 def interpret_response(text: str) -> str:
     if not text:
         return "neutral"
@@ -268,7 +277,7 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
         log.warning("⚠️ Sheets no disponible; no se puede hacer matching.")
         return None
     try:
-        rng = f"{SHEETS_TITLE_LEADS}!A:Z"
+        rng = f"{_a1_sheet(SHEETS_TITLE_LEADS)}!A:Z"
         values = sheets_svc.spreadsheets().values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
         rows = values.get("values", [])
         phone_last10 = str(phone_last10)
@@ -302,7 +311,7 @@ def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
         }
         sheets_svc.spreadsheets().values().append(
             spreadsheetId=SHEETS_ID_LEADS,
-            range=f"{title}!A:C",
+            range=f"{_a1_sheet(title)}!A:C",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body=body
@@ -953,7 +962,7 @@ def _sheet_get_rows() -> Tuple[List[str], List[List[str]]]:
     """Obtiene headers + rows del Sheet principal."""
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         raise RuntimeError("Sheets no disponible (google_ready/SHEETS_ID_LEADS/SHEETS_TITLE_LEADS).")
-    rng = f"{SHEETS_TITLE_LEADS}!A:Z"
+    rng = f"{_a1_sheet(SHEETS_TITLE_LEADS)}!A:Z"
     values = sheets_svc.spreadsheets().values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
     rows = values.get("values", [])
     if not rows:
@@ -991,7 +1000,7 @@ def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: 
             raise RuntimeError(f"No existe columna '{col_name}' en el Sheet.")
         # Columna A=1 => letra:
         col_letter = chr(ord("A") + j)
-        a1 = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_number_1based}"
+        a1 = f"{_a1_sheet(SHEETS_TITLE_LEADS)}!{col_letter}{row_number_1based}"
         data.append({"range": a1, "values": [[value]]})
     body = {"valueInputOption": "USER_ENTERED", "data": data}
     sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
@@ -1077,4 +1086,3 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
-
