@@ -119,15 +119,6 @@ def _normalize_phone_last10(phone: str) -> str:
     digits = re.sub(r"\D", "", phone or "")
     return digits[-10:] if len(digits) >= 10 else digits
 
-def _a1_sheet(title: str) -> str:
-    """Nombre de pestaña en A1 notation, siempre entre comillas simples.
-    Evita errores 'Unable to parse range' cuando hay espacios, p.ej. Hoja 1.
-    """
-    t = (title or "").strip()
-    if t.startswith("'") and t.endswith("'"):
-        return t
-    return "'" + t.replace("'", "''") + "'"
-
 def interpret_response(text: str) -> str:
     if not text:
         return "neutral"
@@ -277,7 +268,7 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
         log.warning("⚠️ Sheets no disponible; no se puede hacer matching.")
         return None
     try:
-        rng = f"{_a1_sheet(SHEETS_TITLE_LEADS)}!A:Z"
+        rng = f"{SHEETS_TITLE_LEADS}!A:Z"
         values = sheets_svc.spreadsheets().values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
         rows = values.get("values", [])
         phone_last10 = str(phone_last10)
@@ -311,7 +302,7 @@ def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
         }
         sheets_svc.spreadsheets().values().append(
             spreadsheetId=SHEETS_ID_LEADS,
-            range=f"{_a1_sheet(title)}!A:C",
+            range=f"{title}!A:C",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body=body
@@ -962,7 +953,7 @@ def _sheet_get_rows() -> Tuple[List[str], List[List[str]]]:
     """Obtiene headers + rows del Sheet principal."""
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         raise RuntimeError("Sheets no disponible (google_ready/SHEETS_ID_LEADS/SHEETS_TITLE_LEADS).")
-    rng = f"{_a1_sheet(SHEETS_TITLE_LEADS)}!A:Z"
+    rng = f"{SHEETS_TITLE_LEADS}!A:Z"
     values = sheets_svc.spreadsheets().values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
     rows = values.get("values", [])
     if not rows:
@@ -1000,7 +991,7 @@ def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: 
             raise RuntimeError(f"No existe columna '{col_name}' en el Sheet.")
         # Columna A=1 => letra:
         col_letter = chr(ord("A") + j)
-        a1 = f"{_a1_sheet(SHEETS_TITLE_LEADS)}!{col_letter}{row_number_1based}"
+        a1 = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_number_1based}"
         data.append({"range": a1, "values": [[value]]})
     body = {"valueInputOption": "USER_ENTERED", "data": data}
     sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
@@ -1010,7 +1001,9 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
     Selecciona 1 prospecto pendiente:
     - WhatsApp no vacío
     - ESTATUS vacío o 'PENDIENTE'
-    - LAST_MESSAGE_AT vacío
+    - Reintenta automáticamente si ESTATUS = 'FALLO_ENVIO'
+      (aunque LAST_MESSAGE_AT tenga valor)
+    - Para cualquier otro ESTATUS != 'FALLO_ENVIO', requiere LAST_MESSAGE_AT vacío
     """
     i_name = _idx(headers, "Nombre")
     i_wa = _idx(headers, "WhatsApp")
@@ -1028,9 +1021,16 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
 
         if not wa:
             continue
-        if last_at:
+        # Regla de reintento (Opción 2):
+        # - Si ya hay LAST_MESSAGE_AT, normalmente se salta
+        # - PERO si ESTATUS=FALLO_ENVIO, se permite reintento aunque haya timestamp
+        if last_at and estatus != "FALLO_ENVIO":
             continue
-        if estatus and estatus not in ("PENDIENTE",):
+        # Permitimos:
+        # - vacío
+        # - PENDIENTE
+        # - FALLO_ENVIO (reintento)
+        if estatus and estatus not in ("PENDIENTE", "FALLO_ENVIO"):
             # si ya trae ENVIADO_INICIAL u otro, lo saltamos
             continue
 
