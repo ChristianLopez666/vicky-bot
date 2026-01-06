@@ -976,9 +976,24 @@ def _cell(row: List[str], i: Optional[int]) -> str:
     return (row[i] if i < len(row) else "") or ""
 
 def _normalize_to_e164_mx(phone_raw: str) -> str:
-    last10 = _normalize_phone_last10(phone_raw)
-    # WhatsApp Cloud API en MX: "52" + 10 dígitos
-    return f"52{last10}" if len(last10) == 10 else re.sub(r"\D", "", phone_raw)
+    digits = re.sub(r"\D", "", phone_raw or "")
+    last10 = _normalize_phone_last10(digits)
+
+    # WhatsApp Cloud API (MX):
+    # - móviles normalmente requieren "521" + 10 dígitos
+    # - algunos datos vienen como "52" + 10 dígitos; se corrige a "521"
+    if len(last10) == 10:
+        return f"521{last10}"
+
+    # Si ya viene con 52 + 10 dígitos, insertar el "1"
+    if digits.startswith("52") and len(digits) == 12:
+        return f"521{digits[2:]}"
+
+    # Si ya viene correcto (521 + 10 dígitos)
+    if digits.startswith("521") and len(digits) == 13:
+        return digits
+
+    return digits
 
 def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: List[str]) -> None:
     """Actualiza celdas por header (ej. ESTATUS, LAST_MESSAGE_AT). row_number_1based incluye header como fila 1."""
