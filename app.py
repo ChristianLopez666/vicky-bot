@@ -288,7 +288,12 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
 # Google Helpers
 # ==========================
 def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
-    """Busca el teléfono en cualquier columna del sheet y devuelve dict con rowIndex y nombre si lo encuentra."""
+    """Busca el teléfono (últimos 10 dígitos) y devuelve:
+    - row_number (1-based, incluye header como fila 1)
+    - nombre (si se detecta)
+    - raw (row completa)
+    - meta opcional por columnas si existen: ESTATUS, LAST_MESSAGE_AT, LAST_TEMPLATE, LAST_TEMPLATE_AT, CAMPAÑA
+    """
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         log.warning("⚠️ Sheets no disponible; no se puede hacer matching.")
         return None
@@ -296,19 +301,62 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
         rng = f"{SHEETS_TITLE_LEADS}!A:Z"
         values = sheets_svc.spreadsheets().values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
         rows = values.get("values", [])
-        phone_last10 = str(phone_last10)
-        
-        for idx, row in enumerate(rows, start=1):
-            joined = " | ".join(row)
+        phone_last10 = str(phone_last10 or "")
+
+        if not rows:
+            return None
+
+        headers = [str(h or "").strip() for h in rows[0]]
+        # Helpers para leer por header si existe
+        def _hidx(name: str) -> Optional[int]:
+            n = (name or "").strip().lower()
+            for i, h in enumerate(headers):
+                if (h or "").strip().lower() == n:
+                    return i
+            return None
+
+        i_nombre = _hidx("nombre") or _hidx("cliente")  # tolerancia
+        i_estatus = _hidx("estatus")
+        i_last = _hidx("last_message_at")
+        i_last_tpl = _hidx("last_template")
+        i_last_tpl_at = _hidx("last_template_at")
+        i_camp = _hidx("campaña") or _hidx("campana") or _hidx("sub-campaña") or _hidx("sub-campana")
+
+        for ridx, row in enumerate(rows[1:], start=2):  # fila real en sheets (1 = header)
+            joined = " | ".join([str(c or "") for c in row])
             digits = re.sub(r"\D", "", joined)
             if phone_last10 and phone_last10 in digits:
-                nombre = None
-                for cell in row:
-                    if cell and not re.search(r"\d", cell):
-                        nombre = cell.strip()
-                        break
-                log.info(f"✅ Cliente encontrado en Sheets: {nombre} ({phone_last10})")
-                return {"row": idx, "nombre": nombre or "", "raw": row}
+                # Nombre
+                nombre = ""
+                if i_nombre is not None and i_nombre < len(row):
+                    nombre = str(row[i_nombre] or "").strip()
+                if not nombre:
+                    # fallback: primera celda no numérica
+                    for cell in row:
+                        cell_s = str(cell or "").strip()
+                        if cell_s and not re.search(r"\d", cell_s):
+                            nombre = cell_s
+                            break
+
+                out: Dict[str, Any] = {
+                    "row_number": ridx,
+                    "nombre": nombre,
+                    "raw": row,
+                }
+                if i_estatus is not None and i_estatus < len(row):
+                    out["estatus"] = str(row[i_estatus] or "").strip()
+                if i_last is not None and i_last < len(row):
+                    out["last_message_at"] = str(row[i_last] or "").strip()
+                if i_last_tpl is not None and i_last_tpl < len(row):
+                    out["last_template"] = str(row[i_last_tpl] or "").strip()
+                if i_last_tpl_at is not None and i_last_tpl_at < len(row):
+                    out["last_template_at"] = str(row[i_last_tpl_at] or "").strip()
+                if i_camp is not None and i_camp < len(row):
+                    out["campana"] = str(row[i_camp] or "").strip()
+
+                log.info(f"✅ Cliente encontrado en Sheets: {nombre or '(sin nombre)'} ({phone_last10}) fila={ridx}")
+                return out
+
         log.info(f"ℹ️ Cliente no encontrado en Sheets: {phone_last10}")
         return None
     except Exception:
@@ -674,6 +722,24 @@ def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
 
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = text.strip().lower()
+    # Prioridad: si hay un flujo activo, NO interpretar números como menú general
+    st = user_state.get(phone, "")
+    if st.startswith("tpv_"):
+        _tpv_next(phone, text)
+        return
+    if st.startswith("imss_"):
+        _imss_next(phone, text)
+        return
+    if st.startswith("emp_"):
+        _emp_next(phone, text)
+        return
+    if st.startswith("fp_"):
+        _fp_next(phone, text)
+        return
+    if st.startswith("auto_"):
+        _auto_next(phone, text)
+        return
+
     if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
         imss_start(phone, match)
     elif t in ("2", "auto", "seguros de auto", "seguro auto"):
@@ -826,6 +892,28 @@ def webhook_receive():
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
 
         match = _greet_and_match(phone) if phone not in user_state else None
+        # Bootstrap de conversación por campaña (evita que '1' dispare IMSS cuando viene de plantilla TPV)
+        try:
+            if phone not in user_state and match:
+                last_tpl = (match.get("last_template") or "").strip().lower()
+                last_at_raw = (match.get("last_template_at") or match.get("last_message_at") or "").strip()
+
+                within_24h = False
+                if last_at_raw:
+                    try:
+                        dt = datetime.fromisoformat(last_at_raw.replace("Z", ""))
+                        within_24h = (datetime.utcnow() - dt) <= timedelta(hours=24)
+                    except Exception:
+                        within_24h = False
+
+                if within_24h and last_tpl in ("promo_tpv", "tpv", "tpv_promo"):
+                    if (msg.get("type") == "text") and ("text" in msg):
+                        txt_l = (msg["text"].get("body", "") or "").strip().lower()
+                        if txt_l in ("1", "2", "si", "sí", "no"):
+                            user_state[phone] = "tpv_wait_interest"
+        except Exception:
+            log.exception("Error en bootstrap de campaña")
+
 
         mtype = msg.get("type")
 
@@ -1131,21 +1219,26 @@ def _normalize_to_e164_mx(phone_raw: str) -> str:
     return digits
 
 def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: List[str]) -> None:
-    """Actualiza celdas por header (ej. ESTATUS, LAST_MESSAGE_AT). row_number_1based incluye header como fila 1."""
+    """Actualiza celdas por header (ej. ESTATUS, LAST_MESSAGE_AT).
+
+    Nota: si una columna no existe, se omite (no debe romper envíos).
+    row_number_1based incluye header como fila 1.
+    """
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         raise RuntimeError("Sheets no disponible para update.")
     data = []
     for col_name, value in updates.items():
         j = _idx(headers, col_name)
         if j is None:
-            raise RuntimeError(f"No existe columna '{col_name}' en el Sheet.")
-        # Columna A=1 => letra:
+            log.warning(f"⚠️ Columna '{col_name}' no existe en Sheet; se omite update.")
+            continue
         col_letter = chr(ord("A") + j)
         a1 = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_number_1based}"
         data.append({"range": a1, "values": [[value]]})
+    if not data:
+        return
     body = {"valueInputOption": "USER_ENTERED", "data": data}
     sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
-
 def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Dict[str, Any]]:
     """
     Selecciona 1 prospecto pendiente:
@@ -1224,7 +1317,10 @@ def ext_auto_send_one():
         now_iso = datetime.utcnow().isoformat()
         updates = {
             "ESTATUS": "ENVIADO_INICIAL" if ok else "FALLO_ENVIO",
-            "LAST_MESSAGE_AT": now_iso
+            "LAST_MESSAGE_AT": now_iso,
+            # Persistencia de campaña/plantilla para enrutar respuestas aunque el servicio reinicie
+            "LAST_TEMPLATE": template_name,
+            "LAST_TEMPLATE_AT": now_iso,
         }
         _update_row_cells(nxt["row_number"], updates, headers)
 
@@ -1240,4 +1336,3 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
-
