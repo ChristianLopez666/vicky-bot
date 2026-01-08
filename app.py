@@ -58,6 +58,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
 SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto")
+CONVERSATIONS_SHEET_TITLE = os.getenv("CONVERSATIONS_SHEET_TITLE", "Conversaciones")
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
 
 PORT = int(os.getenv("PORT", "5000"))
@@ -181,6 +182,7 @@ def send_message(to: str, text: str) -> bool:
             
             if resp.status_code == 200:
                 log.info(f"✅ Mensaje enviado exitosamente a {to}")
+                log_conversation("out", to, text=text, msg_type="text")
                 return True
             
             log.warning(f"⚠️ WPP send_message fallo {resp.status_code}: {resp.text[:200]}")
@@ -257,7 +259,8 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
 
             if resp.status_code == 200:
-                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
+                log.info(f"✅ Plantilla \'{template_name}\' enviada exitosamente a {to}")
+                log_conversation("out", to, msg_type="template", template=template_name, meta={"params": params if isinstance(params, (list, dict)) else None})
                 return True
 
             log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
@@ -333,6 +336,36 @@ def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
     except Exception:
         log.exception("❌ Error escribiendo seguimiento en Sheets")
 
+def log_conversation(direction: str, phone: str, text: str = "", *, msg_type: str = "", template: str = "", meta: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Registra conversación en Google Sheets (degradable).
+    Hoja: CONVERSATIONS_SHEET_TITLE
+    Columnas: timestamp_utc, direction, phone, msg_type, template, text, meta_json
+    """
+    try:
+        if not (google_ready and sheets_svc and SHEETS_ID_LEADS and CONVERSATIONS_SHEET_TITLE):
+            return
+        ts = datetime.utcnow().isoformat()
+        row = [
+            ts,
+            (direction or "").strip().lower(),
+            phone or "",
+            msg_type or "",
+            template or "",
+            (text or "")[:4000],
+            json.dumps(meta or {}, ensure_ascii=False)[:4000],
+        ]
+        sheets_svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range=f"{CONVERSATIONS_SHEET_TITLE}!A:G",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
+    except Exception:
+        # no romper el flujo por logging
+        log.exception("❌ Error registrando conversación en Sheets")
+
 def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
     """Ubica/crea subcarpeta dentro de DRIVE_PARENT_FOLDER_ID."""
     if not (google_ready and drive_svc and DRIVE_PARENT_FOLDER_ID):
@@ -393,7 +426,53 @@ MAIN_MENU = (
     "\nEscribe el número u opción (ej. 'imss', 'auto', 'empresarial', 'contactar')."
 )
 
+# ==========================
+# TPV (promo_tpv) — embudo rápido
+# ==========================
+def tpv_mark_pending(phone: str) -> None:
+    # Estado simple: esperar respuesta 1/2 (sí/no)
+    user_state[phone] = "tpv_wait"
+    _ensure_user(phone)["tpv_stage"] = "wait"
+
+def _tpv_next(phone: str, text: str) -> None:
+    st = user_state.get(phone, "")
+    if st != "tpv_wait":
+        return
+
+    t = (text or "").strip().lower()
+    positive = t in ("1", "si", "sí", "claro", "ok") or interpret_response(text) == "positive"
+    negative = t in ("2", "no", "no gracias") or interpret_response(text) == "negative"
+
+    if positive:
+        user_state[phone] = ""
+        send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime:\n1) ¿Tu *giro* (tipo de negocio)?\n2) ¿Promedio de ventas mensual con tarjeta? (aprox.)")
+        _ensure_user(phone)["tpv_stage"] = "datos"
+        user_state[phone] = "tpv_datos"
+        return
+
+    if negative:
+        user_state[phone] = ""
+        send_message(phone, "Entendido. Si más adelante te interesa, escribe *tpv* o *menú*.")
+        send_main_menu(phone)
+        return
+
+    # Si responde otra cosa
+    send_message(phone, "Para continuar, responde:\n1) Sí\n2) No")
+
+def _tpv_datos_next(phone: str, text: str) -> None:
+    st = user_state.get(phone, "")
+    if st != "tpv_datos":
+        return
+    data = _ensure_user(phone)
+    # Intento simple de capturar dos datos en un solo mensaje
+    data["tpv_info_raw"] = (text or "").strip()
+    send_message(phone, "✅ Gracias. Un asesor te contactará con una propuesta de terminal Inbursa.")
+    _notify_advisor(f"🔔 TPV — Interesado\nWhatsApp: {phone}\nInfo: {data.get('tpv_info_raw','')}")
+    user_state[phone] = ""
+    send_main_menu(phone)
+
 def send_main_menu(phone: str) -> None:
+
     log.info(f"📋 Enviando menú principal a {phone}")
     send_message(phone, MAIN_MENU)
 
@@ -615,12 +694,19 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
         send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
         send_main_menu(phone)
+    elif t in ("tpv", "terminal", "terminales", "pos"):
+        tpv_mark_pending(phone)
+        send_message(phone, "¿Te interesa información de *terminales Inbursa*?\n1) Sí\n2) No")
     elif t in ("menu", "menú", "inicio", "hola"):
         user_state[phone] = ""
         send_main_menu(phone)
     else:
         st = user_state.get(phone, "")
-        if st.startswith("imss_"):
+        if st == "tpv_wait":
+            _tpv_next(phone, text)
+        elif st == "tpv_datos":
+            _tpv_datos_next(phone, text)
+        elif st.startswith("imss_"):
             _imss_next(phone, text)
         elif st.startswith("emp_"):
             _emp_next(phone, text)
@@ -742,9 +828,36 @@ def webhook_receive():
         match = _greet_and_match(phone) if phone not in user_state else None
 
         mtype = msg.get("type")
+
+        # Respuestas interactivas (botones/listas)
+        if mtype == "button" and isinstance(msg.get("button"), dict):
+            btn_text = (msg.get("button") or {}).get("text", "") or (msg.get("button") or {}).get("payload", "")
+            btn_text = (btn_text or "").strip()
+            log.info(f"🔘 Button reply de {phone}: {btn_text}")
+            log_conversation("in", phone, text=btn_text, msg_type="button")
+            _route_command(phone, btn_text or "menú", match)
+            return jsonify({"ok": True}), 200
+
+        if mtype == "interactive" and isinstance(msg.get("interactive"), dict):
+            inter = msg.get("interactive") or {}
+            itype = (inter.get("type") or "").strip()
+            picked = ""
+            if itype == "button_reply" and isinstance(inter.get("button_reply"), dict):
+                br = inter.get("button_reply") or {}
+                picked = (br.get("title") or br.get("id") or "").strip()
+            elif itype == "list_reply" and isinstance(inter.get("list_reply"), dict):
+                lr = inter.get("list_reply") or {}
+                picked = (lr.get("title") or lr.get("id") or "").strip()
+
+            log.info(f"📌 Interactive reply de {phone}: {picked} (type={itype})")
+            log_conversation("in", phone, text=picked, msg_type="interactive", meta={"interactive_type": itype})
+            _route_command(phone, picked or "menú", match)
+            return jsonify({"ok": True}), 200
+
         if mtype == "text" and "text" in msg:
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
+            log_conversation("in", phone, text=text, msg_type="text")
 
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
@@ -1104,6 +1217,10 @@ def ext_auto_send_one():
 
         ok = send_template_message(to, template_name, {"nombre": nombre})
 
+        # Si es la campaña TPV, queda pendiente la respuesta 1/2
+        if ok and template_name == "promo_tpv":
+            tpv_mark_pending(to)
+
         now_iso = datetime.utcnow().isoformat()
         updates = {
             "ESTATUS": "ENVIADO_INICIAL" if ok else "FALLO_ENVIO",
@@ -1123,3 +1240,4 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
+
