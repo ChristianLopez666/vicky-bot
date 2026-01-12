@@ -284,6 +284,52 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
 # ==========================
 # Google Helpers
 # ==========================
+
+def send_template_message_components(to: str, template_name: str, components: List[Dict[str, Any]]) -> bool:
+    """Envía plantilla preaprobada usando components ya armados (header/body/buttons).
+
+    Se usa cuando la plantilla exige parámetros fuera del BODY (por ejemplo, header image variable).
+    """
+    if not (META_TOKEN and WPP_API_URL):
+        log.error("❌ WhatsApp no configurado para plantillas.")
+        return False
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": "es_MX"},
+            **({"components": components} if components else {})
+        }
+    }
+
+    for attempt in range(3):
+        try:
+            log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
+            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+
+            if resp.status_code == 200:
+                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
+                return True
+
+            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
+            if _should_retry(resp.status_code) and attempt < 2:
+                log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
+                _backoff(attempt)
+                continue
+            return False
+        except requests.exceptions.Timeout:
+            log.error(f"⏰ Timeout enviando plantilla '{template_name}' a {to}")
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+        except Exception as e:
+            log.exception(f"❌ Error enviando plantilla '{template_name}' a {to}: {e}")
+            return False
+
 def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
     """
     Busca el teléfono (últimos 10 dígitos) en el Sheet y devuelve:
@@ -1259,7 +1305,16 @@ def ext_auto_send_one():
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
 
-        ok = send_template_message(to, template_name, {"nombre": nombre})
+        if template_name == "seguro_auto_70":
+            # Esta plantilla exige HEADER con imagen variable + BODY con nombre
+            components = [
+                {"type": "header", "parameters": [{"type": "image", "image": {"id": "884297197421583"}}]},
+                {"type": "body", "parameters": [{"type": "text", "text": nombre}]},
+            ]
+            ok = send_template_message_components(to, template_name, components)
+        else:
+            # Default: usar parámetro posicional {{1}}
+            ok = send_template_message(to, template_name, [nombre])
 
         now_iso = datetime.utcnow().isoformat()
         estatus_val = "FALLO_ENVIO" if not ok else ("ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else "ENVIADO_INICIAL")
@@ -1281,4 +1336,3 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
-
