@@ -58,7 +58,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
 SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto")
-CONVERSATIONS_SHEET_TITLE = os.getenv("CONVERSATIONS_SHEET_TITLE", "Conversaciones")
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
 
 PORT = int(os.getenv("PORT", "5000"))
@@ -182,7 +181,6 @@ def send_message(to: str, text: str) -> bool:
             
             if resp.status_code == 200:
                 log.info(f"✅ Mensaje enviado exitosamente a {to}")
-                log_conversation("out", to, text=text, msg_type="text")
                 return True
             
             log.warning(f"⚠️ WPP send_message fallo {resp.status_code}: {resp.text[:200]}")
@@ -259,8 +257,7 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
 
             if resp.status_code == 200:
-                log.info(f"✅ Plantilla \'{template_name}\' enviada exitosamente a {to}")
-                log_conversation("out", to, msg_type="template", template=template_name, meta={"params": params if isinstance(params, (list, dict)) else None})
+                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
                 return True
 
             log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
@@ -288,76 +285,43 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
 # Google Helpers
 # ==========================
 def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
-    """Busca el teléfono (últimos 10 dígitos) y devuelve:
-    - row_number (1-based, incluye header como fila 1)
-    - nombre (si se detecta)
-    - raw (row completa)
-    - meta opcional por columnas si existen: ESTATUS, LAST_MESSAGE_AT, LAST_TEMPLATE, LAST_TEMPLATE_AT, CAMPAÑA
+    """
+    Busca el teléfono (últimos 10 dígitos) en el Sheet y devuelve:
+      - row: número de fila 1-based en Google Sheets
+      - nombre
+      - estatus (si existe la columna)
+      - last_message_at (si existe la columna)
+      - raw: fila completa
     """
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         log.warning("⚠️ Sheets no disponible; no se puede hacer matching.")
         return None
     try:
-        rng = f"{SHEETS_TITLE_LEADS}!A:Z"
-        values = sheets_svc.spreadsheets().values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
-        rows = values.get("values", [])
-        phone_last10 = str(phone_last10 or "")
-
-        if not rows:
+        headers, rows = _sheet_get_rows()  # usa el sheet principal (SHEETS_TITLE_LEADS)
+        if not headers:
             return None
 
-        headers = [str(h or "").strip() for h in rows[0]]
-        # Helpers para leer por header si existe
-        def _hidx(name: str) -> Optional[int]:
-            n = (name or "").strip().lower()
-            for i, h in enumerate(headers):
-                if (h or "").strip().lower() == n:
-                    return i
+        i_name = _idx(headers, "Nombre")
+        i_wa = _idx(headers, "WhatsApp")
+        i_status = _idx(headers, "ESTATUS")
+        i_last = _idx(headers, "LAST_MESSAGE_AT")
+
+        if i_wa is None:
+            log.warning("⚠️ No existe columna 'WhatsApp' en el Sheet.")
             return None
 
-        i_nombre = _hidx("nombre") or _hidx("cliente")  # tolerancia
-        i_estatus = _hidx("estatus")
-        i_last = _hidx("last_message_at")
-        i_last_tpl = _hidx("last_template")
-        i_last_tpl_at = _hidx("last_template_at")
-        i_camp = _hidx("campaña") or _hidx("campana") or _hidx("sub-campaña") or _hidx("sub-campana")
+        target = str(phone_last10).strip()
+        for k, row in enumerate(rows, start=2):  # fila 2 = primer registro
+            wa_cell = _cell(row, i_wa)
+            wa_last10 = _normalize_phone_last10(wa_cell)
+            if target and wa_last10 == target:
+                nombre = _cell(row, i_name).strip() if i_name is not None else ""
+                estatus = _cell(row, i_status).strip() if i_status is not None else ""
+                last_at = _cell(row, i_last).strip() if i_last is not None else ""
+                log.info(f"✅ Cliente encontrado en Sheets: {nombre} ({target})")
+                return {"row": k, "nombre": nombre, "estatus": estatus, "last_message_at": last_at, "raw": row}
 
-        for ridx, row in enumerate(rows[1:], start=2):  # fila real en sheets (1 = header)
-            joined = " | ".join([str(c or "") for c in row])
-            digits = re.sub(r"\D", "", joined)
-            if phone_last10 and phone_last10 in digits:
-                # Nombre
-                nombre = ""
-                if i_nombre is not None and i_nombre < len(row):
-                    nombre = str(row[i_nombre] or "").strip()
-                if not nombre:
-                    # fallback: primera celda no numérica
-                    for cell in row:
-                        cell_s = str(cell or "").strip()
-                        if cell_s and not re.search(r"\d", cell_s):
-                            nombre = cell_s
-                            break
-
-                out: Dict[str, Any] = {
-                    "row_number": ridx,
-                    "nombre": nombre,
-                    "raw": row,
-                }
-                if i_estatus is not None and i_estatus < len(row):
-                    out["estatus"] = str(row[i_estatus] or "").strip()
-                if i_last is not None and i_last < len(row):
-                    out["last_message_at"] = str(row[i_last] or "").strip()
-                if i_last_tpl is not None and i_last_tpl < len(row):
-                    out["last_template"] = str(row[i_last_tpl] or "").strip()
-                if i_last_tpl_at is not None and i_last_tpl_at < len(row):
-                    out["last_template_at"] = str(row[i_last_tpl_at] or "").strip()
-                if i_camp is not None and i_camp < len(row):
-                    out["campana"] = str(row[i_camp] or "").strip()
-
-                log.info(f"✅ Cliente encontrado en Sheets: {nombre or '(sin nombre)'} ({phone_last10}) fila={ridx}")
-                return out
-
-        log.info(f"ℹ️ Cliente no encontrado en Sheets: {phone_last10}")
+        log.info(f"ℹ️ Cliente no encontrado en Sheets: {target}")
         return None
     except Exception:
         log.exception("❌ Error buscando en Sheets")
@@ -383,36 +347,6 @@ def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
         log.info(f"✅ Seguimiento registrado en Sheets: {note}")
     except Exception:
         log.exception("❌ Error escribiendo seguimiento en Sheets")
-
-def log_conversation(direction: str, phone: str, text: str = "", *, msg_type: str = "", template: str = "", meta: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Registra conversación en Google Sheets (degradable).
-    Hoja: CONVERSATIONS_SHEET_TITLE
-    Columnas: timestamp_utc, direction, phone, msg_type, template, text, meta_json
-    """
-    try:
-        if not (google_ready and sheets_svc and SHEETS_ID_LEADS and CONVERSATIONS_SHEET_TITLE):
-            return
-        ts = datetime.utcnow().isoformat()
-        row = [
-            ts,
-            (direction or "").strip().lower(),
-            phone or "",
-            msg_type or "",
-            template or "",
-            (text or "")[:4000],
-            json.dumps(meta or {}, ensure_ascii=False)[:4000],
-        ]
-        sheets_svc.spreadsheets().values().append(
-            spreadsheetId=SHEETS_ID_LEADS,
-            range=f"{CONVERSATIONS_SHEET_TITLE}!A:G",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": [row]},
-        ).execute()
-    except Exception:
-        # no romper el flujo por logging
-        log.exception("❌ Error registrando conversación en Sheets")
 
 def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
     """Ubica/crea subcarpeta dentro de DRIVE_PARENT_FOLDER_ID."""
@@ -474,53 +408,7 @@ MAIN_MENU = (
     "\nEscribe el número u opción (ej. 'imss', 'auto', 'empresarial', 'contactar')."
 )
 
-# ==========================
-# TPV (promo_tpv) — embudo rápido
-# ==========================
-def tpv_mark_pending(phone: str) -> None:
-    # Estado simple: esperar respuesta 1/2 (sí/no)
-    user_state[phone] = "tpv_wait"
-    _ensure_user(phone)["tpv_stage"] = "wait"
-
-def _tpv_next(phone: str, text: str) -> None:
-    st = user_state.get(phone, "")
-    if st != "tpv_wait":
-        return
-
-    t = (text or "").strip().lower()
-    positive = t in ("1", "si", "sí", "claro", "ok") or interpret_response(text) == "positive"
-    negative = t in ("2", "no", "no gracias") or interpret_response(text) == "negative"
-
-    if positive:
-        user_state[phone] = ""
-        send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime:\n1) ¿Tu *giro* (tipo de negocio)?\n2) ¿Promedio de ventas mensual con tarjeta? (aprox.)")
-        _ensure_user(phone)["tpv_stage"] = "datos"
-        user_state[phone] = "tpv_datos"
-        return
-
-    if negative:
-        user_state[phone] = ""
-        send_message(phone, "Entendido. Si más adelante te interesa, escribe *tpv* o *menú*.")
-        send_main_menu(phone)
-        return
-
-    # Si responde otra cosa
-    send_message(phone, "Para continuar, responde:\n1) Sí\n2) No")
-
-def _tpv_datos_next(phone: str, text: str) -> None:
-    st = user_state.get(phone, "")
-    if st != "tpv_datos":
-        return
-    data = _ensure_user(phone)
-    # Intento simple de capturar dos datos en un solo mensaje
-    data["tpv_info_raw"] = (text or "").strip()
-    send_message(phone, "✅ Gracias. Un asesor te contactará con una propuesta de terminal Inbursa.")
-    _notify_advisor(f"🔔 TPV — Interesado\nWhatsApp: {phone}\nInfo: {data.get('tpv_info_raw','')}")
-    user_state[phone] = ""
-    send_main_menu(phone)
-
 def send_main_menu(phone: str) -> None:
-
     log.info(f"📋 Enviando menú principal a {phone}")
     send_message(phone, MAIN_MENU)
 
@@ -533,6 +421,138 @@ def _notify_advisor(text: str) -> None:
         send_message(ADVISOR_NUMBER, text)
     except Exception:
         log.exception("❌ Error notificando al asesor")
+
+# --- TPV / Terminal bancaria (solo cuando viene de plantilla promo_tpv) ---
+TPV_TEMPLATE_NAME = "promo_tpv"
+
+def _parse_dt_maybe(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    v = value.strip()
+    try:
+        # Soporta "2026-01-08T18:03:24.442624545Z"
+        if v.endswith("Z"):
+            v = v[:-1] + "+00:00"
+        return datetime.fromisoformat(v)
+    except Exception:
+        return None
+
+def _tpv_is_context(match: Optional[Dict[str, Any]]) -> bool:
+    """
+    TPV se activa únicamente si:
+    - existe match en Sheets
+    - ESTATUS == ENVIADO_TPV
+    - LAST_MESSAGE_AT dentro de 24h
+    """
+    if not match:
+        return False
+    if (match.get("estatus") or "").strip().upper() != "ENVIADO_TPV":
+        return False
+    dt = _parse_dt_maybe(match.get("last_message_at") or "")
+    if not dt:
+        return False
+    # Si dt viene con tz, normalizamos a UTC; si no, asumimos UTC.
+    if dt.tzinfo is not None:
+        now = datetime.now(dt.tzinfo)
+    else:
+        now = datetime.utcnow()
+    return (now - dt) <= timedelta(hours=24)
+
+def tpv_start_from_reply(phone: str, text: str, match: Optional[Dict[str, Any]]) -> bool:
+    """
+    Procesa la respuesta inmediata del prospecto al mensaje TPV (plantilla):
+      - 1 / sí => pide solo giro => horario => notifica => cierra
+      - 2 / no => pide motivo (opcional) => cierra
+    Retorna True si consumió el mensaje (no debe seguir al menú general).
+    """
+    t = (text or "").strip().lower()
+    intent = interpret_response(text)
+
+    # Determina elección
+    if t == "1" or intent == "positive":
+        user_state[phone] = "tpv_giro"
+        send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+        return True
+
+    if t == "2" or intent == "negative":
+        user_state[phone] = "tpv_motivo"
+        send_message(phone, "Entendido. ¿Cuál fue el *motivo*? (opcional). Si no deseas responder, escribe *omitir*.")
+        return True
+
+    return False
+
+def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
+    st = user_state.get(phone, "")
+    data = _ensure_user(phone)
+
+    # Nombre para notificación (si existe)
+    nombre = ""
+    if match and match.get("nombre"):
+        nombre = match["nombre"].strip()
+
+    if st == "tpv_giro":
+        giro = (text or "").strip()
+        if not giro:
+            send_message(phone, "Solo indícame tu *giro* (ej. restaurante, abarrotes, consultorio).")
+            return
+        data["tpv_giro"] = giro
+        user_state[phone] = "tpv_horario"
+        send_message(phone, "¿Qué *horario* te conviene para que Christian te contacte? (ej. hoy 4pm, mañana 10am)")
+        return
+
+    if st == "tpv_horario":
+        horario = (text or "").strip()
+        if not horario:
+            send_message(phone, "Indícame un *horario* (ej. hoy 4pm, mañana 10am).")
+            return
+        data["tpv_horario"] = horario
+
+        resumen = (
+            "✅ Listo. En breve Christian te contactará para ofrecerte la mejor opción de terminal.\n"
+            f"- Giro: {data.get('tpv_giro','')}\n"
+            f"- Horario: {data.get('tpv_horario','')}"
+        )
+        send_message(phone, resumen)
+
+        aviso = (
+            "🔔 TPV — Prospecto interesado\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {nombre or '(sin nombre)'}\n"
+            f"Giro: {data.get('tpv_giro','')}\n"
+            f"Horario: {data.get('tpv_horario','')}"
+        )
+
+        _notify_advisor(aviso)
+
+        # Opcional: marcar estatus si existe row
+        try:
+            if match and match.get("row"):
+                headers, _ = _sheet_get_rows()
+                if headers and _idx(headers, "ESTATUS") is not None:
+                    _update_row_cells(int(match["row"]), {"ESTATUS": "TPV_INTERESADO"}, headers)
+        except Exception:
+            log.exception("⚠️ No fue posible actualizar ESTATUS TPV_INTERESADO")
+
+        user_state[phone] = ""
+        return
+
+    if st == "tpv_motivo":
+        motivo = (text or "").strip()
+        if motivo.lower() == "omitir":
+            motivo = ""
+        data["tpv_motivo"] = motivo
+
+        send_message(phone, "Gracias por tu respuesta. Si más adelante deseas una terminal, aquí estaré para ayudarte.")
+        try:
+            if match and match.get("row"):
+                headers, _ = _sheet_get_rows()
+                if headers and _idx(headers, "ESTATUS") is not None:
+                    _update_row_cells(int(match["row"]), {"ESTATUS": "TPV_NO_INTERESADO"}, headers)
+        except Exception:
+            log.exception("⚠️ No fue posible actualizar ESTATUS TPV_NO_INTERESADO")
+
+        user_state[phone] = ""
+        return
 
 # --- IMSS (opción 1) ---
 def imss_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
@@ -722,23 +742,15 @@ def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
 
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = text.strip().lower()
-    # Prioridad: si hay un flujo activo, NO interpretar números como menú general
     st = user_state.get(phone, "")
+
+    # TPV tiene prioridad si el prospecto viene de la plantilla promo_tpv
     if st.startswith("tpv_"):
-        _tpv_next(phone, text)
+        _tpv_next(phone, text, match)
         return
-    if st.startswith("imss_"):
-        _imss_next(phone, text)
-        return
-    if st.startswith("emp_"):
-        _emp_next(phone, text)
-        return
-    if st.startswith("fp_"):
-        _fp_next(phone, text)
-        return
-    if st.startswith("auto_"):
-        _auto_next(phone, text)
-        return
+    if _tpv_is_context(match):
+        if tpv_start_from_reply(phone, text, match):
+            return
 
     if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
         imss_start(phone, match)
@@ -760,19 +772,12 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
         send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
         send_main_menu(phone)
-    elif t in ("tpv", "terminal", "terminales", "pos"):
-        tpv_mark_pending(phone)
-        send_message(phone, "¿Te interesa información de *terminales Inbursa*?\n1) Sí\n2) No")
     elif t in ("menu", "menú", "inicio", "hola"):
         user_state[phone] = ""
         send_main_menu(phone)
     else:
         st = user_state.get(phone, "")
-        if st == "tpv_wait":
-            _tpv_next(phone, text)
-        elif st == "tpv_datos":
-            _tpv_datos_next(phone, text)
-        elif st.startswith("imss_"):
+        if st.startswith("imss_"):
             _imss_next(phone, text)
         elif st.startswith("emp_"):
             _emp_next(phone, text)
@@ -892,60 +897,11 @@ def webhook_receive():
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
 
         match = _greet_and_match(phone) if phone not in user_state else None
-        # Bootstrap de conversación por campaña (evita que '1' dispare IMSS cuando viene de plantilla TPV)
-        try:
-            if phone not in user_state and match:
-                last_tpl = (match.get("last_template") or "").strip().lower()
-                last_at_raw = (match.get("last_template_at") or match.get("last_message_at") or "").strip()
-
-                within_24h = False
-                if last_at_raw:
-                    try:
-                        dt = datetime.fromisoformat(last_at_raw.replace("Z", ""))
-                        within_24h = (datetime.utcnow() - dt) <= timedelta(hours=24)
-                    except Exception:
-                        within_24h = False
-
-                if within_24h and last_tpl in ("promo_tpv", "tpv", "tpv_promo"):
-                    if (msg.get("type") == "text") and ("text" in msg):
-                        txt_l = (msg["text"].get("body", "") or "").strip().lower()
-                        if txt_l in ("1", "2", "si", "sí", "no"):
-                            user_state[phone] = "tpv_wait_interest"
-        except Exception:
-            log.exception("Error en bootstrap de campaña")
-
 
         mtype = msg.get("type")
-
-        # Respuestas interactivas (botones/listas)
-        if mtype == "button" and isinstance(msg.get("button"), dict):
-            btn_text = (msg.get("button") or {}).get("text", "") or (msg.get("button") or {}).get("payload", "")
-            btn_text = (btn_text or "").strip()
-            log.info(f"🔘 Button reply de {phone}: {btn_text}")
-            log_conversation("in", phone, text=btn_text, msg_type="button")
-            _route_command(phone, btn_text or "menú", match)
-            return jsonify({"ok": True}), 200
-
-        if mtype == "interactive" and isinstance(msg.get("interactive"), dict):
-            inter = msg.get("interactive") or {}
-            itype = (inter.get("type") or "").strip()
-            picked = ""
-            if itype == "button_reply" and isinstance(inter.get("button_reply"), dict):
-                br = inter.get("button_reply") or {}
-                picked = (br.get("title") or br.get("id") or "").strip()
-            elif itype == "list_reply" and isinstance(inter.get("list_reply"), dict):
-                lr = inter.get("list_reply") or {}
-                picked = (lr.get("title") or lr.get("id") or "").strip()
-
-            log.info(f"📌 Interactive reply de {phone}: {picked} (type={itype})")
-            log_conversation("in", phone, text=picked, msg_type="interactive", meta={"interactive_type": itype})
-            _route_command(phone, picked or "menú", match)
-            return jsonify({"ok": True}), 200
-
         if mtype == "text" and "text" in msg:
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
-            log_conversation("in", phone, text=text, msg_type="text")
 
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
@@ -1219,26 +1175,21 @@ def _normalize_to_e164_mx(phone_raw: str) -> str:
     return digits
 
 def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: List[str]) -> None:
-    """Actualiza celdas por header (ej. ESTATUS, LAST_MESSAGE_AT).
-
-    Nota: si una columna no existe, se omite (no debe romper envíos).
-    row_number_1based incluye header como fila 1.
-    """
+    """Actualiza celdas por header (ej. ESTATUS, LAST_MESSAGE_AT). row_number_1based incluye header como fila 1."""
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         raise RuntimeError("Sheets no disponible para update.")
     data = []
     for col_name, value in updates.items():
         j = _idx(headers, col_name)
         if j is None:
-            log.warning(f"⚠️ Columna '{col_name}' no existe en Sheet; se omite update.")
-            continue
+            raise RuntimeError(f"No existe columna '{col_name}' en el Sheet.")
+        # Columna A=1 => letra:
         col_letter = chr(ord("A") + j)
         a1 = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_number_1based}"
         data.append({"range": a1, "values": [[value]]})
-    if not data:
-        return
     body = {"valueInputOption": "USER_ENTERED", "data": data}
     sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
+
 def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Dict[str, Any]]:
     """
     Selecciona 1 prospecto pendiente:
@@ -1310,17 +1261,11 @@ def ext_auto_send_one():
 
         ok = send_template_message(to, template_name, {"nombre": nombre})
 
-        # Si es la campaña TPV, queda pendiente la respuesta 1/2
-        if ok and template_name == "promo_tpv":
-            tpv_mark_pending(to)
-
         now_iso = datetime.utcnow().isoformat()
+        estatus_val = "FALLO_ENVIO" if not ok else ("ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else "ENVIADO_INICIAL")
         updates = {
-            "ESTATUS": "ENVIADO_INICIAL" if ok else "FALLO_ENVIO",
-            "LAST_MESSAGE_AT": now_iso,
-            # Persistencia de campaña/plantilla para enrutar respuestas aunque el servicio reinicie
-            "LAST_TEMPLATE": template_name,
-            "LAST_TEMPLATE_AT": now_iso,
+            "ESTATUS": estatus_val,
+            "LAST_MESSAGE_AT": now_iso
         }
         _update_row_cells(nxt["row_number"], updates, headers)
 
@@ -1336,3 +1281,5 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
