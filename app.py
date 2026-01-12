@@ -203,7 +203,7 @@ def send_message(to: str, text: str) -> bool:
             return False
     return False
 
-def def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
+def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
     if not (META_TOKEN and WPP_API_URL):
         return False
 
@@ -1261,6 +1261,7 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 
