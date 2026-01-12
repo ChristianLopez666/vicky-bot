@@ -203,11 +203,13 @@ def send_message(to: str, text: str) -> bool:
             return False
     return False
 
-def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
-    """Envía plantilla preaprobada.
+def send_template_message(to: str, template_name: str, params: Dict | List, header_image: Optional[Dict[str, str] | str]=None) -> bool:
+    """
+    Envía plantilla preaprobada por WhatsApp Cloud API.
 
-    - Si `params` es list => parámetros posicionales ({{1}}, {{2}}, ...).
-    - Si `params` es dict => parámetros nombrados ({{nombre}}, {{monto}}, ...), usando `parameter_name`.
+    - BODY: usa SIEMPRE parámetros posicionales ({{1}}, {{2}}, ...). Esto evita mismatches por `parameter_name`.
+    - HEADER (opcional): imagen por `id` o `link` (según lo aprobado en la plantilla).
+      - header_image puede ser dict {"id": "..."} o {"link": "..."} o un string URL (link).
     """
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
@@ -215,91 +217,48 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
 
     components: List[Dict[str, Any]] = []
 
-    # BODY parameters
-    if isinstance(params, dict):
-        # Named params: un solo componente body con parameters que incluyen parameter_name
-        body_params = []
-        for k, v in params.items():
-            key = str(k).strip()
-            if not key:
-                continue
-            body_params.append({
-                "type": "text",
-                "parameter_name": key,
-                "text": str(v)
-            })
-        if body_params:
-            components.append({"type": "body", "parameters": body_params})
-    elif isinstance(params, list):
-        # Positional params: un solo componente body
-        components.append({
-            "type": "body",
-            "parameters": [{"type": "text", "text": str(x)} for x in params]
-        })
+    # HEADER image (si aplica)
+    if header_image:
+        if isinstance(header_image, str):
+            header_image = {"link": header_image}
+        if isinstance(header_image, dict):
+            img_obj: Dict[str, str] = {}
+            if header_image.get("id"):
+                img_obj["id"] = str(header_image["id"])
+            elif header_image.get("link"):
+                img_obj["link"] = str(header_image["link"])
+            if img_obj:
+                components.append({
+                    "type": "header",
+                    "parameters": [{
+                        "type": "image",
+                        "image": img_obj
+                    }]
+                })
+
+    # BODY parameters (posicional)
+    body_values: List[Any] = []
+    if isinstance(params, list):
+        body_values = params
+    elif isinstance(params, dict):
+        # Si llega dict, tomamos solo valores (orden estable en Py3.7+).
+        body_values = list(params.values())
     else:
-        # Sin parámetros
-        components = []
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        "template": {
-            "name": template_name,
-            "language": {"code": "es_MX"},
-            **({"components": components} if components else {})
-        }
-    }
-
-    for attempt in range(3):
-        try:
-            log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
-            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-
-            if resp.status_code == 200:
-                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
-                return True
-
-            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
-            if _should_retry(resp.status_code) and attempt < 2:
-                log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
-                _backoff(attempt)
-                continue
-            return False
-        except requests.exceptions.Timeout:
-            log.error(f"⏰ Timeout enviando plantilla a {to} (intento {attempt + 1})")
-            if attempt < 2:
-                _backoff(attempt)
-                continue
-            return False
-        except Exception:
-            log.exception(f"❌ Error en send_template_message a {to}")
-            if attempt < 2:
-                _backoff(attempt)
-                continue
-            return False
-    return False
-
-
-# ==========================
-# Google Helpers
-# ==========================
-
-def send_template_message_components(to: str, template_name: str, components: List[Dict[str, Any]]) -> bool:
-    """Envía plantilla preaprobada usando components ya armados (header/body/buttons).
-
-    Se usa cuando la plantilla exige parámetros fuera del BODY (por ejemplo, header image variable).
-    """
-    if not (META_TOKEN and WPP_API_URL):
-        log.error("❌ WhatsApp no configurado para plantillas.")
+        log.error("❌ params inválidos para plantilla.")
         return False
 
+    if body_values:
+        components.append({
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(v)} for v in body_values]
+        })
+
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to": str(to),
         "type": "template",
         "template": {
-            "name": template_name,
+            "name": str(template_name),
             "language": {"code": "es_MX"},
             **({"components": components} if components else {})
         }
@@ -308,70 +267,14 @@ def send_template_message_components(to: str, template_name: str, components: Li
     for attempt in range(3):
         try:
             log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
-            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-
-            if resp.status_code == 200:
-                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
+            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=20)
+            if resp.status_code in (200, 201):
                 return True
-
-            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
-            if _should_retry(resp.status_code) and attempt < 2:
-                log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
-                _backoff(attempt)
-                continue
-            return False
-        except requests.exceptions.Timeout:
-            log.error(f"⏰ Timeout enviando plantilla '{template_name}' a {to}")
-            if attempt < 2:
-                _backoff(attempt)
-                continue
-            return False
+            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:500]}")
         except Exception as e:
-            log.exception(f"❌ Error enviando plantilla '{template_name}' a {to}: {e}")
-            return False
-
-def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
-    """
-    Busca el teléfono (últimos 10 dígitos) en el Sheet y devuelve:
-      - row: número de fila 1-based en Google Sheets
-      - nombre
-      - estatus (si existe la columna)
-      - last_message_at (si existe la columna)
-      - raw: fila completa
-    """
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
-        log.warning("⚠️ Sheets no disponible; no se puede hacer matching.")
-        return None
-    try:
-        headers, rows = _sheet_get_rows()  # usa el sheet principal (SHEETS_TITLE_LEADS)
-        if not headers:
-            return None
-
-        i_name = _idx(headers, "Nombre")
-        i_wa = _idx(headers, "WhatsApp")
-        i_status = _idx(headers, "ESTATUS")
-        i_last = _idx(headers, "LAST_MESSAGE_AT")
-
-        if i_wa is None:
-            log.warning("⚠️ No existe columna 'WhatsApp' en el Sheet.")
-            return None
-
-        target = str(phone_last10).strip()
-        for k, row in enumerate(rows, start=2):  # fila 2 = primer registro
-            wa_cell = _cell(row, i_wa)
-            wa_last10 = _normalize_phone_last10(wa_cell)
-            if target and wa_last10 == target:
-                nombre = _cell(row, i_name).strip() if i_name is not None else ""
-                estatus = _cell(row, i_status).strip() if i_status is not None else ""
-                last_at = _cell(row, i_last).strip() if i_last is not None else ""
-                log.info(f"✅ Cliente encontrado en Sheets: {nombre} ({target})")
-                return {"row": k, "nombre": nombre, "estatus": estatus, "last_message_at": last_at, "raw": row}
-
-        log.info(f"ℹ️ Cliente no encontrado en Sheets: {target}")
-        return None
-    except Exception:
-        log.exception("❌ Error buscando en Sheets")
-        return None
+            log.warning(f"⚠️ Excepción enviando plantilla: {e}")
+        time.sleep(1.2 * (attempt + 1))
+    return False
 
 def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
     """Registra una nota en una hoja 'Seguimiento' (append)."""
@@ -1305,15 +1208,11 @@ def ext_auto_send_one():
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
 
+        header_link = os.getenv("SEGURO_AUTO_70_HEADER_LINK", "https://res.cloudinary.com/dxze6tqlu/image/upload/autotal_efb2fz.jpg")
+
         if template_name == "seguro_auto_70":
-            # Esta plantilla exige HEADER con imagen variable + BODY con nombre
-            components = [
-                {"type": "header", "parameters": [{"type": "image", "image": {"id": "884297197421583"}}]},
-                {"type": "body", "parameters": [{"type": "text", "text": nombre}]},
-            ]
-            ok = send_template_message_components(to, template_name, components)
+            ok = send_template_message(to, template_name, [nombre], header_image=header_link)
         else:
-            # Default: usar parámetro posicional {{1}}
             ok = send_template_message(to, template_name, [nombre])
 
         now_iso = datetime.utcnow().isoformat()
@@ -1336,3 +1235,4 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
+
