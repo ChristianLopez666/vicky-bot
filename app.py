@@ -1243,10 +1243,7 @@ def ext_auto_send_one():
         ok = send_template_message(
     to,
     template_name,
-    {
-        "header": [nombre],
-        "body": [nombre]   # ← body {{1}}
-    }
+    [nombre]   # body {{nombre}}
 )
 
         now_iso = datetime.utcnow().isoformat()
@@ -1269,4 +1266,5 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
