@@ -203,118 +203,87 @@ def send_message(to: str, text: str) -> bool:
             return False
     return False
 
+def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
+    """Envía plantilla preaprobada.
 
-def send_template_message(to: str, template_name: str, params: Any = None) -> bool:
-    """Envía una plantilla de WhatsApp (Meta Cloud API).
-
-    Soporta:
-    - params como lista -> body posicional ({{1}}, {{2}}...)
-    - params como dict:
-        - header: list[str] (texto) o {"type":"image","link": "..."} o {"type":"document","link":"...","filename":"..."}
-        - body: list[str] (posicional)
-        - body_named: dict[str,str] (variables nombradas, ej. {"nombre":"Yomero"})
+    - Si `params` es list => parámetros posicionales ({{1}}, {{2}}, ...).
+    - Si `params` es dict => parámetros nombrados ({{nombre}}, {{monto}}, ...), usando `parameter_name`.
     """
-    if not (META_TOKEN and PHONE_NUMBER_ID):
-        logger.error("❌ Falta META_TOKEN o PHONE_NUMBER_ID")
+    if not (META_TOKEN and WPP_API_URL):
+        log.error("❌ WhatsApp no configurado para plantillas.")
         return False
 
-    components: list[dict] = []
+    components: List[Dict[str, Any]] = []
 
-    # ---- Construcción de componentes ----
+    # BODY parameters
     if isinstance(params, dict):
-        # HEADER
-        if "header" in params and params.get("header") is not None:
-            h = params.get("header")
-            if isinstance(h, dict):
-                h_type = (h.get("type") or "").lower().strip()
-                if h_type == "image" and h.get("link"):
-                    components.append({
-                        "type": "header",
-                        "parameters": [{"type": "image", "image": {"link": str(h["link"])}}]
-                    })
-                elif h_type == "document" and h.get("link"):
-                    doc_obj = {"link": str(h["link"])}
-                    if h.get("filename"):
-                        doc_obj["filename"] = str(h["filename"])
-                    components.append({
-                        "type": "header",
-                        "parameters": [{"type": "document", "document": doc_obj}]
-                    })
-                elif h_type == "text":
-                    txt = str(h.get("text") or "")
-                    components.append({
-                        "type": "header",
-                        "parameters": [{"type": "text", "text": txt}]
-                    })
-            elif isinstance(h, list):
-                # header texto posicional (raro, pero soportado)
-                components.append({
-                    "type": "header",
-                    "parameters": [{"type": "text", "text": str(x)} for x in h]
-                })
-            elif isinstance(h, str) and h.strip():
-                # Si te pasan un string, lo tratamos como link de imagen (caso más común)
-                components.append({
-                    "type": "header",
-                    "parameters": [{"type": "image", "image": {"link": h.strip()}}]
-                })
-
-        # BODY (nombrado)
-        if "body_named" in params and isinstance(params.get("body_named"), dict) and params["body_named"]:
-            body_named: dict = params["body_named"]
-            body_params = []
-            for k, v in body_named.items():
-                body_params.append({"type": "text", "text": str(v), "parameter_name": str(k)})
-            components.append({"type": "body", "parameters": body_params})
-
-        # BODY (posicional)
-        elif "body" in params and isinstance(params.get("body"), list) and params["body"]:
-            components.append({
-                "type": "body",
-                "parameters": [{"type": "text", "text": str(x)} for x in params["body"]]
+        # Named params: un solo componente body con parameters que incluyen parameter_name
+        body_params = []
+        for k, v in params.items():
+            key = str(k).strip()
+            if not key:
+                continue
+            body_params.append({
+                "type": "text",
+                "parameter_name": key,
+                "text": str(v)
             })
-
-    elif isinstance(params, list) and params:
-        # body posicional
+        if body_params:
+            components.append({"type": "body", "parameters": body_params})
+    elif isinstance(params, list):
+        # Positional params: un solo componente body
         components.append({
             "type": "body",
             "parameters": [{"type": "text", "text": str(x)} for x in params]
         })
+    else:
+        # Sin parámetros
+        components = []
 
-    payload: dict = {
+    payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "template",
         "template": {
             "name": template_name,
             "language": {"code": "es_MX"},
+            **({"components": components} if components else {})
         }
     }
-    if components:
-        payload["template"]["components"] = components
 
-    url = f"https://graph.facebook.com/v24.0/{PHONE_NUMBER_ID}/messages"
-
-    for attempt in range(1, 4):
+    for attempt in range(3):
         try:
-            logger.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt})")
-            r = requests.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {META_TOKEN}",
-                    "Content-Type": "application/json"
-                },
-                json=payload,
-                timeout=20
-            )
-            if r.status_code == 200:
-                return True
-            logger.warning(f"⚠️ WPP send_template fallo {r.status_code}: {r.text[:300]}")
-        except Exception as e:
-            logger.exception(f"❌ Excepción enviando plantilla: {e}")
-        time.sleep(1.2 * attempt)
+            log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
+            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
 
+            if resp.status_code == 200:
+                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
+                return True
+
+            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
+            if _should_retry(resp.status_code) and attempt < 2:
+                log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
+                _backoff(attempt)
+                continue
+            return False
+        except requests.exceptions.Timeout:
+            log.error(f"⏰ Timeout enviando plantilla a {to} (intento {attempt + 1})")
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+        except Exception:
+            log.exception(f"❌ Error en send_template_message a {to}")
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
     return False
+
+
+# ==========================
+# Google Helpers
+# ==========================
 def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
     """
     Busca el teléfono (últimos 10 dígitos) en el Sheet y devuelve:
@@ -1263,66 +1232,52 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
 
     return None
 
-@app.route("/ext/auto-send-one", methods=["POST"])
+@app.post("/ext/auto-send-one")
 def ext_auto_send_one():
-    # Seguridad: token compartido para cron jobs / envíos automáticos
-    token = request.headers.get("X-AUTO-TOKEN", "")
-    if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    """
+    Endpoint para cron: envía 1 plantilla al siguiente prospecto pendiente.
+    Protegido por header: X-AUTO-TOKEN = AUTO_SEND_TOKEN
+    """
+    try:
+        token = (request.headers.get("X-AUTO-TOKEN") or "").strip()
+        if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    payload = request.get_json(silent=True) or {}
-    template_name = str(payload.get("template", "")).strip()
-    if not template_name:
-        return jsonify({"ok": False, "error": "missing_template"}), 400
+        body = request.get_json(force=True, silent=True) or {}
+        template_name = str(body.get("template", "")).strip()
+        if not template_name:
+            return jsonify({"ok": False, "error": "Falta 'template'"}), 400
 
-    # 1) Obtener siguiente lead pendiente desde Sheets
-    rows = _sheet_get_rows()
-    nxt = _pick_next_pending(rows)
-    if not nxt:
-        return jsonify({"ok": True, "sent": False, "reason": "no_pending"}), 200
+        headers, rows = _sheet_get_rows()
+        if not headers:
+            return jsonify({"ok": False, "error": "Sheet vacío"}), 400
 
-    # 2) Datos básicos
-    nombre = str(nxt.get("Nombre") or nxt.get("nombre") or "").strip()
-    to = str(nxt.get("WhatsApp") or nxt.get("whatsapp") or "").strip()
-    row_num = int(nxt.get("_row", 0) or 0)
+        nxt = _pick_next_pending(headers, rows)
+        if not nxt:
+            return jsonify({"ok": True, "sent": False, "reason": "no_pending"}), 200
 
-    if not to:
-        return jsonify({"ok": True, "sent": False, "reason": "missing_to", "row": row_num, "nombre": nombre}), 200
+        to = _normalize_to_e164_mx(nxt["whatsapp"])
+        nombre = (nxt["nombre"] or "").strip() or "Cliente"
 
-    # 3) Construir params según plantilla
-    # Nota: 'seguro_auto_70' usa variable NOMBRADA {{nombre}} y encabezado de IMAGEN -> requiere:
-    # - body con parameter_name='nombre'
-    # - header image con link
-    if template_name == "seguro_auto_70":
-        img_link = (
-            os.getenv("SEGURO_AUTO_70_IMAGE_URL")
-            or os.getenv("AUTO_SEND_IMAGE_URL")
-            or "https://res.cloudinary.com/dxze6tqlu/image/upload/v1766011904/autotal_efb2fz.jpg"
-        )
-        params = {
-            "header": {"type": "image", "link": img_link},
-            "body_named": {"nombre": (nombre or "Cliente")}
+        ok = send_template_message(to, template_name, {"nombre": nombre})
+
+        now_iso = datetime.utcnow().isoformat()
+        estatus_val = "FALLO_ENVIO" if not ok else ("ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else "ENVIADO_INICIAL")
+        updates = {
+            "ESTATUS": estatus_val,
+            "LAST_MESSAGE_AT": now_iso
         }
-    else:
-        # Plantillas con variables posicionales
-        params = [nombre] if nombre else []
+        _update_row_cells(nxt["row_number"], updates, headers)
 
-    # 4) Enviar
-    ok = send_template_message(to, template_name, params=params)
+        return jsonify({
+            "ok": True,
+            "sent": bool(ok),
+            "to": to,
+            "row": nxt["row_number"],
+            "nombre": nombre,
+            "timestamp": now_iso
+        }), 200
 
-    # 5) Marcar como enviado en Sheets
-    if ok and row_num:
-        now = datetime.utcnow().isoformat()
-        _sheet_update_row(row_num, {
-            "FirstSentAt": now,
-            "Estatus": "ENVIADO"
-        })
-
-    return jsonify({
-        "ok": True,
-        "sent": bool(ok),
-        "timestamp": datetime.utcnow().isoformat(),
-        "to": to,
-        "nombre": nombre,
-        "row": row_num
-    }), 200
+    except Exception as e:
+        log.exception("❌ Error en /ext/auto-send-one")
+        return jsonify({"ok": False, "error": str(e)}), 500
