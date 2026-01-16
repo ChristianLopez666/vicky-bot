@@ -203,6 +203,7 @@ def send_message(to: str, text: str) -> bool:
             return False
     return False
 
+
 def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
     """Envía plantilla preaprobada.
 
@@ -212,6 +213,85 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
         return False
+
+    components: List[Dict[str, Any]] = []
+
+    # HEADER image (solo plantillas con imagen fija)
+    if template_name == "seguro_auto_70":
+        image_url = os.getenv("SEGURO_AUTO_70_IMAGE_URL")
+        if not image_url:
+            log.error("❌ Falta SEGURO_AUTO_70_IMAGE_URL en entorno.")
+            return False
+        components.append({
+            "type": "header",
+            "parameters": [{
+                "type": "image",
+                "image": {"link": image_url}
+            }]
+        })
+
+    # BODY parameters
+    if isinstance(params, dict):
+        body_params = []
+        for k, v in params.items():
+            body_params.append({
+                "type": "text",
+                "parameter_name": k,
+                "text": str(v)
+            })
+        if body_params:
+            components.append({
+                "type": "body",
+                "parameters": body_params
+            })
+    elif isinstance(params, list):
+        body_params = [{"type": "text", "text": str(v)} for v in params]
+        if body_params:
+            components.append({
+                "type": "body",
+                "parameters": body_params
+            })
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": "es_MX"},
+            **({"components": components} if components else {})
+        }
+    }
+
+    for attempt in range(3):
+        try:
+            log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
+            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+
+            if resp.status_code == 200:
+                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
+                return True
+
+            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
+            if _should_retry(resp.status_code) and attempt < 2:
+                log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
+                _backoff(attempt)
+                continue
+            return False
+        except requests.exceptions.Timeout:
+            log.error(f"⏰ Timeout enviando plantilla a {to} (intento {attempt + 1})")
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+        except Exception:
+            log.exception(f"❌ Error en send_template_message a {to}")
+            if attempt < 2:
+                _backoff(attempt)
+                continue
+            return False
+    return False
+
 
     components: List[Dict[str, Any]] = []
 
