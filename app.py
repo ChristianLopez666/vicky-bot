@@ -980,6 +980,36 @@ def webhook_receive():
 
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
+
+            # =========================================================
+            # 🔔 DETECCIÓN DE INTERÉS / DUDA POST-PLANTILLA (GLOBAL)
+            # =========================================================
+            t_lower = text.lower().strip()
+            VALID_COMMANDS = {
+                "1","2","3","4","5","6","7",
+                "menu","menú","inicio","hola",
+                "imss","ley 73","prestamo","préstamo","pension","pensión",
+                "auto","seguro auto","seguros de auto",
+                "vida","salud","seguro de vida","seguro de salud",
+                "vrim","tarjeta medica","tarjeta médica",
+                "empresarial","pyme","credito empresarial","crédito empresarial",
+                "financiamiento","financiamiento practico","financiamiento práctico",
+                "contactar","asesor","contactar con christian"
+            }
+
+            if (
+                not t_lower.isdigit()
+                and t_lower not in VALID_COMMANDS
+                and not user_state.get(phone)
+            ):
+                aviso = (
+                    "📩 Cliente INTERESADO / DUDA detectada\n"
+                    f"WhatsApp: {phone}\n"
+                    f"Mensaje: {text}"
+                )
+                _notify_advisor(aviso)
+            # =========================================================
+
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
 
