@@ -613,7 +613,7 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
         except Exception:
             log.exception("⚠️ No fue posible actualizar ESTATUS TPV_INTERESADO")
 
-        user_state[phone] = ""
+        user_state[phone] = "__greeted__"
         return
 
     if st == "tpv_motivo":
@@ -631,7 +631,7 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
         except Exception:
             log.exception("⚠️ No fue posible actualizar ESTATUS TPV_NO_INTERESADO")
 
-        user_state[phone] = ""
+        user_state[phone] = "__greeted__"
         return
 
 # --- IMSS (opción 1) ---
@@ -686,7 +686,7 @@ def _imss_next(phone: str, text: str) -> None:
         )
         send_message(phone, msg)
         _notify_advisor(f"🔔 IMSS — Prospecto preautorizado\nWhatsApp: {phone}\n" + msg)
-        user_state[phone] = ""
+        user_state[phone] = "__greeted__"
         send_main_menu(phone)
 
 # --- Crédito Empresarial (opción 5) ---
@@ -731,7 +731,7 @@ def _emp_next(phone: str, text: str) -> None:
         )
         send_message(phone, resumen)
         _notify_advisor(f"🔔 Empresarial — Nueva solicitud\nWhatsApp: {phone}\n" + resumen)
-        user_state[phone] = ""
+        user_state[phone] = "__greeted__"
         send_main_menu(phone)
 
 # --- Financiamiento Práctico (opción 6) ---
@@ -763,7 +763,7 @@ def _fp_next(phone: str, text: str) -> None:
             resumen += f"\nCOMENTARIO: {data['fp_comentario']}"
         send_message(phone, resumen)
         _notify_advisor(f"🔔 Financiamiento Práctico — Resumen\nWhatsApp: {phone}\n{resumen}")
-        user_state[phone] = ""
+        user_state[phone] = "__greeted__"
         send_main_menu(phone)
 
 # --- Seguros de Auto (opción 2) ---
@@ -795,7 +795,7 @@ def _auto_next(phone: str, text: str) -> None:
             write_followup_to_sheets("auto_recordatorio", f"Recordatorio póliza -30d para {phone}", objetivo.isoformat())
             threading.Thread(target=_retry_after_days, args=(phone, 7), daemon=True).start()
             send_message(phone, f"✅ Gracias. Te contactaré *un mes antes* ({objetivo.isoformat()}).")
-            user_state[phone] = ""
+            user_state[phone] = "__greeted__"
             send_main_menu(phone)
         except Exception:
             send_message(phone, "Formato inválido. Usa AAAA-MM-DD. Ejemplo: 2025-12-31")
@@ -853,7 +853,7 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
         send_main_menu(phone)
     elif t in ("menu", "menú", "inicio", "hola"):
-        user_state[phone] = ""
+        user_state[phone] = "__greeted__"
         send_main_menu(phone)
     else:
         st = user_state.get(phone, "")
@@ -976,10 +976,17 @@ def webhook_receive():
 
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
 
-        match = _greet_and_match(phone) if phone not in user_state else None
+        if phone not in user_state:
+            user_state[phone] = "__greeted__"
+            match = _greet_and_match(phone)
+        else:
+            match = None
 
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
+
+            text = msg["text"].get("body", "").strip()
+            log.info(f"💬 Texto recibido de {phone}: {text}")
 
             # =========================================================
             # 🔔 DETECCIÓN DE INTERÉS / DUDA POST-PLANTILLA (GLOBAL)
@@ -996,11 +1003,13 @@ def webhook_receive():
                 "financiamiento","financiamiento practico","financiamiento práctico",
                 "contactar","asesor","contactar con christian"
             }
+            st_now = (user_state.get(phone) or "").strip()
+            is_idle = (st_now in ("", "__greeted__"))
 
             if (
                 not t_lower.isdigit()
                 and t_lower not in VALID_COMMANDS
-                and not user_state.get(phone)
+                and is_idle
             ):
                 aviso = (
                     "📩 Cliente INTERESADO / DUDA detectada\n"
@@ -1009,9 +1018,6 @@ def webhook_receive():
                 )
                 _notify_advisor(aviso)
             # =========================================================
-
-            text = msg["text"].get("body", "").strip()
-            log.info(f"💬 Texto recibido de {phone}: {text}")
 
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
@@ -1391,4 +1397,3 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
-
