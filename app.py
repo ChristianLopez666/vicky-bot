@@ -1003,11 +1003,13 @@ def webhook_receive():
                 "financiamiento","financiamiento practico","financiamiento práctico",
                 "contactar","asesor","contactar con christian"
             }
+            st_now = (user_state.get(phone) or "").strip()
+            is_idle = (st_now in ("", "__greeted__"))
 
             if (
                 not t_lower.isdigit()
                 and t_lower not in VALID_COMMANDS
-                and not user_state.get(phone)
+                and is_idle
             ):
                 aviso = (
                     "📩 Cliente INTERESADO / DUDA detectada\n"
@@ -1016,9 +1018,6 @@ def webhook_receive():
                 )
                 _notify_advisor(aviso)
             # =========================================================
-
-            text = msg["text"].get("body", "").strip()
-            log.info(f"💬 Texto recibido de {phone}: {text}")
 
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
@@ -1037,21 +1036,6 @@ def webhook_receive():
                     send_message(phone, "Hubo un detalle al procesar tu solicitud. Intentemos de nuevo.")
                     return jsonify({"ok": True}), 200
 
-
-            # PRIORIDAD: continuar embudo activo
-            st = user_state.get(phone, "")
-            if st.startswith("auto_"):
-                _auto_next(phone, text)
-                return jsonify({"ok": True}), 200
-            if st.startswith("imss_"):
-                _imss_next(phone, text)
-                return jsonify({"ok": True}), 200
-            if st.startswith("emp_"):
-                _emp_next(phone, text)
-                return jsonify({"ok": True}), 200
-            if st.startswith("fp_"):
-                _fp_next(phone, text)
-                return jsonify({"ok": True}), 200
             _route_command(phone, text, match)
             return jsonify({"ok": True}), 200
 
