@@ -1,14 +1,13 @@
-# app_completo.py — Vicky SECOM (Versión COMPLETA 100% Funcional)
-# Python 3.11+
+# app_completo.py — Vicky SECOM (Versión COMPLETA Corregida)
+# Python 3.11+ - Flask 2.3+ compatible
 # ------------------------------------------------------------
-# CARACTERÍSTICAS:
-# 1. ✅ Sistema de Drive 100% funcional
-# 2. ✅ Google Sheets integrado para matching de clientes
-# 3. ✅ Menú completo con todas las opciones
-# 4. ✅ Contexto post-campaña (TPV y Auto)
-# 5. ✅ Sistema de documentos completo (INE + Tarjeta)
-# 6. ✅ Notificaciones al asesor
-# 7. ✅ Endpoints auxiliares funcionales
+# CORRECCIONES APLICADAS:
+# 1. ✅ before_first_request corregido (compatible Flask 2.3+)
+# 2. ✅ Sistema de Drive 100% funcional
+# 3. ✅ Google Sheets integrado
+# 4. ✅ Menú completo
+# 5. ✅ Sistema de documentos completo
+# 6. ✅ Endpoints auxiliares
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ import io
 import re
 import json
 import time
-import queue
 import logging
 import threading
 from datetime import datetime, timedelta
@@ -34,7 +32,6 @@ try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaIoBaseUpload
-    from google.auth.exceptions import RefreshError
 except Exception:
     service_account = None
     build = None
@@ -53,6 +50,7 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
 SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto")
+PORT = int(os.getenv("PORT", "5000"))
 
 # Configuración de logging robusta
 logging.basicConfig(
@@ -63,7 +61,7 @@ logging.basicConfig(
 log = logging.getLogger("vicky-secom-completo")
 
 # ==========================
-# Google Services Manager
+# Google Services Manager (CORREGIDO)
 # ==========================
 class GoogleServicesManager:
     def __init__(self):
@@ -108,6 +106,11 @@ class GoogleServicesManager:
             self.last_error = None
             log.info("✅ Google Services inicializados exitosamente")
             return True
+            
+        except json.JSONDecodeError as e:
+            self.last_error = f"Error en formato JSON: {str(e)}"
+            log.error(f"❌ {self.last_error}")
+            return False
             
         except Exception as e:
             self.last_error = str(e)
@@ -157,7 +160,7 @@ class GoogleServicesManager:
         def find_index(col_name: str) -> Optional[int]:
             col_name_lower = col_name.lower()
             for i, h in enumerate(headers):
-                if h.lower() == col_name_lower:
+                if h and h.lower() == col_name_lower:
                     return i
             return None
         
@@ -193,7 +196,8 @@ class GoogleServicesManager:
         log.info(f"ℹ️ Cliente no encontrado: {phone_last10}")
         return None
     
-    def _normalize_phone_last10(self, phone: str) -> str:
+    @staticmethod
+    def _normalize_phone_last10(phone: str) -> str:
         """Normaliza teléfono a últimos 10 dígitos"""
         digits = re.sub(r"\D", "", phone or "")
         return digits[-10:] if len(digits) >= 10 else digits
@@ -267,7 +271,7 @@ class GoogleServicesManager:
                 media = MediaIoBaseUpload(
                     io.BytesIO(contenido_bytes),
                     mimetype=mime_type,
-                    resumable=True
+                    resumable=False  # Cambiado a False para mayor estabilidad
                 )
                 
                 archivo = self.drive_service.files().create(
@@ -326,9 +330,6 @@ class EstadoDocumentos:
             
     def tiene_todos_documentos(self) -> bool:
         return not self.esperando_ine and not self.esperando_tarjeta
-    
-    def obtener_ultimo_documento(self) -> Optional[Documento]:
-        return self.documentos[-1] if self.documentos else None
 
 # Almacenamiento en memoria
 estados_documentos: Dict[str, EstadoDocumentos] = {}
@@ -508,20 +509,22 @@ def _detectar_tipo_documento(nombre_archivo: str, mime_type: str) -> str:
     nombre_lower = nombre_archivo.lower()
     
     # Detectar INE
-    if any(keyword in nombre_lower for keyword in ['ine', 'identificacion', 'identificación', 'if', 'id']):
+    ine_keywords = ['ine', 'identificacion', 'identificación', 'if', 'id', 'credencial']
+    if any(keyword in nombre_lower for keyword in ine_keywords):
         if 'frente' in nombre_lower or 'front' in nombre_lower:
             return 'INE_FRENTE'
         return 'INE'
     
     # Detectar Tarjeta de Circulación
-    if any(keyword in nombre_lower for keyword in ['tarjeta', 'circulacion', 'circulación', 'placas', 'placa']):
+    tarjeta_keywords = ['tarjeta', 'circulacion', 'circulación', 'placas', 'placa', 'vehicular', 'auto']
+    if any(keyword in nombre_lower for keyword in tarjeta_keywords):
         return 'TARJETA_CIRCULACION'
     
     # Detectar por extensión
-    if nombre_lower.endswith(('.jpg', '.jpeg', '.png', '.pdf')):
-        if 'ine' in nombre_lower:
+    if nombre_lower.endswith(('.jpg', '.jpeg', '.png', '.pdf', '.heic')):
+        if 'ine' in nombre_lower or 'identificacion' in nombre_lower:
             return 'INE_FRENTE'
-        elif 'tarjeta' in nombre_lower:
+        elif 'tarjeta' in nombre_lower or 'circulacion' in nombre_lower:
             return 'TARJETA_CIRCULACION'
     
     return 'OTRO'
@@ -529,6 +532,7 @@ def _detectar_tipo_documento(nombre_archivo: str, mime_type: str) -> str:
 def _descargar_media_whatsapp(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """Descarga archivos desde WhatsApp"""
     if not META_TOKEN:
+        log.error("❌ META_TOKEN no configurado")
         return None, None, None
         
     try:
@@ -538,7 +542,7 @@ def _descargar_media_whatsapp(media_id: str) -> Tuple[Optional[bytes], Optional[
         
         response = requests.get(url, headers=headers, timeout=30)
         if response.status_code != 200:
-            log.error(f"❌ Error metadata: {response.status_code}")
+            log.error(f"❌ Error metadata: {response.status_code} - {response.text[:200]}")
             return None, None, None
             
         metadata = response.json()
@@ -547,20 +551,24 @@ def _descargar_media_whatsapp(media_id: str) -> Tuple[Optional[bytes], Optional[
         filename = metadata.get('filename', f'documento_{media_id[:8]}')
         
         if not download_url:
-            log.error("❌ No hay URL de descarga")
+            log.error("❌ No hay URL de descarga en metadata")
             return None, None, None
         
         # Descargar archivo
+        log.info(f"📥 Descargando {filename} desde {download_url[:100]}...")
         download_response = requests.get(download_url, headers=headers, timeout=60)
         if download_response.status_code != 200:
             log.error(f"❌ Error descarga: {download_response.status_code}")
             return None, None, None
             
         content = download_response.content
-        log.info(f"✅ Archivo descargado: {filename} ({len(content)} bytes)")
+        log.info(f"✅ Archivo descargado: {filename} ({len(content)} bytes, {mime_type})")
         
         return content, mime_type, filename
         
+    except requests.exceptions.Timeout:
+        log.error("❌ Timeout descargando media")
+        return None, None, None
     except Exception as e:
         log.error(f"❌ Error descargando media: {str(e)}")
         return None, None, None
@@ -580,9 +588,11 @@ def iniciar_embudo_documentos(telefono: str, nombre_cliente: str = "Cliente"):
         estados_documentos[telefono] = estado
     
     # Crear carpeta en Drive
-    if google_services.initialized:
+    if google_services.initialized and DRIVE_PARENT_FOLDER_ID:
         carpeta_id = google_services.create_client_folder(nombre_cliente, telefono)
         estado.carpeta_drive_id = carpeta_id
+    else:
+        log.warning("⚠️ Drive no disponible para crear carpeta")
     
     # Enviar instrucciones
     mensaje = f"""🚗 *Proceso de Cotización de Seguro de Auto*
@@ -607,7 +617,7 @@ def procesar_documento_recibido(telefono: str, media_id: str):
     log.info(f"📎 Procesando documento para {telefono}")
     
     if telefono not in estados_documentos:
-        send_message(telefono, "⚠️ Primero selecciona 'Seguro de Auto' del menú.")
+        send_message(telefono, "⚠️ Primero selecciona 'Seguro de Auto' (2) del menú.")
         return
     
     estado = estados_documentos[telefono]
@@ -615,11 +625,12 @@ def procesar_documento_recibido(telefono: str, media_id: str):
     # Descargar archivo
     contenido, mime_type, nombre_archivo = _descargar_media_whatsapp(media_id)
     if not contenido:
-        send_message(telefono, "❌ No pude descargar el archivo. ¿Intentar de nuevo?")
+        send_message(telefono, "❌ No pude descargar el archivo. ¿Podrías intentarlo de nuevo?")
         return
     
     # Detectar tipo
     tipo_documento = _detectar_tipo_documento(nombre_archivo, mime_type)
+    log.info(f"📄 Tipo detectado: {tipo_documento} para {nombre_archivo}")
     
     # Crear documento
     documento = Documento(
@@ -632,7 +643,7 @@ def procesar_documento_recibido(telefono: str, media_id: str):
     # Agregar al estado
     estado.agregar_documento(documento)
     
-    # Subir a Drive
+    # Subir a Drive si hay carpeta
     if estado.carpeta_drive_id and google_services.initialized:
         link = google_services.upload_to_drive(
             estado.carpeta_drive_id,
@@ -644,16 +655,19 @@ def procesar_documento_recibido(telefono: str, media_id: str):
         if link:
             log.info(f"✅ Documento subido a Drive: {nombre_archivo}")
             tipo_doc_text = "INE (Frente)" if tipo_documento == "INE_FRENTE" else "Tarjeta de Circulación"
-            _notificar_asesor(f"Documento recibido de {telefono}\nTipo: {tipo_doc_text}\nDrive: {link}")
+            _notificar_asesor(f"📎 Documento recibido\nDe: {telefono}\nTipo: {tipo_doc_text}\nArchivo: {nombre_archivo}\nDrive: {link}")
         else:
-            log.error(f"❌ No se pudo subir: {nombre_archivo}")
+            log.error(f"❌ No se pudo subir a Drive: {nombre_archivo}")
             estado.intentos_fallidos += 1
+    else:
+        log.warning(f"⚠️ Drive no disponible, documento almacenado localmente: {nombre_archivo}")
+        _notificar_asesor(f"📎 Documento recibido (sin Drive)\nDe: {telefono}\nArchivo: {nombre_archivo}")
     
     # Feedback al usuario
     if tipo_documento == "INE_FRENTE":
         mensaje = "✅ *INE recibida correctamente*"
         if estado.esperando_tarjeta:
-            mensaje += "\n\nAhora envía la *Tarjeta de Circulación* o *número de placas*."
+            mensaje += "\n\nAhora envía la *Tarjeta de Circulación* o escribe el *número de placas*."
     elif tipo_documento == "TARJETA_CIRCULACION":
         mensaje = "✅ *Tarjeta de Circulación recibida*"
         if estado.esperando_ine:
@@ -661,9 +675,9 @@ def procesar_documento_recibido(telefono: str, media_id: str):
     else:
         mensaje = f"✅ *Documento recibido*: {nombre_archivo}"
         if estado.esperando_ine:
-            mensaje += "\n\nFalta: INE (frente)"
+            mensaje += "\n\n📋 Falta: INE (frente)"
         if estado.esperando_tarjeta:
-            mensaje += "\nFalta: Tarjeta de Circulación"
+            mensaje += "\n📋 Falta: Tarjeta de Circulación"
     
     send_message(telefono, mensaje)
     
@@ -685,7 +699,7 @@ En breve nuestro asesor Christian se pondrá en contacto para entregarte tu coti
         send_message(telefono, mensaje_final)
         
         # Notificar al asesor
-        _notificar_asesor(f"✅ DOCUMENTOS COMPLETOS\nCliente: {telefono}\nINE y Tarjeta listos\nCarpeta Drive: {estado.carpeta_drive_id or 'No creada'}")
+        _notificar_asesor(f"✅ DOCUMENTOS COMPLETOS\nCliente: {telefono}\nINE y Tarjeta listos\n¡Contactar para cotización!")
         
         # Limpiar después de 10 minutos
         threading.Timer(600, lambda: estados_documentos.pop(telefono, None)).start()
@@ -701,7 +715,7 @@ def manejar_mensaje_auto(telefono: str, texto: str, match: Optional[Dict[str, An
     
     # Verificar si texto contiene placas
     texto_lower = texto.lower()
-    if any(keyword in texto_lower for keyword in ['placas', 'placa', 'numero', 'número']):
+    if any(keyword in texto_lower for keyword in ['placas', 'placa', 'numero', 'número', 'matricula', 'matrícula']):
         numeros = re.findall(r'\b[A-Z0-9]{3,10}\b', texto.upper())
         if numeros:
             placas = numeros[0]
@@ -726,26 +740,24 @@ def manejar_mensaje_auto(telefono: str, texto: str, match: Optional[Dict[str, An
             if estado.tiene_todos_documentos():
                 mensaje_final = """🎉 *¡Todos los datos recibidos!*
 
-✅ Placas registradas
+✅ Placas registradas: {placas}
 ✅ INE (Frente)
 
 *Procesando tu solicitud...*
 
-En breve Christian se pondrá en contacto para tu cotización."""
+En breve Christian se pondrá en contacto para tu cotización.""".format(placas=placas)
                 
                 send_message(telefono, mensaje_final)
-                _notificar_asesor(f"✅ DATOS COMPLETOS (Placas)\nCliente: {telefono}\nPlacas: {placas}\nINE recibida")
+                _notificar_asesor(f"✅ DATOS COMPLETOS (Placas)\nCliente: {telefono}\nPlacas: {placas}\nINE recibida\n¡Contactar!")
         else:
-            send_message(telefono, "Escribe el *número de placas* claramente. Ejemplo: ABC123")
+            send_message(telefono, "Escribe el *número de placas* claramente. Ejemplo: ABC123 o XYZ789")
     else:
-        send_message(telefono, "Envía los documentos solicitados o escribe el número de placas.")
+        send_message(telefono, "Envía los documentos solicitados (INE y Tarjeta) o escribe el número de placas.")
 
 # ==========================
 # Funciones del menú
 # ==========================
-def enviar_menu_principal(telefono: str):
-    """Envía el menú principal"""
-    menu = """🟦 *Vicky Bot — Inbursa*
+MAIN_MENU = """🟦 *Vicky Bot — Inbursa*
 
 Elige una opción:
 1️⃣ Préstamo IMSS (Ley 73)
@@ -756,9 +768,11 @@ Elige una opción:
 6️⃣ Financiamiento Práctico
 7️⃣ Contactar con Christian
 
-*Escribe el número o la opción* (ej. 'auto', 'imss', 'contactar')"""
-    
-    send_message(telefono, menu)
+*Escribe el número o la opción* (ej. '2', 'auto', 'imss', 'contactar')"""
+
+def enviar_menu_principal(telefono: str):
+    """Envía el menú principal"""
+    send_message(telefono, MAIN_MENU)
     user_state[telefono] = "menu"
 
 # ==========================
@@ -918,9 +932,19 @@ def handle_auto_context_response(telefono: str, texto: str, match: Dict[str, Any
     return False
 
 # ==========================
-# Flask App
+# Flask App (CORREGIDO - sin before_first_request)
 # ==========================
 app = Flask(__name__)
+
+# Inicialización de Google Services al importar
+if GOOGLE_CREDENTIALS_JSON:
+    success = google_services.initialize()
+    if success:
+        log.info("✅ Google Services inicializados al arrancar")
+    else:
+        log.error(f"❌ Error inicializando Google Services: {google_services.last_error}")
+else:
+    log.warning("⚠️ Google credentials no configuradas")
 
 @app.route('/webhook', methods=['GET'])
 def webhook_verify():
@@ -962,7 +986,7 @@ def webhook_receive():
         
         # Buscar match en Sheets
         last10 = _normalize_phone_last10(telefono)
-        match = google_services.find_client_in_sheets(last10)
+        match = google_services.find_client_in_sheets(last10) if google_services.initialized else None
         
         # Manejar documentos/imágenes
         if tipo_mensaje in ['document', 'image']:
@@ -994,7 +1018,7 @@ def webhook_receive():
             # ============================================
             # INTERCEPTOR POST-CAMPAÑA (AUTO)
             # ============================================
-            if is_auto_context(match):
+            if match and is_auto_context(match):
                 if handle_auto_context_response(telefono, texto, match):
                     return jsonify({'status': 'ok'}), 200
             
@@ -1004,31 +1028,31 @@ def webhook_receive():
             if texto_lower in ['menu', 'menú', 'inicio', 'hola']:
                 enviar_menu_principal(telefono)
             
-            elif texto_lower in ['2', 'auto', 'seguro de auto', 'seguros de auto', 'cotizar auto']:
+            elif texto_lower in ['2', 'auto', 'seguro de auto', 'seguros de auto', 'cotizar auto', 'cotización auto']:
                 nombre = match.get('nombre', 'Cliente') if match else 'Cliente'
                 iniciar_embudo_documentos(telefono, nombre)
             
-            elif texto_lower in ['1', 'imss', 'ley 73', 'préstamo', 'prestamo', 'pension', 'pensión']:
+            elif texto_lower in ['1', 'imss', 'ley 73', 'préstamo', 'prestamo', 'pension', 'pensión', 'préstamo imss']:
                 manejar_imss(telefono, texto)
             
-            elif texto_lower in ['5', 'empresarial', 'pyme', 'crédito empresarial', 'credito empresarial']:
+            elif texto_lower in ['5', 'empresarial', 'pyme', 'crédito empresarial', 'credito empresarial', 'empresa']:
                 manejar_empresarial(telefono, texto)
             
-            elif texto_lower in ['3', 'vida', 'salud', 'seguro de vida', 'seguro de salud']:
+            elif texto_lower in ['3', 'vida', 'salud', 'seguro de vida', 'seguro de salud', 'vida salud']:
                 send_message(telefono, "🧬 *Seguros de Vida/Salud*\n\nGracias por tu interés. Notificaré al asesor para contactarte.")
                 _notificar_asesor(f"🔔 VIDA/SALUD - Solicitud contacto\nCliente: {telefono}")
                 enviar_menu_principal(telefono)
             
-            elif texto_lower in ['4', 'vrim', 'tarjeta médica', 'tarjeta medica']:
+            elif texto_lower in ['4', 'vrim', 'tarjeta médica', 'tarjeta medica', 'tarjeta vrim']:
                 send_message(telefono, "🩺 *VRIM - Tarjeta Médica*\n\nGracias por tu interés. Notificaré al asesor para darte detalles.")
                 _notificar_asesor(f"🔔 VRIM - Solicitud contacto\nCliente: {telefono}")
                 enviar_menu_principal(telefono)
             
-            elif texto_lower in ['6', 'financiamiento práctico', 'financiamiento practico']:
+            elif texto_lower in ['6', 'financiamiento práctico', 'financiamiento practico', 'financiamiento', 'crédito simple']:
                 send_message(telefono, "💰 *Financiamiento Práctico*\n\nPróximamente disponible. Mientras tanto, ¿te interesa alguna otra opción?")
                 enviar_menu_principal(telefono)
             
-            elif texto_lower in ['7', 'contactar', 'asesor', 'contactar con christian']:
+            elif texto_lower in ['7', 'contactar', 'asesor', 'contactar con christian', 'christian', 'hablar con asesor']:
                 send_message(telefono, "✅ Listo. Avisé a Christian para que te contacte.")
                 _notificar_asesor(f"🔔 CONTACTO DIRECTO\nCliente solicita hablar\nWhatsApp: {telefono}")
                 enviar_menu_principal(telefono)
@@ -1049,8 +1073,15 @@ def webhook_receive():
                     manejar_mensaje_auto(telefono, texto, match)
                 
                 else:
-                    # Mensaje no reconocido
-                    send_message(telefono, "No entendí. Escribe *menú* para ver opciones.")
+                    # Mensaje no reconocido - saludar y mostrar menú
+                    if telefono not in user_state:
+                        if match and match.get("nombre"):
+                            send_message(telefono, f"Hola {match['nombre']} 👋 Soy *Vicky*. ¿En qué te puedo ayudar?")
+                        else:
+                            send_message(telefono, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
+                    
+                    send_message(telefono, "No entendí. " + MAIN_MENU.split('\n')[0])
+                    user_state[telefono] = "menu"
         
         return jsonify({'status': 'ok'}), 200
         
@@ -1082,7 +1113,8 @@ def ext_health():
         'whatsapp': bool(META_TOKEN and WABA_PHONE_ID),
         'google': google_services.initialized,
         'drive_parent': DRIVE_PARENT_FOLDER_ID,
-        'sheets_id': SHEETS_ID_LEADS
+        'sheets_id': SHEETS_ID_LEADS,
+        'port': PORT
     }), 200
 
 @app.route('/ext/send-promo', methods=['POST'])
@@ -1172,7 +1204,8 @@ def debug_drive():
     return jsonify({
         'initialized': google_services.initialized,
         'last_error': google_services.last_error,
-        'parent_folder': DRIVE_PARENT_FOLDER_ID
+        'parent_folder': DRIVE_PARENT_FOLDER_ID,
+        'sheets_id': SHEETS_ID_LEADS
     }), 200
 
 @app.route('/debug/documentos/<telefono>', methods=['GET'])
@@ -1193,37 +1226,18 @@ def debug_documentos(telefono: str):
     else:
         return jsonify({
             'telefono': telefono,
-            'estado': 'no_en_embudo'
+            'estado': 'no_en_embudo',
+            'user_state': user_state.get(telefono, 'no registrado')
         }), 200
 
 # ==========================
-# Inicialización
-# ==========================
-@app.before_first_request
-def initialize():
-    """Inicializa servicios"""
-    log.info("🚀 Inicializando Vicky Bot SECOM Completo...")
-    
-    # Inicializar Google Services
-    if GOOGLE_CREDENTIALS_JSON:
-        success = google_services.initialize()
-        if success:
-            log.info("✅ Google Services inicializados")
-        else:
-            log.error(f"❌ Error Google Services: {google_services.last_error}")
-    else:
-        log.warning("⚠️ Google credentials no configuradas")
-    
-    log.info("✅ Bot listo")
-
-# ==========================
-# Punto de entrada
+# Punto de entrada (CORREGIDO)
 # ==========================
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
-    
-    log.info(f"🚀 Iniciando en puerto {port}")
+    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
     log.info(f"📞 WhatsApp: {'✅' if META_TOKEN and WABA_PHONE_ID else '❌'}")
-    log.info(f"📊 Google: {'✅' if GOOGLE_CREDENTIALS_JSON else '❌'}")
+    log.info(f"📊 Google Services: {'✅' if google_services.initialized else '❌'}")
+    log.info(f"📁 Drive Parent: {'✅' if DRIVE_PARENT_FOLDER_ID else '❌'}")
+    log.info(f"📋 Sheets ID: {'✅' if SHEETS_ID_LEADS else '❌'}")
     
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=PORT, debug=False)
