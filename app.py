@@ -566,6 +566,91 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
         user_state[phone] = "__greeted__"
         return
 
+# --- AUTO CONTEXT DETECTION (NEW) ---
+def _auto_is_context(match: Optional[Dict[str, Any]]) -> bool:
+    """
+    AUTO (seguro de auto) se activa si:
+    - existe match en Sheets
+    - ESTATUS en (ENVIADO_INICIAL, ENVIADO_AUTO, ENVIADO_SEGURO_AUTO)
+    - LAST_MESSAGE_AT dentro de 24h
+    """
+    if not match:
+        return False
+    
+    estatus = (match.get("estatus") or "").strip().upper()
+    valid_status = {"ENVIADO_INICIAL", "ENVIADO_AUTO", "ENVIADO_SEGURO_AUTO"}
+    if estatus not in valid_status:
+        return False
+    
+    dt = _parse_dt_maybe(match.get("last_message_at") or "")
+    if not dt:
+        return False
+    
+    if dt.tzinfo is not None:
+        now = datetime.now(dt.tzinfo)
+    else:
+        now = datetime.utcnow()
+    
+    return (now - dt) <= timedelta(hours=24)
+
+def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) -> bool:
+    """
+    Maneja respuestas en contexto AUTO post-campaña.
+    Retorna True si consumió el mensaje.
+    """
+    t = (text or "").strip().lower()
+    intent = interpret_response(text)
+    st_now = user_state.get(phone, "")
+    idle = st_now in ("", "__greeted__")
+    
+    if not idle:
+        return False
+    
+    if not _auto_is_context(match):
+        return False
+    
+    # Respuesta positiva (Sí, 1, etc.)
+    if t in ("1", "si", "sí", "ok", "claro") or intent == "positive":
+        user_state[phone] = "auto_intro"
+        auto_start(phone, match)
+        return True
+    
+    # Respuesta negativa (No, 2, etc.)
+    if t in ("2", "no", "nel") or intent == "negative":
+        user_state[phone] = "auto_vencimiento_fecha"
+        nombre = match.get("nombre", "").strip() or "Cliente"
+        send_message(phone, f"Entendido {nombre}. Para poder recordarte a tiempo, ¿cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)")
+        
+        # Notificar al asesor
+        aviso = (
+            "🔔 AUTO — NO INTERESADO / TIENE SEGURO\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {nombre}\n"
+            f"Respuesta: {text}"
+        )
+        _notify_advisor(aviso)
+        return True
+    
+    # Menú
+    if t in ("menu", "menú", "inicio"):
+        user_state[phone] = "__greeted__"
+        send_main_menu(phone)
+        return True
+    
+    # Cualquier otra cosa: notificar asesor como DUDA
+    nombre = match.get("nombre", "").strip() or "Cliente"
+    aviso = (
+        "📩 AUTO — DUDA / INTERÉS detectada\n"
+        f"WhatsApp: {phone}\n"
+        f"Nombre: {nombre}\n"
+        f"Mensaje: {text}"
+    )
+    _notify_advisor(aviso)
+    
+    # Pregunta cerrada de confirmación
+    send_message(phone, "¿Deseas cotizar tu seguro de auto ahora? Responde *Sí* o *No*")
+    return True
+
 # --- IMSS (opción 1) ---
 def imss_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "imss_beneficios"
@@ -909,63 +994,33 @@ def webhook_receive():
 
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
 
-        # 🔍 DETECCIÓN DE PLANTILLAS DESACTIVADA — Sheets es la única fuente de verdad
-        context_info = msg.get("context", {})
-        template_name = ""
+        # Obtener match SIEMPRE (necesario para contexto de campaña)
+        last10 = _normalize_phone_last10(phone)
+        match = match_client_in_sheets(last10)
         
-        if context_info:
-            template_name = context_info.get("template_name", "").lower()
-            log.info(f"🔍 Mensaje es respuesta a plantilla: {template_name}")
+        # Estado actual del usuario
+        st_now = user_state.get(phone, "")
+        idle = st_now in ("", "__greeted__")
+        
+        # Manejo de mensajes de texto
+        mtype = msg.get("type")
+        if mtype == "text" and "text" in msg:
+            text = msg["text"].get("body", "").strip()
+            log.info(f"💬 Texto recibido de {phone}: {text}")
             
-            # Si es respuesta a plantilla de seguro de auto, activamos ese flujo INMEDIATAMENTE
-            if "seguro_auto" in template_name or "auto_70" in template_name:
-                log.info(f"🚗 Cliente {phone} respondiendo a plantilla de seguro de auto - ACTIVANDO FLUJO")
-                # ESTABLECER ESTADO ANTES DE CUALQUIER OTRA LÓGICA
-                user_state[phone] = "auto_intro"
-                # Enviar mensaje de bienvenida específico
-                send_message(phone,
-                    "🚗 *Seguro de Auto*\nEnvíame por favor:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas\n\nCuando lo envíes, te confirmaré recepción y procesaré la cotización."
-                )
-                return jsonify({"ok": True}), 200
+            # =========================================================
+            # 🔔 INTERCEPTOR POST-CAMPAÑA (AUTO) - PRIORIDAD ALTA
+            # =========================================================
+            if idle and match:
+                # 1. CONTEXTO AUTO (Seguro de Auto)
+                if _auto_is_context(match):
+                    if _handle_auto_context_response(phone, text, match):
+                        return jsonify({"ok": True}), 200
                 
-            # Si es respuesta a TPV
-            elif "tpv" in template_name.lower():
-                log.info(f"💳 Cliente {phone} respondiendo a plantilla TPV")
-                match = match_client_in_sheets(_normalize_phone_last10(phone))
+                # 2. CONTEXTO TPV
                 if _tpv_is_context(match):
-                    user_state[phone] = "tpv_start"
-
-        # Si NO es respuesta a plantilla, continuar con lógica normal
-        # Pero primero verificar si el mensaje contiene palabras clave de seguro
-        mtype = msg.get("type")
-        if mtype == "text" and "text" in msg:
-            text = msg["text"].get("body", "").strip()
-            log.info(f"💬 Texto recibido de {phone}: {text}")
-            
-            # DETECCIÓN ESPECÍFICA PARA SEGURO DE AUTO (palabras clave)
-            t_lower = text.lower().strip()
-            
-            # Si el usuario menciona "seguro", "auto", "vencimiento" o similar
-            seguro_keywords = ["seguro", "auto", "carro", "vehículo", "vencimiento", "vence", "póliza", "poliza"]
-            if any(keyword in t_lower for keyword in seguro_keywords):
-                # Verificar si el usuario está en estado neutral
-                current_state = user_state.get(phone, "")
-                if current_state in ("", "__greeted__", None):
-                    log.info(f"🚗 Palabra clave de seguro detectada - Activando flujo para {phone}")
-                    user_state[phone] = "auto_intro"
-                    send_message(phone,
-                        "🚗 *Seguro de Auto*\nEnvíame por favor:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas\n\nCuando lo envíes, te confirmaré recepción y procesaré la cotización."
-                    )
-                    return jsonify({"ok": True}), 200
-
-        # Lógica existente para estado del usuario (solo si no se activó flujo especial)
-        match = _greet_and_match(phone) if phone not in user_state else match_client_in_sheets(_normalize_phone_last10(phone))
-
-        mtype = msg.get("type")
-        if mtype == "text" and "text" in msg:
-
-            text = msg["text"].get("body", "").strip()
-            log.info(f"💬 Texto recibido de {phone}: {text}")
+                    if tpv_start_from_reply(phone, text, match):
+                        return jsonify({"ok": True}), 200
 
             # =========================================================
             # 🔔 DETECCIÓN DE INTERÉS / DUDA POST-PLANTILLA (GLOBAL)
@@ -982,13 +1037,11 @@ def webhook_receive():
                 "financiamiento","financiamiento practico","financiamiento práctico",
                 "contactar","asesor","contactar con christian"
             }
-            st_now = (user_state.get(phone) or "").strip()
-            is_idle = (st_now in ("", "__greeted__"))
 
             if (
                 not t_lower.isdigit()
                 and t_lower not in VALID_COMMANDS
-                and is_idle
+                and idle
             ):
                 aviso = (
                     "📩 Cliente INTERESADO / DUDA detectada\n"
@@ -998,6 +1051,13 @@ def webhook_receive():
                 _notify_advisor(aviso)
             # =========================================================
 
+            # Inicialización del estado si es nuevo usuario
+            if phone not in user_state:
+                user_state[phone] = "__greeted__"
+                if not match:  # Solo saludar si no tenemos match ya
+                    _greet_and_match(phone)
+
+            # Comando especial GPT
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
