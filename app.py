@@ -1,13 +1,13 @@
-# app_completo.py — Vicky SECOM (Versión COMPLETA Corregida)
+# app_completo.py — Vicky SECOM (Versión COMPLETA con todos los endpoints)
 # Python 3.11+ - Flask 2.3+ compatible
 # ------------------------------------------------------------
 # CORRECCIONES APLICADAS:
-# 1. ✅ before_first_request corregido (compatible Flask 2.3+)
+# 1. ✅ Endpoint /ext/auto-send-one AGREGADO
 # 2. ✅ Sistema de Drive 100% funcional
 # 3. ✅ Google Sheets integrado
 # 4. ✅ Menú completo
 # 5. ✅ Sistema de documentos completo
-# 6. ✅ Endpoints auxiliares
+# 6. ✅ Todos los endpoints del original
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -46,10 +46,12 @@ META_TOKEN = os.getenv("META_TOKEN")
 WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
 SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto")
+AUTO_SEND_TOKEN = os.getenv("AUTO_SEND_TOKEN", "vicky_autosend_5min_2025")
 PORT = int(os.getenv("PORT", "5000"))
 
 # Configuración de logging robusta
@@ -61,7 +63,7 @@ logging.basicConfig(
 log = logging.getLogger("vicky-secom-completo")
 
 # ==========================
-# Google Services Manager (CORREGIDO)
+# Google Services Manager
 # ==========================
 class GoogleServicesManager:
     def __init__(self):
@@ -117,14 +119,15 @@ class GoogleServicesManager:
             log.error(f"❌ Error inicializando Google Services: {str(e)}")
             return False
     
-    def get_sheet_rows(self) -> Tuple[List[str], List[List[str]]]:
-        """Obtiene headers + rows del Sheet principal"""
+    def get_sheet_rows(self, sheet_title: str = None) -> Tuple[List[str], List[List[str]]]:
+        """Obtiene headers + rows del Sheet"""
         if not self.initialized or not self.sheets_service:
             log.error("❌ Google Sheets no inicializado")
             return [], []
             
         try:
-            rng = f"{SHEETS_TITLE_LEADS}!A:Z"
+            title = sheet_title or SHEETS_TITLE_LEADS
+            rng = f"{title}!A:Z"
             result = self.sheets_service.spreadsheets().values().get(
                 spreadsheetId=SHEETS_ID_LEADS,
                 range=rng
@@ -133,13 +136,13 @@ class GoogleServicesManager:
             values = result.get('values', [])
             
             if not values:
-                log.warning("ℹ️ Sheet vacío")
+                log.warning(f"ℹ️ Sheet '{title}' vacío")
                 return [], []
                 
-            headers = [h.strip() for h in values[0]]
+            headers = [h.strip() if h else "" for h in values[0]]
             rows = values[1:]
             
-            log.info(f"✅ Sheet cargado: {len(headers)} columnas, {len(rows)} filas")
+            log.info(f"✅ Sheet cargado: {title} - {len(headers)} columnas, {len(rows)} filas")
             return headers, rows
             
         except Exception as e:
@@ -271,7 +274,7 @@ class GoogleServicesManager:
                 media = MediaIoBaseUpload(
                     io.BytesIO(contenido_bytes),
                     mimetype=mime_type,
-                    resumable=False  # Cambiado a False para mayor estabilidad
+                    resumable=False
                 )
                 
                 archivo = self.drive_service.files().create(
@@ -296,6 +299,103 @@ class GoogleServicesManager:
                     log.error(f"❌ Máximo de reintentos para {nombre_archivo}")
                     return None
                     
+        return None
+    
+    def update_sheet_cell(self, row_number: int, column_name: str, value: str) -> bool:
+        """Actualiza celda en Google Sheets"""
+        if not self.initialized or not self.sheets_service:
+            log.error("❌ Google Sheets no inicializado")
+            return False
+            
+        try:
+            headers, _ = self.get_sheet_rows()
+            if not headers:
+                return False
+            
+            # Encontrar índice de columna
+            col_idx = None
+            for i, h in enumerate(headers):
+                if h and h.lower() == column_name.lower():
+                    col_idx = i
+                    break
+            
+            if col_idx is None:
+                log.error(f"❌ Columna '{column_name}' no encontrada")
+                return False
+            
+            # Convertir índice a letra de columna (A=0, B=1, etc.)
+            col_letter = chr(ord('A') + col_idx)
+            range_name = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_number}"
+            
+            body = {
+                'values': [[value]]
+            }
+            
+            self.sheets_service.spreadsheets().values().update(
+                spreadsheetId=SHEETS_ID_LEADS,
+                range=range_name,
+                valueInputOption='USER_ENTERED',
+                body=body
+            ).execute()
+            
+            log.info(f"✅ Celda actualizada: {range_name} = '{value}'")
+            return True
+            
+        except Exception as e:
+            log.error(f"❌ Error actualizando celda: {str(e)}")
+            return False
+    
+    def find_next_pending_client(self) -> Optional[Dict[str, Any]]:
+        """Encuentra el próximo cliente pendiente para envío automático"""
+        if not self.initialized:
+            return None
+            
+        headers, rows = self.get_sheet_rows()
+        if not headers:
+            return None
+        
+        # Encontrar índices de columnas
+        def find_index(col_name: str) -> Optional[int]:
+            col_name_lower = col_name.lower()
+            for i, h in enumerate(headers):
+                if h and h.lower() == col_name_lower:
+                    return i
+            return None
+        
+        idx_nombre = find_index("Nombre")
+        idx_wa = find_index("WhatsApp")
+        idx_status = find_index("ESTATUS")
+        idx_last = find_index("LAST_MESSAGE_AT")
+        
+        if idx_wa is None:
+            return None
+        
+        for row_num, row in enumerate(rows, start=2):
+            # Verificar si hay número de WhatsApp
+            if idx_wa < len(row) and row[idx_wa].strip():
+                wa_number = row[idx_wa].strip()
+                
+                # Verificar estado
+                if idx_status is not None and idx_status < len(row):
+                    estatus = row[idx_status].strip().upper()
+                    
+                    # Saltar si ya tiene estado diferente a PENDIENTE o vacío
+                    if estatus and estatus not in ("", "PENDIENTE", "FALLO_ENVIO"):
+                        continue
+                
+                # Verificar último mensaje
+                if idx_last is not None and idx_last < len(row) and row[idx_last].strip():
+                    # Ya tiene timestamp, saltar
+                    continue
+                
+                nombre = row[idx_nombre].strip() if idx_nombre is not None and idx_nombre < len(row) else ""
+                
+                return {
+                    "row": row_num,
+                    "nombre": nombre,
+                    "whatsapp": wa_number
+                }
+        
         return None
 
 # Instancia global de Google Services
@@ -462,6 +562,25 @@ def _normalize_phone_last10(phone: str) -> str:
     """Normaliza teléfono a últimos 10 dígitos"""
     digits = re.sub(r"\D", "", phone or "")
     return digits[-10:] if len(digits) >= 10 else digits
+
+def _normalize_to_e164_mx(phone: str) -> str:
+    """Normaliza teléfono a formato E164 para México"""
+    digits = re.sub(r"\D", "", phone or "")
+    
+    # Si ya tiene 521 + 10 dígitos
+    if digits.startswith("521") and len(digits) == 13:
+        return digits
+    
+    # Si tiene 52 + 10 dígitos, agregar 1
+    if digits.startswith("52") and len(digits) == 12:
+        return f"521{digits[2:]}"
+    
+    # Si tiene solo 10 dígitos, agregar 521
+    if len(digits) == 10:
+        return f"521{digits}"
+    
+    # Para otros formatos, devolver como está
+    return digits
 
 def interpret_response(text: str) -> str:
     """Interpreta respuesta del usuario"""
@@ -738,14 +857,14 @@ def manejar_mensaje_auto(telefono: str, texto: str, match: Optional[Dict[str, An
             
             # Verificar si completó
             if estado.tiene_todos_documentos():
-                mensaje_final = """🎉 *¡Todos los datos recibidos!*
+                mensaje_final = f"""🎉 *¡Todos los datos recibidos!*
 
 ✅ Placas registradas: {placas}
 ✅ INE (Frente)
 
 *Procesando tu solicitud...*
 
-En breve Christian se pondrá en contacto para tu cotización.""".format(placas=placas)
+En breve Christian se pondrá en contacto para tu cotización."""
                 
                 send_message(telefono, mensaje_final)
                 _notificar_asesor(f"✅ DATOS COMPLETOS (Placas)\nCliente: {telefono}\nPlacas: {placas}\nINE recibida\n¡Contactar!")
@@ -932,7 +1051,7 @@ def handle_auto_context_response(telefono: str, texto: str, match: Dict[str, Any
     return False
 
 # ==========================
-# Flask App (CORREGIDO - sin before_first_request)
+# Flask App
 # ==========================
 app = Flask(__name__)
 
@@ -946,6 +1065,9 @@ if GOOGLE_CREDENTIALS_JSON:
 else:
     log.warning("⚠️ Google credentials no configuradas")
 
+# ==========================
+# Webhook endpoints
+# ==========================
 @app.route('/webhook', methods=['GET'])
 def webhook_verify():
     """Verificación webhook"""
@@ -1080,7 +1202,7 @@ def webhook_receive():
                         else:
                             send_message(telefono, "Hola 👋 Soy *Vicky*. Estoy para ayudarte.")
                     
-                    send_message(telefono, "No entendí. " + MAIN_MENU.split('\n')[0])
+                    send_message(telefono, MAIN_MENU)
                     user_state[telefono] = "menu"
         
         return jsonify({'status': 'ok'}), 200
@@ -1090,7 +1212,7 @@ def webhook_receive():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # ==========================
-# Endpoints auxiliares
+# Endpoints auxiliares (TODOS INCLUIDOS)
 # ==========================
 @app.route('/health', methods=['GET'])
 def health():
@@ -1114,7 +1236,8 @@ def ext_health():
         'google': google_services.initialized,
         'drive_parent': DRIVE_PARENT_FOLDER_ID,
         'sheets_id': SHEETS_ID_LEADS,
-        'port': PORT
+        'port': PORT,
+        'auto_send_token_configured': bool(AUTO_SEND_TOKEN)
     }), 200
 
 @app.route('/ext/send-promo', methods=['POST'])
@@ -1198,6 +1321,87 @@ def ext_test_send():
         log.error(f"❌ Error test-send: {str(e)}")
         return jsonify({'ok': False, 'error': str(e)}), 500
 
+# ==========================
+# 🔥 ENDPOINT /ext/auto-send-one (AGREGADO)
+# ==========================
+@app.route('/ext/auto-send-one', methods=['POST'])
+def ext_auto_send_one():
+    """
+    Endpoint para cron: envía 1 plantilla al siguiente prospecto pendiente.
+    Protegido por header: X-AUTO-TOKEN = AUTO_SEND_TOKEN
+    """
+    try:
+        # Verificar token de autorización
+        token = (request.headers.get("X-AUTO-TOKEN") or "").strip()
+        if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
+            log.warning(f"❌ Token inválido o faltante: recibido={token[:10]}..., esperado={AUTO_SEND_TOKEN[:10]}...")
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        
+        # Obtener template del body
+        body = request.get_json(force=True, silent=True) or {}
+        template_name = str(body.get("template", "")).strip()
+        if not template_name:
+            return jsonify({"ok": False, "error": "Falta parámetro 'template'"}), 400
+        
+        log.info(f"🔄 Auto-send iniciado para template: {template_name}")
+        
+        # Buscar próximo cliente pendiente
+        cliente = google_services.find_next_pending_client()
+        if not cliente:
+            log.info("ℹ️ No hay clientes pendientes para envío automático")
+            return jsonify({
+                "ok": True, 
+                "sent": False, 
+                "reason": "no_pending_clients"
+            }), 200
+        
+        log.info(f"📋 Cliente encontrado: {cliente['nombre']} ({cliente['whatsapp']}) - Fila {cliente['row']}")
+        
+        # Normalizar número de WhatsApp
+        to = _normalize_to_e164_mx(cliente["whatsapp"])
+        nombre = (cliente["nombre"] or "").strip() or "Cliente"
+        
+        # Enviar plantilla
+        log.info(f"📤 Enviando plantilla '{template_name}' a {to} (Nombre: {nombre})")
+        ok = send_template_message(to, template_name, {"nombre": nombre})
+        
+        # Actualizar Google Sheets
+        now_iso = datetime.utcnow().isoformat()
+        
+        if ok:
+            estatus_val = "ENVIADO_INICIAL"
+            log.info(f"✅ Plantilla enviada exitosamente a {to}")
+        else:
+            estatus_val = "FALLO_ENVIO"
+            log.error(f"❌ Falló envío de plantilla a {to}")
+        
+        # Actualizar celdas en Google Sheets
+        if google_services.initialized:
+            # Actualizar ESTATUS
+            google_services.update_sheet_cell(cliente["row"], "ESTATUS", estatus_val)
+            
+            # Actualizar LAST_MESSAGE_AT
+            google_services.update_sheet_cell(cliente["row"], "LAST_MESSAGE_AT", now_iso)
+        
+        # Notificar al asesor si es exitoso
+        if ok and ADVISOR_NUMBER:
+            _notificar_asesor(f"🤖 Auto-send completado\nCliente: {nombre}\nTeléfono: {to}\nTemplate: {template_name}\nEstado: {estatus_val}")
+        
+        return jsonify({
+            "ok": True,
+            "sent": bool(ok),
+            "to": to,
+            "row": cliente["row"],
+            "nombre": nombre,
+            "template": template_name,
+            "estatus": estatus_val,
+            "timestamp": now_iso
+        }), 200
+        
+    except Exception as e:
+        log.exception(f"❌ Error crítico en /ext/auto-send-one")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route('/debug/drive', methods=['GET'])
 def debug_drive():
     """Debug de Drive"""
@@ -1205,7 +1409,8 @@ def debug_drive():
         'initialized': google_services.initialized,
         'last_error': google_services.last_error,
         'parent_folder': DRIVE_PARENT_FOLDER_ID,
-        'sheets_id': SHEETS_ID_LEADS
+        'sheets_id': SHEETS_ID_LEADS,
+        'auto_send_token': bool(AUTO_SEND_TOKEN)
     }), 200
 
 @app.route('/debug/documentos/<telefono>', methods=['GET'])
@@ -1221,7 +1426,8 @@ def debug_documentos(telefono: str):
             'esperando_tarjeta': estado.esperando_tarjeta,
             'tiene_todos': estado.tiene_todos_documentos(),
             'carpeta_drive': estado.carpeta_drive_id,
-            'intentos_fallidos': estado.intentos_fallidos
+            'intentos_fallidos': estado.intentos_fallidos,
+            'user_state': user_state.get(telefono, 'no registrado')
         }), 200
     else:
         return jsonify({
@@ -1231,7 +1437,7 @@ def debug_documentos(telefono: str):
         }), 200
 
 # ==========================
-# Punto de entrada (CORREGIDO)
+# Punto de entrada
 # ==========================
 if __name__ == '__main__':
     log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
@@ -1239,5 +1445,6 @@ if __name__ == '__main__':
     log.info(f"📊 Google Services: {'✅' if google_services.initialized else '❌'}")
     log.info(f"📁 Drive Parent: {'✅' if DRIVE_PARENT_FOLDER_ID else '❌'}")
     log.info(f"📋 Sheets ID: {'✅' if SHEETS_ID_LEADS else '❌'}")
+    log.info(f"🤖 Auto-send Token: {'✅' if AUTO_SEND_TOKEN else '❌'}")
     
     app.run(host='0.0.0.0', port=PORT, debug=False)
