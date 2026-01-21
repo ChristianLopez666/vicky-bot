@@ -1,4 +1,4 @@
-# app.py — Vicky SECOM (Versión 100% Funcional Corregida)
+# app.py — Vicky SECOM (Versión 100% Funcional Corregida - Webhook FIXED)
 # Python 3.11+
 # ------------------------------------------------------------
 # CORRECCIONES APLICADAS:
@@ -8,7 +8,7 @@
 # 4. ✅ Logging exhaustivo para diagnóstico
 # 5. ✅ Manejo mejorado de errores
 # 6. ✅ Worker para envíos masivos
-# 7. ✅ DETECCIÓN DE RESPUESTAS A PLANTILLAS (SEGURO AUTO)
+# 7. ✅ WEBHOOK FIXED - Detección temprana de respuestas a plantillas
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ PORT = int(os.getenv("PORT", "5000"))
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-d %H:%M:%S"
 )
 log = logging.getLogger("vicky-secom")
 
@@ -292,75 +292,6 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
                 continue
             return False
     return False
-
-
-    components: List[Dict[str, Any]] = []
-
-    # BODY parameters
-    if isinstance(params, dict):
-        # Named params: un solo componente body con parameters que incluyen parameter_name
-        body_params = []
-        for k, v in params.items():
-            key = str(k).strip()
-            if not key:
-                continue
-            body_params.append({
-                "type": "text",
-                "parameter_name": key,
-                "text": str(v)
-            })
-        if body_params:
-            components.append({"type": "body", "parameters": body_params})
-    elif isinstance(params, list):
-        # Positional params: un solo componente body
-        components.append({
-            "type": "body",
-            "parameters": [{"type": "text", "text": str(x)} for x in params]
-        })
-    else:
-        # Sin parámetros
-        components = []
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        "template": {
-            "name": template_name,
-            "language": {"code": "es_MX"},
-            **({"components": components} if components else {})
-        }
-    }
-
-    for attempt in range(3):
-        try:
-            log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
-            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-
-            if resp.status_code == 200:
-                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
-                return True
-
-            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
-            if _should_retry(resp.status_code) and attempt < 2:
-                log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
-                _backoff(attempt)
-                continue
-            return False
-        except requests.exceptions.Timeout:
-            log.error(f"⏰ Timeout enviando plantilla a {to} (intento {attempt + 1})")
-            if attempt < 2:
-                _backoff(attempt)
-                continue
-            return False
-        except Exception:
-            log.exception(f"❌ Error en send_template_message a {to}")
-            if attempt < 2:
-                _backoff(attempt)
-                continue
-            return False
-    return False
-
 
 # ==========================
 # Google Helpers
@@ -887,7 +818,7 @@ def webhook_verify():
     return "Error", 403
 
 # ==========================
-# Webhook — recepción
+# Webhook — recepción (VERSIÓN CORREGIDA)
 # ==========================
 def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """Descarga bytes, mime_type y filename desde WPP Graph para media_id."""
@@ -971,37 +902,63 @@ def webhook_receive():
 
         msg = messages[0]
         phone = msg.get("from")
+        
         if not phone:
             log.warning("⚠️ Mensaje sin número de teléfono")
             return jsonify({"ok": True}), 200
 
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
 
-        # 🔍 DETECTAR SI ES RESPUESTA A UNA PLANTILLA ESPECÍFICA
+        # 🔍 DETECTAR SI ES RESPUESTA A UNA PLANTILLA ESPECÍFICA (LO PRIMERO)
         context_info = msg.get("context", {})
         template_name = ""
         
         if context_info:
-            from_msg_id = context_info.get("id", "")
             template_name = context_info.get("template_name", "").lower()
-            log.info(f"🔍 Mensaje es respuesta. Plantilla original: {template_name}")
+            log.info(f"🔍 Mensaje es respuesta a plantilla: {template_name}")
             
-            # Si es respuesta a plantilla de seguro de auto, activamos ese flujo
+            # Si es respuesta a plantilla de seguro de auto, activamos ese flujo INMEDIATAMENTE
             if "seguro_auto" in template_name or "auto_70" in template_name:
-                log.info(f"🚗 Cliente {phone} respondiendo a plantilla de seguro de auto")
-                # Iniciamos el flujo de seguro de auto directamente
-                auto_start(phone, None)
+                log.info(f"🚗 Cliente {phone} respondiendo a plantilla de seguro de auto - ACTIVANDO FLUJO")
+                # ESTABLECER ESTADO ANTES DE CUALQUIER OTRA LÓGICA
+                user_state[phone] = "auto_intro"
+                # Enviar mensaje de bienvenida específico
+                send_message(phone,
+                    "🚗 *Seguro de Auto*\nEnvíame por favor:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas\n\nCuando lo envíes, te confirmaré recepción y procesaré la cotización."
+                )
                 return jsonify({"ok": True}), 200
                 
-            # Si es respuesta a TPV, ya está manejado por _tpv_is_context
+            # Si es respuesta a TPV
             elif "tpv" in template_name.lower():
                 log.info(f"💳 Cliente {phone} respondiendo a plantilla TPV")
                 match = match_client_in_sheets(_normalize_phone_last10(phone))
                 if _tpv_is_context(match):
                     user_state[phone] = "tpv_start"
-                # La lógica de TPV se manejará en _route_command
 
-        # Lógica existente para estado del usuario
+        # Si NO es respuesta a plantilla, continuar con lógica normal
+        # Pero primero verificar si el mensaje contiene palabras clave de seguro
+        mtype = msg.get("type")
+        if mtype == "text" and "text" in msg:
+            text = msg["text"].get("body", "").strip()
+            log.info(f"💬 Texto recibido de {phone}: {text}")
+            
+            # DETECCIÓN ESPECÍFICA PARA SEGURO DE AUTO (palabras clave)
+            t_lower = text.lower().strip()
+            
+            # Si el usuario menciona "seguro", "auto", "vencimiento" o similar
+            seguro_keywords = ["seguro", "auto", "carro", "vehículo", "vencimiento", "vence", "póliza", "poliza"]
+            if any(keyword in t_lower for keyword in seguro_keywords):
+                # Verificar si el usuario está en estado neutral
+                current_state = user_state.get(phone, "")
+                if current_state in ("", "__greeted__", None):
+                    log.info(f"🚗 Palabra clave de seguro detectada - Activando flujo para {phone}")
+                    user_state[phone] = "auto_intro"
+                    send_message(phone,
+                        "🚗 *Seguro de Auto*\nEnvíame por favor:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas\n\nCuando lo envíes, te confirmaré recepción y procesaré la cotización."
+                    )
+                    return jsonify({"ok": True}), 200
+
+        # Lógica existente para estado del usuario (solo si no se activó flujo especial)
         if phone not in user_state:
             user_state[phone] = "__greeted__"
             match = _greet_and_match(phone)
@@ -1036,23 +993,14 @@ def webhook_receive():
                 not t_lower.isdigit()
                 and t_lower not in VALID_COMMANDS
                 and is_idle
-                and template_name  # Solo si viene de plantilla
             ):
                 aviso = (
-                    "📩 Cliente INTERESADO / DUDA detectada (respuesta a plantilla)\n"
+                    "📩 Cliente INTERESADO / DUDA detectada\n"
                     f"WhatsApp: {phone}\n"
-                    f"Plantilla: {template_name}\n"
                     f"Mensaje: {text}"
                 )
                 _notify_advisor(aviso)
-            
-            # Si el cliente está en flujo de auto y pregunta por fecha de vencimiento
-            if "vencimiento" in t_lower or "vence" in t_lower or "fecha" in t_lower:
-                if user_state.get(phone) == "__greeted__" or is_idle:
-                    log.info(f"📅 Cliente {phone} pregunta por fecha de vencimiento")
-                    user_state[phone] = "auto_vencimiento_fecha"
-                    send_message(phone, "¿Cuál es la *fecha de vencimiento* de tu póliza actual? (formato AAAA-MM-DD)")
-                    return jsonify({"ok": True}), 200
+            # =========================================================
 
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
