@@ -9,6 +9,7 @@
 # 5. ✅ Manejo mejorado de errores
 # 6. ✅ Worker para envíos masivos
 # 7. ✅ WEBHOOK FIXED - Detección temprana de respuestas a plantillas
+# 8. ✅ FIXED: Subida a Google Drive con mejor manejo de errores
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -391,17 +392,50 @@ def upload_to_drive(file_name: str, file_bytes: bytes, mime_type: str, folder_na
         log.warning("⚠️ Drive no disponible; no se puede subir archivo.")
         return None
     try:
+        log.info(f"📤 Intentando subir a Drive: {file_name} ({len(file_bytes)} bytes) a carpeta '{folder_name}'")
+        
         folder_id = _find_or_create_client_folder(folder_name)
         if not folder_id:
+            log.error(f"❌ No se pudo crear/obtener carpeta: {folder_name}")
             return None
-        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
-        meta = {"name": file_name, "parents": [folder_id]}
-        created = drive_svc.files().create(body=meta, media_body=media, fields="id, webViewLink").execute()
-        link = created.get("webViewLink") or created.get("id")
-        log.info(f"✅ Archivo subido a Drive: {file_name} -> {link}")
-        return link
-    except Exception:
-        log.exception("❌ Error subiendo archivo a Drive")
+            
+        # Crear media object
+        file_obj = io.BytesIO(file_bytes)
+        media = MediaIoBaseUpload(file_obj, mimetype=mime_type, resumable=True)
+        
+        # Metadata del archivo
+        file_metadata = {
+            "name": file_name,
+            "parents": [folder_id]
+        }
+        
+        log.info(f"📤 Subiendo archivo '{file_name}' a carpeta ID: {folder_id}")
+        
+        # Ejecutar upload
+        request = drive_svc.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, name, webViewLink, webContentLink"
+        )
+        
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                log.info(f"📊 Progreso: {int(status.progress() * 100)}%")
+        
+        file_id = response.get("id")
+        web_view_link = response.get("webViewLink")
+        web_content_link = response.get("webContentLink")
+        
+        log.info(f"✅ Archivo subido exitosamente a Drive")
+        log.info(f"   📎 File ID: {file_id}")
+        log.info(f"   🔗 Web View Link: {web_view_link}")
+        log.info(f"   📥 Web Content Link: {web_content_link}")
+        
+        return web_view_link or file_id
+    except Exception as e:
+        log.exception(f"❌ Error crítico subiendo archivo a Drive: {str(e)}")
         return None
 
 # ==========================
@@ -908,68 +942,188 @@ def webhook_verify():
 def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """Descarga bytes, mime_type y filename desde WPP Graph para media_id."""
     if not META_TOKEN:
+        log.error("❌ META_TOKEN no configurado para descargar media")
         return None, None, None
+    
+    log.info(f"📥 Descargando media ID: {media_id}")
+    
     try:
-        meta = requests.get(
-            f"https://graph.facebook.com/v20.0/{media_id}",
+        # Obtener metadata del archivo
+        meta_url = f"https://graph.facebook.com/v20.0/{media_id}"
+        meta_resp = requests.get(
+            meta_url,
             headers={"Authorization": f"Bearer {META_TOKEN}"},
             timeout=WPP_TIMEOUT
         )
-        if meta.status_code != 200:
-            log.warning(f"⚠️ Meta media meta fallo {meta.status_code}: {meta.text[:200]}")
+        
+        if meta_resp.status_code != 200:
+            log.error(f"❌ Error obteniendo metadata: {meta_resp.status_code} - {meta_resp.text[:200]}")
             return None, None, None
-        meta_j = meta.json()
+        
+        meta_j = meta_resp.json()
         url = meta_j.get("url")
-        mime = meta_j.get("mime_type")
-        fname = meta_j.get("filename") or f"media_{media_id}"
+        mime = meta_j.get("mime_type", "application/octet-stream")
+        
+        # Extraer nombre de archivo
+        fname = None
+        if "filename" in meta_j:
+            fname = meta_j.get("filename")
+        else:
+            # Intentar extraer de content-disposition si está disponible
+            content_disp = meta_resp.headers.get('content-disposition', '')
+            if 'filename=' in content_disp:
+                fname = content_disp.split('filename=')[-1].strip('"\'')
+        
+        if not fname:
+            # Crear nombre basado en tipo y timestamp
+            ext_map = {
+                'image/jpeg': '.jpg',
+                'image/png': '.png',
+                'application/pdf': '.pdf',
+                'application/msword': '.doc',
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+                'application/vnd.ms-excel': '.xls',
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx'
+            }
+            ext = ext_map.get(mime, '.bin')
+            fname = f"whatsapp_media_{int(time.time())}{ext}"
+        
         if not url:
+            log.error("❌ No se obtuvo URL de descarga")
             return None, None, None
-        binr = requests.get(url, headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=WPP_TIMEOUT)
-        if binr.status_code != 200:
-            log.warning(f"⚠️ Meta media download fallo {binr.status_code}")
+        
+        log.info(f"📥 Descargando archivo: {fname} ({mime}) desde {url}")
+        
+        # Descargar contenido
+        bin_resp = requests.get(
+            url, 
+            headers={"Authorization": f"Bearer {META_TOKEN}"}, 
+            timeout=WPP_TIMEOUT * 2  # Más tiempo para descargas grandes
+        )
+        
+        if bin_resp.status_code != 200:
+            log.error(f"❌ Error descargando contenido: {bin_resp.status_code}")
             return None, None, None
-        log.info(f"✅ Media descargada: {fname} ({len(binr.content)} bytes)")
-        return binr.content, mime, fname
-    except Exception:
-        log.exception("❌ Error descargando media")
+        
+        content = bin_resp.content
+        log.info(f"✅ Media descargada exitosamente: {fname} ({len(content)} bytes)")
+        
+        return content, mime, fname
+        
+    except requests.exceptions.Timeout:
+        log.error(f"⏰ Timeout descargando media {media_id}")
+        return None, None, None
+    except Exception as e:
+        log.exception(f"❌ Error crítico descargando media {media_id}: {str(e)}")
         return None, None, None
 
 def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
     try:
+        log.info(f"🖼️ Procesando multimedia de {phone}")
+        
+        # Extraer media_id basado en tipo
         media_id = None
-        if msg.get("type") == "image" and "image" in msg:
+        media_type = msg.get("type", "")
+        file_info = {}
+        
+        if media_type == "image" and "image" in msg:
             media_id = msg["image"].get("id")
-        elif msg.get("type") == "document" and "document" in msg:
+            file_info = msg["image"]
+        elif media_type == "document" and "document" in msg:
             media_id = msg["document"].get("id")
-        elif msg.get("type") == "audio" and "audio" in msg:
+            file_info = msg["document"]
+        elif media_type == "audio" and "audio" in msg:
             media_id = msg["audio"].get("id")
-        elif msg.get("type") == "video" and "video" in msg:
+            file_info = msg["audio"]
+        elif media_type == "video" and "video" in msg:
             media_id = msg["video"].get("id")
+            file_info = msg["video"]
+        else:
+            log.warning(f"⚠️ Tipo de multimedia no soportado: {media_type}")
+            send_message(phone, "Recibí tu archivo, gracias. (Tipo de archivo no procesable).")
+            return
 
         if not media_id:
-            send_message(phone, "Recibí tu archivo, gracias. (No se pudo identificar el contenido).")
+            log.error("❌ No se pudo extraer media_id del mensaje")
+            send_message(phone, "Recibí tu archivo, pero no pude identificar el contenido.")
             return
 
+        log.info(f"📥 Descargando {media_type} con ID: {media_id}")
+        
+        # Descargar archivo
         file_bytes, mime, fname = _download_media(media_id)
         if not file_bytes:
-            send_message(phone, "Recibí tu archivo, pero hubo un problema procesándolo.")
+            log.error("❌ No se pudieron descargar los bytes del archivo")
+            send_message(phone, "Recibí tu archivo, pero hubo un problema descargándolo.")
             return
 
-        last4 = _normalize_phone_last10(phone)[-4:]
-        match = match_client_in_sheets(_normalize_phone_last10(phone))
+        # Buscar información del cliente
+        last10 = _normalize_phone_last10(phone)
+        match = match_client_in_sheets(last10)
+        
+        # Crear nombre de carpeta
         if match and match.get("nombre"):
-            folder_name = f"{match['nombre'].replace(' ', '_')}_{last4}"
+            folder_name = f"{match['nombre'].replace(' ', '_')}_{last10[-4:]}"
         else:
-            folder_name = f"Cliente_{last4}"
-
-        link = upload_to_drive(fname, file_bytes, mime or "application/octet-stream", folder_name)
-        link_text = link or "(sin link Drive)"
-
-        _notify_advisor(f"🔔 Multimedia recibida\nDesde: {phone}\nArchivo: {fname}\nDrive: {link_text}")
-        send_message(phone, "✅ *Recibido y en proceso*. En breve te doy seguimiento.")
-    except Exception:
-        log.exception("❌ Error manejando multimedia")
-        send_message(phone, "Recibí tu archivo, gracias. Si algo falla, lo reviso de inmediato.")
+            folder_name = f"Cliente_{last10[-4:]}"
+        
+        # Subir a Drive
+        log.info(f"📤 Subiendo a Drive: {fname} a carpeta '{folder_name}'")
+        drive_link = upload_to_drive(fname, file_bytes, mime or "application/octet-stream", folder_name)
+        
+        if drive_link:
+            link_text = f"{drive_link}"
+            log.info(f"✅ Archivo subido exitosamente: {link_text}")
+            
+            # Notificar al asesor con más detalles
+            nombre_cliente = match.get("nombre", "").strip() if match else "Sin nombre"
+            aviso = (
+                "🔔 *Multimedia recibida*\n"
+                f"📞 *Desde:* {phone}\n"
+                f"👤 *Cliente:* {nombre_cliente}\n"
+                f"📎 *Archivo:* {fname}\n"
+                f"📦 *Tamaño:* {len(file_bytes):,} bytes\n"
+                f"📁 *Tipo:* {media_type}\n"
+                f"🔗 *Drive:* {link_text}"
+            )
+            
+            # Intentar notificar al asesor
+            try:
+                _notify_advisor(aviso)
+                log.info(f"✅ Notificación enviada al asesor: {ADVISOR_NUMBER}")
+            except Exception as e:
+                log.error(f"❌ Error notificando al asesor: {str(e)}")
+            
+            # Responder al cliente
+            send_message(phone, "✅ *Documentos recibidos y procesados*. El asesor los revisará y te dará seguimiento.")
+        else:
+            # Fallback si Drive falla: notificar igual pero sin link
+            log.warning("⚠️ Falló subida a Drive, notificando sin link")
+            
+            nombre_cliente = match.get("nombre", "").strip() if match else "Sin nombre"
+            aviso = (
+                "⚠️ *Multimedia recibida (SIN DRIVE)*\n"
+                f"📞 *Desde:* {phone}\n"
+                f"👤 *Cliente:* {nombre_cliente}\n"
+                f"📎 *Archivo:* {fname}\n"
+                f"📦 *Tamaño:* {len(file_bytes):,} bytes\n"
+                f"📁 *Tipo:* {media_type}\n"
+                f"❌ *Drive:* Falló la subida"
+            )
+            
+            try:
+                _notify_advisor(aviso)
+                log.info(f"⚠️ Notificación de error enviada al asesor")
+            except Exception as e:
+                log.error(f"❌ Error notificando falla al asesor: {str(e)}")
+            
+            # Responder al cliente (mensaje genérico)
+            send_message(phone, "✅ *Documentos recibidos*. Están siendo procesados. En breve te doy seguimiento.")
+            
+    except Exception as e:
+        log.exception(f"❌ Error crítico manejando multimedia de {phone}")
+        # Mensaje de fallback al cliente
+        send_message(phone, "Recibí tus documentos. Si hay algún problema, nuestro asesor te contactará.")
 
 @app.post("/webhook")
 def webhook_receive():
