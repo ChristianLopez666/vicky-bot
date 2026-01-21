@@ -8,6 +8,7 @@
 # 4. ✅ Logging exhaustivo para diagnóstico
 # 5. ✅ Manejo mejorado de errores
 # 6. ✅ Worker para envíos masivos
+# 7. ✅ DETECCIÓN DE RESPUESTAS A PLANTILLAS (SEGURO AUTO)
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -976,6 +977,31 @@ def webhook_receive():
 
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
 
+        # 🔍 DETECTAR SI ES RESPUESTA A UNA PLANTILLA ESPECÍFICA
+        context_info = msg.get("context", {})
+        template_name = ""
+        
+        if context_info:
+            from_msg_id = context_info.get("id", "")
+            template_name = context_info.get("template_name", "").lower()
+            log.info(f"🔍 Mensaje es respuesta. Plantilla original: {template_name}")
+            
+            # Si es respuesta a plantilla de seguro de auto, activamos ese flujo
+            if "seguro_auto" in template_name or "auto_70" in template_name:
+                log.info(f"🚗 Cliente {phone} respondiendo a plantilla de seguro de auto")
+                # Iniciamos el flujo de seguro de auto directamente
+                auto_start(phone, None)
+                return jsonify({"ok": True}), 200
+                
+            # Si es respuesta a TPV, ya está manejado por _tpv_is_context
+            elif "tpv" in template_name.lower():
+                log.info(f"💳 Cliente {phone} respondiendo a plantilla TPV")
+                match = match_client_in_sheets(_normalize_phone_last10(phone))
+                if _tpv_is_context(match):
+                    user_state[phone] = "tpv_start"
+                # La lógica de TPV se manejará en _route_command
+
+        # Lógica existente para estado del usuario
         if phone not in user_state:
             user_state[phone] = "__greeted__"
             match = _greet_and_match(phone)
@@ -1010,14 +1036,23 @@ def webhook_receive():
                 not t_lower.isdigit()
                 and t_lower not in VALID_COMMANDS
                 and is_idle
+                and template_name  # Solo si viene de plantilla
             ):
                 aviso = (
-                    "📩 Cliente INTERESADO / DUDA detectada\n"
+                    "📩 Cliente INTERESADO / DUDA detectada (respuesta a plantilla)\n"
                     f"WhatsApp: {phone}\n"
+                    f"Plantilla: {template_name}\n"
                     f"Mensaje: {text}"
                 )
                 _notify_advisor(aviso)
-            # =========================================================
+            
+            # Si el cliente está en flujo de auto y pregunta por fecha de vencimiento
+            if "vencimiento" in t_lower or "vence" in t_lower or "fecha" in t_lower:
+                if user_state.get(phone) == "__greeted__" or is_idle:
+                    log.info(f"📅 Cliente {phone} pregunta por fecha de vencimiento")
+                    user_state[phone] = "auto_vencimiento_fecha"
+                    send_message(phone, "¿Cuál es la *fecha de vencimiento* de tu póliza actual? (formato AAAA-MM-DD)")
+                    return jsonify({"ok": True}), 200
 
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
