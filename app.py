@@ -909,7 +909,7 @@ def webhook_receive():
 
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
 
-        # 🔍 DETECTAR SI ES RESPUESTA A UNA PLANTILLA ESPECÍFICA (LO PRIMERO)
+        # 🔍 DETECCIÓN DE PLANTILLAS DESACTIVADA — Sheets es la única fuente de verdad
         context_info = msg.get("context", {})
         template_name = ""
         
@@ -959,11 +959,7 @@ def webhook_receive():
                     return jsonify({"ok": True}), 200
 
         # Lógica existente para estado del usuario (solo si no se activó flujo especial)
-        if phone not in user_state:
-            user_state[phone] = "__greeted__"
-            match = _greet_and_match(phone)
-        else:
-            match = None
+        match = _greet_and_match(phone) if phone not in user_state else match_client_in_sheets(_normalize_phone_last10(phone))
 
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
