@@ -205,6 +205,22 @@ def send_message(to: str, text: str) -> bool:
     return False
 
 
+def forward_media_to_advisor(media_type: str, media_id: str) -> None:
+    """Reenvía la multimedia recibida al número del asesor usando el media_id original."""
+    if not (META_TOKEN and WPP_API_URL and ADVISOR_NUMBER):
+        return
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": ADVISOR_NUMBER,
+        "type": media_type,
+        media_type: {"id": media_id}
+    }
+    try:
+        requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+        log.info(f"📤 Multimedia reenviada al asesor ({media_type})")
+    except Exception:
+        log.exception("❌ Error reenviando multimedia al asesor")
+
 def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
     """Envía plantilla preaprobada.
 
@@ -949,6 +965,9 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
         if not media_id:
             send_message(phone, "Recibí tu archivo, gracias. (No se pudo identificar el contenido).")
             return
+
+        # 🔁 Reenviar inmediatamente la multimedia al asesor
+        forward_media_to_advisor(msg.get("type"), media_id)
 
         file_bytes, mime, fname = _download_media(media_id)
         if not file_bytes:
