@@ -477,12 +477,12 @@ MAIN_MENU = (
 )
 
 def send_main_menu(phone: str) -> None:
-    log.info(f\"📋 Enviando menú principal a {phone}\")
+    log.info(f"📋 Enviando menú principal a {phone}")
     try:
         user = _ensure_user(phone)
-        user[\"last_menu_shown\"] = True
+        user["last_menu_shown"] = True
     except Exception:
-        log.exception(\"❌ No se pudo guardar last_menu_shown\")
+        log.exception("❌ No se pudo guardar last_menu_shown")
     send_message(phone, MAIN_MENU)
 
 # ==========================
