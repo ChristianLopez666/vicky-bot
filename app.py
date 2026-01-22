@@ -1,3 +1,44 @@
+from __future__ import annotations
+
+STATE_CLOSED = "closed"
+STATE_HANDOFF = "handoff"
+
+def is_close_message(text: str) -> bool:
+    t = text.lower()
+    CLOSE_WORDS = ["gracias", "por lo pronto", "luego", "después", "no por ahora", "más tarde"]
+    return any(w in t for w in CLOSE_WORDS)
+
+
+def gpt_copilot_response(user_text: str, context: str = "") -> str:
+    try:
+        messages = [
+            {"role": "system", "content": "Eres Vicky, asistente financiera de Inbursa. Responde breve, clara y comercial."},
+            {"role": "assistant", "content": context},
+            {"role": "user", "content": user_text},
+        ]
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.3,
+            max_tokens=180,
+        )
+        return resp.choices[0].message["content"].strip()
+    except Exception:
+        return "Entendido. Un asesor te contactará para apoyarte mejor."
+
+
+def reset_state(phone):
+    user_state[phone] = STATE_CLOSED
+    user_data.pop(phone, None)
+
+
+def safe_send(phone, text):
+    if last_bot_message.get(phone) == text:
+        return
+    last_bot_message[phone] = text
+    send_text(phone, text)
+
+
 # app.py — Vicky SECOM (Versión 100% Funcional Corregida - Webhook FIXED)
 # Python 3.11+
 # ------------------------------------------------------------
@@ -10,9 +51,6 @@
 # 6. ✅ Worker para envíos masivos
 # 7. ✅ WEBHOOK FIXED - Detección temprana de respuestas a plantillas
 # ------------------------------------------------------------
-
-from __future__ import annotations
-
 import os
 import io
 import re
@@ -67,7 +105,7 @@ PORT = int(os.getenv("PORT", "5000"))
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%Y-%m-d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger("vicky-secom")
 
@@ -131,6 +169,55 @@ def interpret_response(text: str) -> str:
     if any(n in t for n in neg):
         return "negative"
     return "neutral"
+
+
+def detect_intent(text: str) -> str:
+    """Heurística ligera para detectar intención de producto/acción desde lenguaje natural."""
+    if not text:
+        return "unknown"
+    t = text.strip().lower()
+
+    # Normalizaciones simples
+    t = t.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+
+    # Acciones globales
+    if any(k in t for k in ("menu", "menú", "inicio", "start", "hola")):
+        return "menu"
+    if any(k in t for k in ("contactar", "asesor", "christian", "llamada", "hablar con", "comunicar")):
+        return "contactar"
+
+    # Productos / embudos
+    if any(k in t for k in ("prestamo", "préstamo", "imss", "ley 73", "pensionado", "pension", "pensión", "credito imss", "crédito imss")):
+        return "imss"
+    if any(k in t for k in ("tpv", "terminal", "terminal bancaria", "punto de venta", "punto venta", "cobrar con tarjeta", "comisiones")):
+        return "tpv"
+    if any(k in t for k in ("auto", "seguro de auto", "seguro auto", "poliza", "póliza", "placas", "tarjeta de circulacion", "tarjeta de circulación")):
+        return "auto"
+    if any(k in t for k in ("vrim", "tarjeta medica", "tarjeta médica", "membresia medica", "membresía médica")):
+        return "vrim"
+    if any(k in t for k in ("vida", "gmm", "gastos medicos", "gastos médicos", "salud", "seguro de vida")):
+        return "vida_salud"
+    if any(k in t for k in ("empresarial", "empresa", "negocio", "pyme", "capital de trabajo", "credito empresarial", "crédito empresarial")):
+        return "empresarial"
+    if any(k in t for k in ("financiamiento", "credito simple", "crédito simple", "revolvente", "factoraje", "arrendamiento")):
+        return "financiamiento"
+
+    return "unknown"
+
+
+def _flow_from_state(st: str) -> str:
+    st = st or ""
+    if st.startswith("auto_"):
+        return "auto"
+    if st.startswith("tpv_"):
+        return "tpv"
+    if st.startswith("imss_"):
+        return "imss"
+    if st.startswith("emp_"):
+        return "empresarial"
+    if st.startswith("fp_"):
+        return "financiamiento"
+    return "unknown"
 
 def extract_number(text: str) -> Optional[float]:
     if not text:
@@ -857,6 +944,46 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
     t = text.strip().lower()
     st = user_state.get(phone, "")
 
+    # Intent router de respaldo (por si la llamada no pasó por webhook_receive)
+    intent = detect_intent(text)
+    flow = _flow_from_state(st)
+    if intent == "menu":
+        user_state[phone] = "__greeted__"
+        send_main_menu(phone)
+        return
+    if intent == "contactar":
+        _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}\nMensaje: {text}")
+        send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
+        send_main_menu(phone)
+        return
+    if intent not in ("unknown", flow):
+        user_state[phone] = "__greeted__"
+        if intent == "imss":
+            imss_start(phone, match)
+            return
+        if intent == "auto":
+            auto_start(phone, match)
+            return
+        if intent == "tpv":
+            tpv_start_from_reply(phone, "1", match)
+            return
+        if intent == "empresarial":
+            emp_start(phone, match)
+            return
+        if intent == "financiamiento":
+            fp_start(phone, match)
+            return
+        if intent == "vida_salud":
+            send_message(phone, "🧬 *Seguros de Vida/Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.")
+            _notify_advisor(f"🔔 Vida/Salud — Solicitud de contacto\nWhatsApp: {phone}\nMensaje: {text}")
+            send_main_menu(phone)
+            return
+        if intent == "vrim":
+            send_message(phone, "🩺 *VRIM* — Membresía médica. Notificaré al asesor para darte detalles.")
+            _notify_advisor(f"🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}\nMensaje: {text}")
+            send_main_menu(phone)
+            return
+
     # TPV tiene prioridad si el prospecto viene de la plantilla promo_tpv
     if st.startswith("tpv_"):
         _tpv_next(phone, text, match)
@@ -1027,7 +1154,58 @@ def webhook_receive():
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
             
+            
             # =========================================================
+            # 🧭 INTENT ROUTER (cambio de producto sin fricción)
+            # =========================================================
+            intent = detect_intent(text)
+            flow = _flow_from_state(st_now)
+
+            # Comandos rápidos (menú / contacto) con prioridad
+            if intent == "menu":
+                user_state[phone] = "__greeted__"
+                send_main_menu(phone)
+                return jsonify({"ok": True}), 200
+
+            if intent == "contactar":
+                _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}\nMensaje: {text}")
+                send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
+                send_main_menu(phone)
+                return jsonify({"ok": True}), 200
+
+            # Si el usuario está dentro de un flujo y pide OTRO producto, se hace override inmediato
+            if intent not in ("unknown", flow):
+                log.info(f"🧭 Cambio de intención detectado: flow_actual={flow} -> intent={intent}")
+                user_state[phone] = "__greeted__"  # reseteo controlado (mantiene saludo)
+                # Derivación al embudo correcto
+                if intent == "imss":
+                    imss_start(phone, match)
+                    return jsonify({"ok": True}), 200
+                if intent == "auto":
+                    auto_start(phone, match)
+                    return jsonify({"ok": True}), 200
+                if intent == "tpv":
+                    # Simula aceptación para iniciar el flujo TPV sin exigir comandos
+                    tpv_start_from_reply(phone, "1", match)
+                    return jsonify({"ok": True}), 200
+                if intent == "empresarial":
+                    emp_start(phone, match)
+                    return jsonify({"ok": True}), 200
+                if intent == "financiamiento":
+                    fp_start(phone, match)
+                    return jsonify({"ok": True}), 200
+                if intent == "vida_salud":
+                    send_message(phone, "🧬 *Seguros de Vida/Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.")
+                    _notify_advisor(f"🔔 Vida/Salud — Solicitud de contacto\nWhatsApp: {phone}\nMensaje: {text}")
+                    send_main_menu(phone)
+                    return jsonify({"ok": True}), 200
+                if intent == "vrim":
+                    send_message(phone, "🩺 *VRIM* — Membresía médica. Notificaré al asesor para darte detalles.")
+                    _notify_advisor(f"🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}\nMensaje: {text}")
+                    send_main_menu(phone)
+                    return jsonify({"ok": True}), 200
+            # =========================================================
+# =========================================================
             # 🔔 INTERCEPTOR POST-CAMPAÑA (AUTO) - PRIORIDAD ALTA
             # =========================================================
             if idle and match:
@@ -1060,7 +1238,7 @@ def webhook_receive():
             if (
                 not t_lower.isdigit()
                 and t_lower not in VALID_COMMANDS
-                and idle
+                and (locals().get("intent") == "unknown")
             ):
                 aviso = (
                     "📩 Cliente INTERESADO / DUDA detectada\n"
