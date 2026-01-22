@@ -1161,6 +1161,8 @@ def webhook_receive():
 # =========================
 # GPT INVISIBLE — FALLBACK (sin comandos)
 # =========================
+    except Exception:
+        pass
 if idle and text and (not t_lower.isdigit()) and (t_lower not in VALID_COMMANDS):
     intent = gpt_classify_intent(text)
     if intent:
