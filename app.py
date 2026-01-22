@@ -113,46 +113,6 @@ user_data: Dict[str, Dict[str, Any]] = {}
 # ==========================
 # Utilidades generales
 # ==========================
-
-# ==========================
-# GPT — Clasificador de intención (INVISIBLE)
-# ==========================
-def gpt_classify_intent(text: str) -> Optional[str]:
-    """Devuelve una etiqueta de intención o None. GPT NO responde al usuario."""
-    if not openai or not OPENAI_API_KEY or not text:
-        return None
-
-    try:
-        completion = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Clasifica el mensaje del usuario y responde SOLO con UNA etiqueta exacta:\n"
-                        "INTENT_PRESTAMO_IMSS\n"
-                        "INTENT_SEGURO_AUTO\n"
-                        "INTENT_VIDA_SALUD\n"
-                        "INTENT_VRIM\n"
-                        "INTENT_EMPRESARIAL\n"
-                        "INTENT_CONTACTO\n"
-                        "INTENT_DESCONOCIDO\n"
-                        "No agregues texto adicional."
-                    ),
-                },
-                {"role": "user", "content": text},
-            ],
-        )
-
-        label = (completion.choices[0].message.content or "").strip()
-        if label.startswith("INTENT_"):
-            return label
-        return "INTENT_DESCONOCIDO"
-    except Exception:
-        log.exception("❌ Error GPT clasificando intención")
-        return None
-
 WPP_API_URL = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages" if WABA_PHONE_ID else None
 WPP_TIMEOUT = 15
 
@@ -478,11 +438,6 @@ MAIN_MENU = (
 
 def send_main_menu(phone: str) -> None:
     log.info(f"📋 Enviando menú principal a {phone}")
-    try:
-        user = _ensure_user(phone)
-        user["last_menu_shown"] = True
-    except Exception:
-        log.exception("❌ No se pudo guardar last_menu_shown")
     send_message(phone, MAIN_MENU)
 
 # ==========================
@@ -496,6 +451,90 @@ def _notify_advisor(text: str) -> None:
         log.exception("❌ Error notificando al asesor")
 
 # --- TPV / Terminal bancaria (solo cuando viene de plantilla promo_tpv) ---
+
+# ==========================
+# GPT Invisible (clasificación de intención, SIN respuesta libre)
+# ==========================
+GPT_INTENTS = {
+    'INTENT_PRESTAMO_IMSS',
+    'INTENT_SEGURO_AUTO',
+    'INTENT_VIDA_SALUD',
+    'INTENT_VRIM',
+    'INTENT_EMPRESARIAL',
+    'INTENT_FINANCIAMIENTO_PRACTICO',
+    'INTENT_CONTACTO_ASESOR',
+    'INTENT_DESCONOCIDO',
+}
+
+def gpt_classify_intent(user_text: str) -> Optional[str]:
+    """
+    Clasifica la intención del usuario para enrutarlo a un flujo existente.
+    Regresa SOLO una etiqueta en GPT_INTENTS o None si no se puede clasificar.
+    """
+    if not (openai and OPENAI_API_KEY):
+        return None
+    t = (user_text or '').strip()
+    if not t:
+        return None
+    try:
+        system = (
+            "Eres un clasificador de intención para un bot de WhatsApp. "
+            "NO debes responder al usuario. "
+            "Debes contestar SOLO con UNA de estas etiquetas exactas: "
+            "INTENT_PRESTAMO_IMSS, INTENT_SEGURO_AUTO, INTENT_VIDA_SALUD, INTENT_VRIM, "
+            "INTENT_EMPRESARIAL, INTENT_FINANCIAMIENTO_PRACTICO, INTENT_CONTACTO_ASESOR, INTENT_DESCONOCIDO. "
+            "Si no estás seguro, responde INTENT_DESCONOCIDO."
+        )
+        completion = openai.chat.completions.create(
+            model=os.getenv('OPENAI_MODEL', 'gpt-4o-mini'),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": t},
+            ],
+            temperature=0.0,
+        )
+        intent = (completion.choices[0].message.content or '').strip()
+        # Sanitizar: tomar primera línea/primer token
+        intent = intent.splitlines()[0].strip()
+        intent = intent.split()[0].strip()
+        if intent in GPT_INTENTS:
+            return intent
+        return None
+    except Exception:
+        log.exception('❌ Error en gpt_classify_intent')
+        return None
+
+def route_gpt_intent(phone: str, intent: str, match: Optional[Dict[str, Any]]) -> None:
+    """Enruta a los flujos existentes (sin inventar respuestas)."""
+    if intent == 'INTENT_PRESTAMO_IMSS':
+        imss_start(phone, match)
+        return
+    if intent == 'INTENT_SEGURO_AUTO':
+        auto_start(phone, match)
+        return
+    if intent == 'INTENT_EMPRESARIAL':
+        emp_start(phone, match)
+        return
+    if intent == 'INTENT_FINANCIAMIENTO_PRACTICO':
+        fp_start(phone, match)
+        return
+    if intent == 'INTENT_VIDA_SALUD':
+        send_message(phone, '🧬 *Seguros de Vida/Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.')
+        _notify_advisor(f'🔔 Vida/Salud — Solicitud de contacto\nWhatsApp: {phone}')
+        send_main_menu(phone)
+        return
+    if intent == 'INTENT_VRIM':
+        send_message(phone, '🩺 *VRIM* — Membresía médica. Notificaré al asesor para darte detalles.')
+        _notify_advisor(f'🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}')
+        send_main_menu(phone)
+        return
+    if intent == 'INTENT_CONTACTO_ASESOR':
+        _notify_advisor(f'🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}')
+        send_message(phone, '✅ Listo. Avisé a Christian para que te contacte.')
+        send_main_menu(phone)
+        return
+    # Desconocido: fallback a menú
+    send_message(phone, 'No entendí. Escribe *menú* para ver opciones.')
 TPV_TEMPLATE_NAME = "promo_tpv"
 
 def _parse_dt_maybe(value: str) -> Optional[datetime]:
@@ -889,42 +928,6 @@ def _retry_after_days(phone: str, days: int) -> None:
 # ==========================
 # Router helpers
 # ==========================
-
-def route_gpt_intent(phone: str, intent: str, match: Optional[Dict[str, Any]]) -> None:
-    """Mapea intención -> flujos existentes. GPT NO manda, solo interpreta."""
-    if intent == "INTENT_PRESTAMO_IMSS":
-        imss_start(phone, match)
-        return
-
-    if intent == "INTENT_SEGURO_AUTO":
-        auto_start(phone, match)
-        return
-
-    if intent == "INTENT_EMPRESARIAL":
-        emp_start(phone, match)
-        return
-
-    if intent == "INTENT_CONTACTO":
-        try:
-            _notify_advisor(f"🔔 Contacto solicitado (GPT)\nWhatsApp: {phone}")
-        except Exception:
-            log.exception("❌ Error notificando asesor (GPT contacto)")
-        send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
-        send_main_menu(phone)
-        return
-
-    if intent in ("INTENT_VIDA_SALUD", "INTENT_VRIM"):
-        try:
-            _notify_advisor(f"🔔 Interés detectado ({intent})\nWhatsApp: {phone}")
-        except Exception:
-            log.exception("❌ Error notificando asesor (GPT interés)")
-        send_message(phone, "Gracias por tu interés. Un asesor te contactará.")
-        send_main_menu(phone)
-        return
-
-    # Desconocido: menú seguro
-    send_main_menu(phone)
-
 def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     last10 = _normalize_phone_last10(phone)
     match = match_client_in_sheets(last10)
@@ -1157,28 +1160,19 @@ def webhook_receive():
                 if not match:  # Solo saludar si no tenemos match ya
                     _greet_and_match(phone)
 
+            # =========================================================
+            # 🧠 GPT Invisible (clasifica y enruta, SIN comando especial:)
+            # =========================================================
+            if (openai and OPENAI_API_KEY) and idle and text and (not t_lower.isdigit()) and (t_lower not in VALID_COMMANDS):
+                intent = gpt_classify_intent(text)
+                if intent and intent != 'INTENT_DESCONOCIDO':
+                    user_data.setdefault(phone, {})['last_intent'] = intent
+                    log.info(f"🧠 GPT intent detectada para {phone}: {intent}")
+                    route_gpt_intent(phone, intent, match)
+                    return jsonify({"ok": True, "gpt_intent": intent}), 200
+            # =========================================================
 
-# =========================
-# GPT INVISIBLE — FALLBACK (sin comandos)
-# =========================
-    except Exception:
-        pass
-if idle and text and (not t_lower.isdigit()) and (t_lower not in VALID_COMMANDS):
-    intent = gpt_classify_intent(text)
-    if intent:
-        try:
-            user = _ensure_user(phone)
-            user["last_intent"] = intent
-            user["last_menu_shown"] = False
-        except Exception:
-            log.exception("❌ No se pudo guardar estado mínimo (last_intent)")
-
-        log.info(f"🧠 GPT intent detectado: {intent}")
-        route_gpt_intent(phone, intent, match)
-        return jsonify({"ok": True}), 200
-
-
-    _route_command(phone, text, match)
+            _route_command(phone, text, match)
             return jsonify({"ok": True}), 200
 
         if mtype in {"image", "document", "audio", "video"}:
@@ -1374,13 +1368,6 @@ def ext_send_promo():
 # Arranque (para desarrollo local)
 # En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
 # ==========================
-if __name__ == "__main__":
-    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
-    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
-    log.info(f"📊 Google Sheets/Drive: {google_ready}")
-    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
-    
-    app.run(host="0.0.0.0", port=PORT, debug=False)
 # ==========================
 # AUTO SEND (1 prospecto por corrida) — Render Cron Job
 # ==========================
@@ -1539,3 +1526,12 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
+    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
+    log.info(f"📊 Google Sheets/Drive: {google_ready}")
+    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
+    
+    app.run(host="0.0.0.0", port=PORT, debug=False)
