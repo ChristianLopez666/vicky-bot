@@ -9,6 +9,7 @@
 # 5. ✅ Manejo mejorado de errores
 # 6. ✅ Worker para envíos masivos
 # 7. ✅ WEBHOOK FIXED - Detección temprana de respuestas a plantillas
+# 8. ✅ GPT como clasificador de intención (fallback inteligente)
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -441,6 +442,133 @@ def send_main_menu(phone: str) -> None:
     send_message(phone, MAIN_MENU)
 
 # ==========================
+# GPT Intención Classifier
+# ==========================
+def classify_intent_with_gpt(text: str) -> str:
+    """
+    Clasifica la intención del mensaje usando GPT.
+    Retorna una etiqueta de intención específica.
+    """
+    if not openai or not OPENAI_API_KEY:
+        log.warning("⚠️ OpenAI no disponible para clasificación de intención")
+        return "INTENT_DESCONOCIDO"
+    
+    system_prompt = """
+    Eres un clasificador de intenciones para un bot de WhatsApp de servicios financieros (Inbursa).
+    
+    REGLAS ESTRICTAS:
+    1. SOLO devuelve UNA de estas etiquetas exactas:
+       - INTENT_PRESTAMO_IMSS
+       - INTENT_SEGURO_AUTO
+       - INTENT_SEGURO_VIDA_SALUD
+       - INTENT_VRIM
+       - INTENT_CREDITO_EMPRESARIAL
+       - INTENT_FINANCIAMIENTO_PRACTICO
+       - INTENT_CONTACTO
+       - INTENT_MENU
+       - INTENT_DESCONOCIDO
+    
+    2. NO escribas explicaciones
+    3. NO escribas texto para el usuario
+    4. NO inventes nuevas etiquetas
+    5. NO uses puntuación adicional
+    6. Responde ÚNICAMENTE con la etiqueta
+    
+    CONTEXTO:
+    - El usuario puede escribir en español informal
+    - Clasifica según la intención principal
+    
+    EJEMPLOS:
+    "quiero un préstamo del imss" → INTENT_PRESTAMO_IMSS
+    "necesito seguro para mi carro" → INTENT_SEGURO_AUTO
+    "cotizar auto" → INTENT_SEGURO_AUTO
+    "seguro de vida" → INTENT_SEGURO_VIDA_SALUD
+    "tarjeta médica" → INTENT_VRIM
+    "crédito para mi negocio" → INTENT_CREDITO_EMPRESARIAL
+    "quiero hablar con un asesor" → INTENT_CONTACTO
+    "hola" → INTENT_MENU
+    "quiero una pizza" → INTENT_DESCONOCIDO
+    """
+    
+    try:
+        log.info(f"🧠 Clasificando intención con GPT para: '{text[:50]}...'")
+        
+        completion = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.1,
+            max_tokens=20
+        )
+        
+        intent = completion.choices[0].message.content.strip()
+        
+        # Validar que la respuesta sea una etiqueta válida
+        valid_intents = {
+            "INTENT_PRESTAMO_IMSS",
+            "INTENT_SEGURO_AUTO", 
+            "INTENT_SEGURO_VIDA_SALUD",
+            "INTENT_VRIM",
+            "INTENT_CREDITO_EMPRESARIAL",
+            "INTENT_FINANCIAMIENTO_PRACTICO",
+            "INTENT_CONTACTO",
+            "INTENT_MENU",
+            "INTENT_DESCONOCIDO"
+        }
+        
+        if intent in valid_intents:
+            log.info(f"✅ Intención clasificada: {intent}")
+            return intent
+        else:
+            log.warning(f"⚠️ GPT devolvió etiqueta inválida: {intent}")
+            return "INTENT_DESCONOCIDO"
+            
+    except Exception as e:
+        log.exception(f"❌ Error clasificando intención con GPT: {e}")
+        return "INTENT_DESCONOCIDO"
+
+def handle_unknown_message_with_gpt(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
+    """
+    Maneja mensajes desconocidos usando GPT para clasificar intención.
+    Redirige al flujo correspondiente basado en la clasificación.
+    """
+    intent = classify_intent_with_gpt(text)
+    
+    # Almacenar temporalmente la última intención detectada
+    user_data.setdefault(phone, {})["last_intent"] = intent
+    user_data[phone]["last_menu_shown"] = datetime.utcnow().isoformat()
+    
+    # Mapear intención a acción
+    if intent == "INTENT_PRESTAMO_IMSS":
+        imss_start(phone, match)
+    elif intent == "INTENT_SEGURO_AUTO":
+        auto_start(phone, match)
+    elif intent == "INTENT_SEGURO_VIDA_SALUD":
+        send_message(phone, "🧬 *Seguros de Vida/Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.")
+        _notify_advisor(f"🔔 Vida/Salud — Solicitud de contacto\nWhatsApp: {phone}")
+        send_main_menu(phone)
+    elif intent == "INTENT_VRIM":
+        send_message(phone, "🩺 *VRIM* — Membresía médica. Notificaré al asesor para darte detalles.")
+        _notify_advisor(f"🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}")
+        send_main_menu(phone)
+    elif intent == "INTENT_CREDITO_EMPRESARIAL":
+        emp_start(phone, match)
+    elif intent == "INTENT_FINANCIAMIENTO_PRACTICO":
+        fp_start(phone, match)
+    elif intent == "INTENT_CONTACTO":
+        _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
+        send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
+        send_main_menu(phone)
+    elif intent == "INTENT_MENU":
+        user_state[phone] = "__greeted__"
+        send_main_menu(phone)
+    else:  # INTENT_DESCONOCIDO o cualquier otro caso
+        send_message(phone, "No entendí claramente tu solicitud. ¿Puedes ser más específico o elegir una opción del menú?\n\nEscribe *menú* para ver las opciones disponibles.")
+        log.info(f"🤖 Intención desconocida para '{text[:50]}...', solicitando clarificación")
+
+# ==========================
 # Embudos (conservados del original)
 # ==========================
 def _notify_advisor(text: str) -> None:
@@ -865,6 +993,7 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         if tpv_start_from_reply(phone, text, match):
             return
 
+    # Comandos directos del menú
     if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
         imss_start(phone, match)
     elif t in ("2", "auto", "seguros de auto", "seguro auto"):
@@ -889,6 +1018,7 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
     else:
+        # Si estamos en un embudo específico, continuar con él
         st = user_state.get(phone, "")
         if st.startswith("imss_"):
             _imss_next(phone, text)
@@ -899,7 +1029,8 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         elif st.startswith("auto_"):
             _auto_next(phone, text)
         else:
-            send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
+            # Mensaje no reconocido - usar GPT como fallback inteligente
+            handle_unknown_message_with_gpt(phone, text, match)
 
 # ==========================
 # Webhook — verificación
@@ -1076,22 +1207,22 @@ def webhook_receive():
                 if not match:  # Solo saludar si no tenemos match ya
                     _greet_and_match(phone)
 
-            # Comando especial GPT
+            # Comando especial GPT (solo para depuración - no UX productivo)
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
-                    log.info(f"🧠 Procesando solicitud GPT para {phone}")
+                    log.info(f"🧠 Procesando solicitud GPT (depuración) para {phone}")
                     completion = openai.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.4,
                     )
                     answer = completion.choices[0].message.content.strip()
-                    send_message(phone, answer)
+                    send_message(phone, f"[DEPURACIÓN GPT]\n{answer}")
                     return jsonify({"ok": True}), 200
                 except Exception:
-                    log.exception("❌ Error llamando a OpenAI")
-                    send_message(phone, "Hubo un detalle al procesar tu solicitud. Intentemos de nuevo.")
+                    log.exception("❌ Error llamando a OpenAI (depuración)")
+                    send_message(phone, "Hubo un detalle al procesar tu solicitud de depuración.")
                     return jsonify({"ok": True}), 200
 
             _route_command(phone, text, match)
@@ -1455,3 +1586,4 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
+        
