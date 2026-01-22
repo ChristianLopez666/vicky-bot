@@ -1,11 +1,4 @@
-# app.py — Vicky SECOM (Versión 100% Funcional Co
-        # 🔎 RAG: responder dudas con manuales
-        if openai and OPENAI_API_KEY and text and not text.lower().startswith(("menu","hola","hi")):
-            ans = _rag_answer(text)
-            if ans:
-                send_message(phone, ans)
-                return jsonify({"ok": True}), 200
-rregida - Webhook FIXED)
+# app.py — Vicky SECOM (Versión 100% Funcional Corregida - Webhook FIXED)
 # Python 3.11+
 # ------------------------------------------------------------
 # CORRECCIONES APLICADAS:
@@ -16,6 +9,7 @@ rregida - Webhook FIXED)
 # 5. ✅ Manejo mejorado de errores
 # 6. ✅ Worker para envíos masivos
 # 7. ✅ WEBHOOK FIXED - Detección temprana de respuestas a plantillas
+# 8. ✅ Integración robusta con OpenAI / GPT
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -62,6 +56,7 @@ WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")  # configurable
 
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
@@ -80,8 +75,9 @@ log = logging.getLogger("vicky-secom")
 
 if OPENAI_API_KEY and openai:
     try:
+        # Compatible con SDKs que usan openai.api_key o openai.api_key = ...
         openai.api_key = OPENAI_API_KEY
-        log.info("OpenAI configurado correctamente")
+        log.info("OpenAI configurado correctamente (clave añadida)")
     except Exception:
         log.warning("OpenAI configurado pero no disponible")
 
@@ -1088,12 +1084,54 @@ def webhook_receive():
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
                     log.info(f"🧠 Procesando solicitud GPT para {phone}")
-                    completion = openai.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.4,
-                    )
-                    answer = completion.choices[0].message.content.strip()
+                    # Intentamos soportar distintas versiones del SDK.
+                    answer_text = None
+                    model = OPENAI_MODEL or "gpt-3.5-turbo"
+                    # Opción 1: SDK clásico (openai.ChatCompletion.create)
+                    try:
+                        completion = openai.ChatCompletion.create(
+                            model=model,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.4,
+                        )
+                        # acceder al contenido de forma segura
+                        choice = completion.choices[0]
+                        # choice.message puede ser dict-like
+                        if hasattr(choice, "message") and isinstance(choice.message, dict):
+                            answer_text = choice.message.get("content")
+                        elif isinstance(choice, dict) and choice.get("message"):
+                            answer_text = choice["message"].get("content")
+                        else:
+                            # algunos SDK retornan choices[0].text
+                            answer_text = getattr(choice, "text", None) or (choice.get("text") if isinstance(choice, dict) else None)
+                    except Exception as e1:
+                        log.debug("openai.ChatCompletion.create falló, intentando alternativa: %s", e1)
+                        # Opción 2: nueva ruta (openai.chat.completions.create)
+                        try:
+                            completion = openai.chat.completions.create(
+                                model=model,
+                                messages=[{"role": "user", "content": prompt}],
+                                temperature=0.4,
+                            )
+                            choice = completion.choices[0]
+                            # choice.message puede ser objeto o dict
+                            msgobj = None
+                            if isinstance(choice, dict):
+                                msgobj = choice.get("message") or choice.get("delta")
+                            else:
+                                msgobj = getattr(choice, "message", None) or getattr(choice, "delta", None)
+                            if isinstance(msgobj, dict):
+                                answer_text = msgobj.get("content")
+                            else:
+                                # fallback
+                                answer_text = getattr(choice, "text", None) or (choice.get("text") if isinstance(choice, dict) else None)
+                        except Exception as e2:
+                            log.exception("❌ Ambos intentos a OpenAI fallaron")
+                            raise
+
+                    answer = (answer_text or "").strip()
+                    if not answer:
+                        answer = "Lo siento, no obtuve respuesta del modelo. Intenta más tarde."
                     send_message(phone, answer)
                     return jsonify({"ok": True}), 200
                 except Exception:
@@ -1462,44 +1500,4 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
-# =====================
-# RAG MANUALES (DRIVE)
-# =====================
-from pypdf import PdfReader
 
-_MANUAL_CACHE = {}
-
-def _load_manuals_from_drive():
-    if not DRIVE_PARENT_FOLDER_ID:
-        return
-    files = drive_list_files(DRIVE_PARENT_FOLDER_ID)
-    for f in files:
-        if not f["name"].lower().endswith(".pdf"):
-            continue
-        if f["id"] in _MANUAL_CACHE:
-            continue
-        data = drive_download_file(f["id"])
-        reader = PdfReader(data)
-        text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        _MANUAL_CACHE[f["name"]] = text.lower()
-
-def _rag_answer(question: str) -> str | None:
-    if not _MANUAL_CACHE:
-        _load_manuals_from_drive()
-    q = question.lower()
-    hits = []
-    for name, text in _MANUAL_CACHE.items():
-        if any(w in text for w in q.split()):
-            hits.append((name, text))
-    if not hits:
-        return None
-    context = hits[0][1][:4000]
-    completion = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Responde solo con base en el manual proporcionado. Si no viene, di que no está en el manual."},
-            {"role": "user", "content": f"MANUAL:\n{context}\n\nPREGUNTA:{question}"}
-        ],
-        temperature=0.2,
-    )
-    return completion.choices[0].message.content.strip()
