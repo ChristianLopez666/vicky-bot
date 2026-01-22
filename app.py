@@ -1178,7 +1178,7 @@ if idle and text and (not t_lower.isdigit()) and (t_lower not in VALID_COMMANDS)
         return jsonify({"ok": True}), 200
 
 
-            _route_command(phone, text, match)
+    _route_command(phone, text, match)
             return jsonify({"ok": True}), 200
 
         if mtype in {"image", "document", "audio", "video"}:
