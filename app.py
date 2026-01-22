@@ -1,3 +1,56 @@
+# =========================
+# 🔒 ESTADOS TERMINALES
+# =========================
+STATE_CLOSED = "closed"
+STATE_HANDOFF = "handoff"
+
+def is_close_message(text: str) -> bool:
+    t = text.lower()
+    CLOSE_WORDS = ["gracias", "por lo pronto", "luego", "después", "no por ahora", "más tarde"]
+    return any(w in t for w in CLOSE_WORDS)
+
+
+# =========================
+# 🧠 GPT COPILOTO (IN-FLOW)
+# =========================
+def gpt_copilot_response(user_text: str, context: str = "") -> str:
+    try:
+        messages = [
+            {"role": "system", "content": "Eres Vicky, asistente financiera de Inbursa. Responde breve, clara y comercial."},
+            {"role": "assistant", "content": context},
+            {"role": "user", "content": user_text},
+        ]
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.3,
+            max_tokens=180,
+        )
+        return resp.choices[0].message["content"].strip()
+    except Exception:
+        return "Entendido. Un asesor te contactará para apoyarte mejor."
+
+
+# =========================
+# ♻️ RESET DURO DE ESTADO
+# =========================
+def reset_state(phone):
+    user_state[phone] = STATE_CLOSED
+    user_data.pop(phone, None)
+
+
+# =========================
+# 🚫 ANTI-BUCLE
+# =========================
+last_bot_message = {}
+
+def safe_send(phone, text):
+    if last_bot_message.get(phone) == text:
+        return
+    last_bot_message[phone] = text
+    send_text(phone, text)
+
+
 # app.py — Vicky SECOM (Versión 100% Funcional Corregida - Webhook FIXED)
 # Python 3.11+
 # ------------------------------------------------------------
