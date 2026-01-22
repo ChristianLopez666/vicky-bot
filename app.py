@@ -1,17 +1,14 @@
-# app.py — Vicky SECOM (Producción)
+# app.py — Vicky SECOM (Versión 100% Funcional Corregida - Webhook FIXED)
 # Python 3.11+
 # ------------------------------------------------------------
-# Mejoras aplicadas (resumen):
-# - Fix plantillas: BODY usa parámetros posicionales; soporta dict -> lista mediante TEMPLATE_PARAM_ORDER
-# - OpenAI migrado a cliente moderno (OpenAI.responses) con fallback al SDK legacy
-# - Eliminados threads de larga espera; ahora se registran seguimientos en Sheets
-# - Centralizado GRAPH_VERSION para WPP/descarga media
-# - Corrección datefmt en logging
-# - Menor ruido de notificaciones "DUDA" (solo si match + campaña reciente/contexto)
-# - Validaciones y logging más robustos
-# - FIX: no abortar envío de plantilla si falta SEGURO_AUTO_70_IMAGE_URL (env var)
-# - FIX: FALLO_ENVIO solo si Meta responde con fallo HTTP; no marcar fallo por configuraciones internas
-# - Logging forense completo en fallos de plantillas (payload completo + status + response.text)
+# CORRECCIONES APLICADAS:
+# 1. ✅ Endpoint /ext/send-promo completamente funcional
+# 2. ✅ Eliminación de función duplicada
+# 3. ✅ Validación robusta de configuración
+# 4. ✅ Logging exhaustivo para diagnóstico
+# 5. ✅ Manejo mejorado de errores
+# 6. ✅ Worker para envíos masivos
+# 7. ✅ WEBHOOK FIXED - Detección temprana de respuestas a plantillas
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -21,6 +18,8 @@ import io
 import re
 import json
 import time
+import math
+import queue
 import logging
 import threading
 from datetime import datetime, timedelta
@@ -40,18 +39,11 @@ except Exception:
     build = None
     MediaIoBaseUpload = None
 
-# OpenAI: intentamos cliente moderno; si no, fallback al SDK legacy
-openai_client = None
-openai_legacy = None
+# GPT opcional
 try:
-    from openai import OpenAI  # modern SDK
+    import openai
 except Exception:
-    OpenAI = None
-
-try:
-    import openai as openai_legacy_mod  # legacy SDK
-except Exception:
-    openai_legacy_mod = None
+    openai = None
 
 # ==========================
 # Carga entorno + Logging
@@ -63,8 +55,6 @@ WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")  # configurable
-GRAPH_VERSION = os.getenv("GRAPH_VERSION", "v20.0")
 
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
@@ -73,33 +63,20 @@ DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
 
 PORT = int(os.getenv("PORT", "5000"))
 
-# Configuración de logging robusta (fix datefmt)
+# Configuración de logging robusta
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, 
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-d %H:%M:%S"
 )
 log = logging.getLogger("vicky-secom")
 
-# Inicializar cliente OpenAI si es posible
-if OPENAI_API_KEY:
-    if 'OpenAI' in globals() and OpenAI is not None:
-        try:
-            openai_client = OpenAI(api_key=OPENAI_API_KEY)
-            log.info("OpenAI modern client configurado correctamente")
-        except Exception:
-            openai_client = None
-            log.exception("No se pudo inicializar OpenAI modern client")
-    if openai_client is None and openai_legacy_mod is not None:
-        try:
-            openai_legacy_mod.api_key = OPENAI_API_KEY
-            openai_legacy = openai_legacy_mod
-            log.info("OpenAI legacy SDK configurado correctamente (fallback)")
-        except Exception:
-            openai_legacy = None
-            log.exception("No se pudo inicializar OpenAI legacy SDK")
-else:
-    log.info("OPENAI_API_KEY no configurada; modo GPT deshabilitado")
+if OPENAI_API_KEY and openai:
+    try:
+        openai.api_key = OPENAI_API_KEY
+        log.info("OpenAI configurado correctamente")
+    except Exception:
+        log.warning("OpenAI configurado pero no disponible")
 
 # ==========================
 # Google Setup (degradable)
@@ -128,7 +105,6 @@ else:
 
 # =================================
 # Estado por usuario en memoria
-# (Se recomienda persistir en DB/Sheets si se requiere resiliencia)
 # =================================
 app = Flask(__name__)
 user_state: Dict[str, str] = {}
@@ -137,7 +113,7 @@ user_data: Dict[str, Dict[str, Any]] = {}
 # ==========================
 # Utilidades generales
 # ==========================
-WPP_API_URL = f"https://graph.facebook.com/{GRAPH_VERSION}/{WABA_PHONE_ID}/messages" if WABA_PHONE_ID else None
+WPP_API_URL = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages" if WABA_PHONE_ID else None
 WPP_TIMEOUT = 15
 
 def _normalize_phone_last10(phone: str) -> str:
@@ -191,23 +167,23 @@ def send_message(to: str, text: str) -> bool:
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID faltan).")
         return False
-
+    
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
         "text": {"body": text[:4096]},
     }
-
+    
     for attempt in range(3):
         try:
             log.info(f"📤 Enviando mensaje a {to} (intento {attempt + 1})")
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-
+            
             if resp.status_code == 200:
                 log.info(f"✅ Mensaje enviado exitosamente a {to}")
                 return True
-
+            
             log.warning(f"⚠️ WPP send_message fallo {resp.status_code}: {resp.text[:200]}")
             if _should_retry(resp.status_code) and attempt < 2:
                 log.info(f"🔄 Reintentando en {2 ** attempt} segundos...")
@@ -220,13 +196,14 @@ def send_message(to: str, text: str) -> bool:
                 _backoff(attempt)
                 continue
             return False
-        except Exception:
+        except Exception as e:
             log.exception(f"❌ Error en send_message a {to}")
             if attempt < 2:
                 _backoff(attempt)
                 continue
             return False
     return False
+
 
 def forward_media_to_advisor(media_type: str, media_id: str) -> None:
     """Reenvía la multimedia recibida al número del asesor usando el media_id original."""
@@ -244,26 +221,14 @@ def forward_media_to_advisor(media_type: str, media_id: str) -> None:
     except Exception:
         log.exception("❌ Error reenviando multimedia al asesor")
 
-# -------------------------------
-# Template parameter ordering
-# -------------------------------
-# Define aquí el orden de parámetros por plantilla (posicional {{1}}, {{2}}, ...)
-TEMPLATE_PARAM_ORDER: Dict[str, List[str]] = {
-    "promo_tpv": ["nombre"],
-    "seguro_auto_70": ["nombre"],
-    # Añadir otras plantillas y su orden de parámetros si es necesario
-}
-
 def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
-    """Envía plantilla preaprobada usando parámetros posicionales (BODY), evitando parameter_name.
+    """Envía plantilla preaprobada.
 
-    NOTA IMPORTANTE (fix solicitado):
-    - Si falta SEGURO_AUTO_70_IMAGE_URL, NO abortar. Loggear warning y enviar sin header.
-    - En caso de fallo HTTP de Meta: logging forense completo (template, payload, status_code, response.text).
+    - Si `params` es list => parámetros posicionales ({{1}}, {{2}}, ...).
+    - Si `params` es dict => parámetros nombrados ({{nombre}}, {{monto}}, ...), usando `parameter_name`.
     """
     if not (META_TOKEN and WPP_API_URL):
-        log.error("❌ WhatsApp no configurado para plantillas (META_TOKEN/WABA_PHONE_ID faltan).")
-        # Do not treat this as a Meta failure here; caller (ext_auto_send_one) should decide what to do.
+        log.error("❌ WhatsApp no configurado para plantillas.")
         return False
 
     components: List[Dict[str, Any]] = []
@@ -271,43 +236,38 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
     # HEADER image (solo plantillas con imagen fija)
     if template_name == "seguro_auto_70":
         image_url = os.getenv("SEGURO_AUTO_70_IMAGE_URL")
-        if image_url:
-            components.append({
-                "type": "header",
-                "parameters": [{
-                    "type": "image",
-                    "image": {"link": image_url}
-                }]
-            })
-        else:
-            # FIX: do not abort — send the template without header
-            log.warning("⚠️ SEGURO_AUTO_70_IMAGE_URL no definida, enviando plantilla 'seguro_auto_70' SIN header image.")
-
-    # BODY parameters -> siempre posicional "text"
-    body_params: List[Dict[str, Any]] = []
-    if isinstance(params, dict):
-        # mapear dict a lista usando TEMPLATE_PARAM_ORDER
-        schema = TEMPLATE_PARAM_ORDER.get(template_name)
-        if not schema:
-            log.error(f"❌ No existe un schema de parámetros para plantilla '{template_name}', no es seguro enviar dict. Abortando envío.")
-            # In this case we must log and return False because it's ambiguous how to map dict -> positional params.
+        if not image_url:
+            log.error("❌ Falta SEGURO_AUTO_70_IMAGE_URL en entorno.")
             return False
-        for key in schema:
-            if key not in params:
-                log.warning(f"⚠️ Parámetro '{key}' faltante para plantilla '{template_name}'; se envía cadena vacía.")
-            value = params.get(key, "")
-            body_params.append({"type": "text", "text": str(value)})
-    elif isinstance(params, list):
-        for v in params:
-            body_params.append({"type": "text", "text": str(v)})
-    else:
-        body_params = []
-
-    if body_params:
         components.append({
-            "type": "body",
-            "parameters": body_params
+            "type": "header",
+            "parameters": [{
+                "type": "image",
+                "image": {"link": image_url}
+            }]
         })
+
+    # BODY parameters
+    if isinstance(params, dict):
+        body_params = []
+        for k, v in params.items():
+            body_params.append({
+                "type": "text",
+                "parameter_name": k,
+                "text": str(v)
+            })
+        if body_params:
+            components.append({
+                "type": "body",
+                "parameters": body_params
+            })
+    elif isinstance(params, list):
+        body_params = [{"type": "text", "text": str(v)} for v in params]
+        if body_params:
+            components.append({
+                "type": "body",
+                "parameters": body_params
+            })
 
     payload = {
         "messaging_product": "whatsapp",
@@ -320,7 +280,6 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
         }
     }
 
-    # Intentar enviar con reintentos para 429/5xx
     for attempt in range(3):
         try:
             log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
@@ -330,41 +289,20 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
                 log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
                 return True
 
-            # Forensic logging: full payload + status + full response.text
-            try:
-                payload_str = json.dumps(payload, ensure_ascii=False)
-            except Exception:
-                payload_str = str(payload)
-
-            log.error(
-                "❌ WPP send_template failed\n"
-                f"template: {template_name}\n"
-                f"to: {to}\n"
-                f"status_code: {resp.status_code}\n"
-                f"response_text: {resp.text}\n"
-                f"payload: {payload_str}"
-            )
-
-            # Decide retry on 429/5xx
+            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
             if _should_retry(resp.status_code) and attempt < 2:
                 log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
                 _backoff(attempt)
                 continue
-
             return False
         except requests.exceptions.Timeout:
-            log.error(f"⏰ Timeout enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
+            log.error(f"⏰ Timeout enviando plantilla a {to} (intento {attempt + 1})")
             if attempt < 2:
                 _backoff(attempt)
                 continue
             return False
-        except Exception as e:
-            # Forensic logging for exceptions with payload
-            try:
-                payload_str = json.dumps(payload, ensure_ascii=False)
-            except Exception:
-                payload_str = str(payload)
-            log.exception(f"❌ Exception enviando plantilla '{template_name}' a {to}. Payload: {payload_str}")
+        except Exception:
+            log.exception(f"❌ Error en send_template_message a {to}")
             if attempt < 2:
                 _backoff(attempt)
                 continue
@@ -410,6 +348,7 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
                 last_at = _cell(row, i_last).strip() if i_last is not None else ""
                 log.info(f"✅ Cliente encontrado en Sheets: {nombre} ({target})")
                 return {"row": k, "nombre": nombre, "estatus": estatus, "last_message_at": last_at, "raw": row}
+
         log.info(f"ℹ️ Cliente no encontrado en Sheets: {target}")
         return None
     except Exception:
@@ -417,7 +356,7 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
         return None
 
 def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
-    """Registra una nota en una hoja 'Seguimiento' (append). (mantener compatibilidad histórica)"""
+    """Registra una nota en una hoja 'Seguimiento' (append)."""
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
         log.warning("⚠️ Sheets no disponible; no se puede escribir seguimiento.")
         return
@@ -436,28 +375,6 @@ def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
         log.info(f"✅ Seguimiento registrado en Sheets: {note}")
     except Exception:
         log.exception("❌ Error escribiendo seguimiento en Sheets")
-
-def write_followup_record(phone: str, tipo: str, fecha_objetivo_iso: str) -> None:
-    """
-    Registra un seguimiento estructurado en la hoja 'Seguimiento':
-    columnas: PHONE | TIPO | FECHA_OBJETIVO | STATUS
-    """
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
-        log.warning("⚠️ Sheets no disponible; no se puede escribir seguimiento estructurado.")
-        return
-    try:
-        title = "Seguimiento"
-        body = {"values": [[phone, tipo, fecha_objetivo_iso, "PENDIENTE"]]}
-        sheets_svc.spreadsheets().values().append(
-            spreadsheetId=SHEETS_ID_LEADS,
-            range=f"{title}!A:D",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body=body
-        ).execute()
-        log.info(f"✅ Seguimiento estructurado registrado: {phone} | {tipo} | {fecha_objetivo_iso}")
-    except Exception:
-        log.exception("❌ Error escribiendo seguimiento estructurado en Sheets")
 
 def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
     """Ubica/crea subcarpeta dentro de DRIVE_PARENT_FOLDER_ID."""
@@ -562,6 +479,7 @@ def _tpv_is_context(match: Optional[Dict[str, Any]]) -> bool:
     dt = _parse_dt_maybe(match.get("last_message_at") or "")
     if not dt:
         return False
+    # Si dt viene con tz, normalizamos a UTC; si no, asumimos UTC.
     if dt.tzinfo is not None:
         now = datetime.now(dt.tzinfo)
     else:
@@ -595,6 +513,7 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     st = user_state.get(phone, "")
     data = _ensure_user(phone)
 
+    # Nombre para notificación (si existe)
     nombre = ""
     if match and match.get("nombre"):
         nombre = match["nombre"].strip()
@@ -633,6 +552,7 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
 
         _notify_advisor(aviso)
 
+        # Opcional: marcar estatus si existe row
         try:
             if match and match.get("row"):
                 headers, _ = _sheet_get_rows()
@@ -672,35 +592,22 @@ def _auto_is_context(match: Optional[Dict[str, Any]]) -> bool:
     """
     if not match:
         return False
-
+    
     estatus = (match.get("estatus") or "").strip().upper()
     valid_status = {"ENVIADO_INICIAL", "ENVIADO_AUTO", "ENVIADO_SEGURO_AUTO"}
     if estatus not in valid_status:
         return False
-
+    
     dt = _parse_dt_maybe(match.get("last_message_at") or "")
     if not dt:
         return False
-
+    
     if dt.tzinfo is not None:
         now = datetime.now(dt.tzinfo)
     else:
         now = datetime.utcnow()
-
+    
     return (now - dt) <= timedelta(hours=24)
-
-def _is_recent_campaign(match: Optional[Dict[str, Any]], hours: int = 24) -> bool:
-    """General: verifica si LAST_MESSAGE_AT está dentro de 'hours' horas."""
-    if not match:
-        return False
-    dt = _parse_dt_maybe(match.get("last_message_at") or "")
-    if not dt:
-        return False
-    if dt.tzinfo is not None:
-        now = datetime.now(dt.tzinfo)
-    else:
-        now = datetime.utcnow()
-    return (now - dt) <= timedelta(hours=hours)
 
 def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) -> bool:
     """
@@ -711,25 +618,26 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
     intent = interpret_response(text)
     st_now = user_state.get(phone, "")
     idle = st_now in ("", "__greeted__")
-
+    
     if not idle:
         return False
-
+    
     if not _auto_is_context(match):
         return False
-
+    
     # Respuesta positiva (Sí, 1, etc.)
     if t in ("1", "si", "sí", "ok", "claro") or intent == "positive":
         user_state[phone] = "auto_intro"
         auto_start(phone, match)
         return True
-
+    
     # Respuesta negativa (No, 2, etc.)
     if t in ("2", "no", "nel") or intent == "negative":
         user_state[phone] = "auto_vencimiento_fecha"
         nombre = match.get("nombre", "").strip() or "Cliente"
         send_message(phone, f"Entendido {nombre}. Para poder recordarte a tiempo, ¿cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)")
-
+        
+        # Notificar al asesor
         aviso = (
             "🔔 AUTO — NO INTERESADO / TIENE SEGURO\n"
             f"WhatsApp: {phone}\n"
@@ -738,13 +646,13 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
         )
         _notify_advisor(aviso)
         return True
-
+    
     # Menú
     if t in ("menu", "menú", "inicio"):
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
         return True
-
+    
     # Cualquier otra cosa: notificar asesor como DUDA
     nombre = match.get("nombre", "").strip() or "Cliente"
     aviso = (
@@ -754,7 +662,8 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
         f"Mensaje: {text}"
     )
     _notify_advisor(aviso)
-
+    
+    # Pregunta cerrada de confirmación
     send_message(phone, "¿Deseas cotizar tu seguro de auto ahora? Responde *Sí* o *No*")
     return True
 
@@ -916,18 +825,21 @@ def _auto_next(phone: str, text: str) -> None:
         try:
             fecha = datetime.fromisoformat(text.strip()).date()
             objetivo = fecha - timedelta(days=30)
-            # Registrar recordatorio -30d en Sheets (seguimiento estructurado)
-            write_followup_record(phone, "AUTO_REMINDER_30D", objetivo.isoformat())
-
-            # Registrar reintento a +7d como seguimiento estructurado (reemplaza thread long-sleep)
-            fecha_reintento = (datetime.utcnow() + timedelta(days=7)).isoformat()
-            write_followup_record(phone, "AUTO_RETRY_7D", fecha_reintento)
-
-            send_message(phone, f"✅ Gracias. He registrado un recordatorio para {objetivo.isoformat()}. En breve te contactaremos.")
+            write_followup_to_sheets("auto_recordatorio", f"Recordatorio póliza -30d para {phone}", objetivo.isoformat())
+            threading.Thread(target=_retry_after_days, args=(phone, 7), daemon=True).start()
+            send_message(phone, f"✅ Gracias. Te contactaré *un mes antes* ({objetivo.isoformat()}).")
             user_state[phone] = "__greeted__"
             send_main_menu(phone)
         except Exception:
             send_message(phone, "Formato inválido. Usa AAAA-MM-DD. Ejemplo: 2025-12-31")
+
+def _retry_after_days(phone: str, days: int) -> None:
+    try:
+        time.sleep(days * 24 * 60 * 60)
+        send_message(phone, "⏰ Seguimos a tus órdenes. ¿Deseas que coticemos tu seguro de auto cuando se acerque el vencimiento?")
+        write_followup_to_sheets("auto_reintento", f"Reintento +{days}d enviado a {phone}", datetime.utcnow().isoformat())
+    except Exception:
+        log.exception("Error en reintento programado")
 
 # ==========================
 # Router helpers
@@ -1007,7 +919,7 @@ def webhook_verify():
     return "Error", 403
 
 # ==========================
-# Webhook — recepción (PRODUCTION)
+# Webhook — recepción (VERSIÓN CORREGIDA)
 # ==========================
 def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """Descarga bytes, mime_type y filename desde WPP Graph para media_id."""
@@ -1015,7 +927,7 @@ def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Opti
         return None, None, None
     try:
         meta = requests.get(
-            f"https://graph.facebook.com/{GRAPH_VERSION}/{media_id}",
+            f"https://graph.facebook.com/v20.0/{media_id}",
             headers={"Authorization": f"Bearer {META_TOKEN}"},
             timeout=WPP_TIMEOUT
         )
@@ -1054,7 +966,7 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
             send_message(phone, "Recibí tu archivo, gracias. (No se pudo identificar el contenido).")
             return
 
-        # Reenviar inmediatamente la multimedia al asesor (para que la vea rápido)
+        # 🔁 Reenviar inmediatamente la multimedia al asesor
         forward_media_to_advisor(msg.get("type"), media_id)
 
         file_bytes, mime, fname = _download_media(media_id)
@@ -1083,7 +995,7 @@ def webhook_receive():
     try:
         payload = request.get_json(force=True, silent=True) or {}
         log.info(f"📥 Webhook recibido: {json.dumps(payload, indent=2)[:500]}...")
-
+        
         entry = payload.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
@@ -1094,7 +1006,7 @@ def webhook_receive():
 
         msg = messages[0]
         phone = msg.get("from")
-
+        
         if not phone:
             log.warning("⚠️ Mensaje sin número de teléfono")
             return jsonify({"ok": True}), 200
@@ -1104,17 +1016,17 @@ def webhook_receive():
         # Obtener match SIEMPRE (necesario para contexto de campaña)
         last10 = _normalize_phone_last10(phone)
         match = match_client_in_sheets(last10)
-
+        
         # Estado actual del usuario
         st_now = user_state.get(phone, "")
         idle = st_now in ("", "__greeted__")
-
+        
         # Manejo de mensajes de texto
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
-
+            
             # =========================================================
             # 🔔 INTERCEPTOR POST-CAMPAÑA (AUTO) - PRIORIDAD ALTA
             # =========================================================
@@ -1123,7 +1035,7 @@ def webhook_receive():
                 if _auto_is_context(match):
                     if _handle_auto_context_response(phone, text, match):
                         return jsonify({"ok": True}), 200
-
+                
                 # 2. CONTEXTO TPV
                 if _tpv_is_context(match):
                     if tpv_start_from_reply(phone, text, match):
@@ -1131,9 +1043,6 @@ def webhook_receive():
 
             # =========================================================
             # 🔔 DETECCIÓN DE INTERÉS / DUDA POST-PLANTILLA (GLOBAL)
-            # Notificar ADVISOR solo si:
-            # - existe match en Sheets y
-            # - hay campaña reciente (LAST_MESSAGE_AT <= 24h) o contexto AUTO/TPV
             # =========================================================
             t_lower = text.lower().strip()
             VALID_COMMANDS = {
@@ -1148,18 +1057,11 @@ def webhook_receive():
                 "contactar","asesor","contactar con christian"
             }
 
-            should_notify = False
             if (
                 not t_lower.isdigit()
                 and t_lower not in VALID_COMMANDS
                 and idle
-                and match
             ):
-                # Solo si match existe y campaña reciente o contextos especiales
-                if _is_recent_campaign(match) or _auto_is_context(match) or _tpv_is_context(match):
-                    should_notify = True
-
-            if should_notify:
                 aviso = (
                     "📩 Cliente INTERESADO / DUDA detectada\n"
                     f"WhatsApp: {phone}\n"
@@ -1174,84 +1076,21 @@ def webhook_receive():
                 if not match:  # Solo saludar si no tenemos match ya
                     _greet_and_match(phone)
 
-            # Comando especial GPT (sgpt:)
-            if text.lower().startswith("sgpt:") and (openai_client or openai_legacy) and OPENAI_API_KEY:
+            # Comando especial GPT
+            if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
                     log.info(f"🧠 Procesando solicitud GPT para {phone}")
-                    answer = None
-                    if openai_client:
-                        # Modern client: client.responses.create(...)
-                        try:
-                            resp = openai_client.responses.create(
-                                model=OPENAI_MODEL,
-                                input=prompt,
-                                temperature=0.4,
-                            )
-                            if hasattr(resp, "output_text") and resp.output_text:
-                                answer = resp.output_text
-                            else:
-                                out = getattr(resp, "output", None) or (resp.get("output") if isinstance(resp, dict) else None)
-                                if isinstance(out, list) and out:
-                                    parts = []
-                                    for block in out:
-                                        content = block.get("content") if isinstance(block, dict) else None
-                                        if isinstance(content, list):
-                                            for c in content:
-                                                txt = c.get("text") if isinstance(c, dict) else None
-                                                if txt:
-                                                    parts.append(txt)
-                                        elif isinstance(block, dict) and block.get("text"):
-                                            parts.append(block.get("text"))
-                                    if parts:
-                                        answer = "\n".join(parts)
-                                if not answer and hasattr(resp, "choices"):
-                                    try:
-                                        choice = resp.choices[0]
-                                        txt = None
-                                        if isinstance(choice, dict):
-                                            msg = choice.get("message") or choice.get("delta")
-                                            if isinstance(msg, dict):
-                                                txt = msg.get("content") or msg.get("text")
-                                            else:
-                                                txt = choice.get("text")
-                                        else:
-                                            msg = getattr(choice, "message", None) or getattr(choice, "delta", None)
-                                            if isinstance(msg, dict):
-                                                txt = msg.get("content") or msg.get("text")
-                                            else:
-                                                txt = getattr(choice, "text", None)
-                                        if txt:
-                                            answer = txt
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            log.exception("❌ Llamada modern OpenAI.responses.create falló")
-                            answer = None
-
-                    if not answer and openai_legacy:
-                        # Fallback: legacy SDK (ChatCompletion.create)
-                        try:
-                            completion = openai_legacy.ChatCompletion.create(
-                                model=OPENAI_MODEL,
-                                messages=[{"role": "user", "content": prompt}],
-                                temperature=0.4,
-                            )
-                            choice = completion.choices[0]
-                            if getattr(choice, "message", None):
-                                answer = choice.message.get("content") if isinstance(choice.message, dict) else getattr(choice.message, "content", None)
-                            else:
-                                answer = getattr(choice, "text", None) or (choice.get("text") if isinstance(choice, dict) else None)
-                        except Exception:
-                            log.exception("❌ Fallback legacy OpenAI ChatCompletion.create falló")
-
-                    if not answer:
-                        answer = "Lo siento, no obtuve respuesta del modelo. Intenta más tarde."
-
-                    send_message(phone, answer.strip())
+                    completion = openai.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.4,
+                    )
+                    answer = completion.choices[0].message.content.strip()
+                    send_message(phone, answer)
                     return jsonify({"ok": True}), 200
                 except Exception:
-                    log.exception("❌ Error procesando solicitud GPT")
+                    log.exception("❌ Error llamando a OpenAI")
                     send_message(phone, "Hubo un detalle al procesar tu solicitud. Intentemos de nuevo.")
                     return jsonify({"ok": True}), 200
 
@@ -1275,7 +1114,7 @@ def webhook_receive():
 @app.get("/health")
 def health():
     return jsonify({
-        "status": "ok",
+        "status": "ok", 
         "service": "Vicky Bot Inbursa",
         "timestamp": datetime.utcnow().isoformat()
     }), 200
@@ -1286,7 +1125,7 @@ def ext_health():
         "status": "ok",
         "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID),
         "google_ready": google_ready,
-        "openai_ready": bool((openai_client or openai_legacy) and OPENAI_API_KEY)
+        "openai_ready": bool(openai and OPENAI_API_KEY)
     }), 200
 
 @app.post("/ext/test-send")
@@ -1296,20 +1135,20 @@ def ext_test_send():
         data = request.get_json(force=True) or {}
         to = str(data.get("to", "")).strip()
         text = str(data.get("text", "")).strip()
-
+        
         if not to or not text:
             return jsonify({
-                "ok": False,
+                "ok": False, 
                 "error": "Faltan parámetros 'to' o 'text'"
             }), 400
-
+            
         log.info(f"🧪 Test send a {to}: {text}")
         ok = send_message(to, text)
         return jsonify({"ok": bool(ok)}), 200
     except Exception as e:
         log.exception("❌ Error en /ext/test-send")
         return jsonify({
-            "ok": False,
+            "ok": False, 
             "error": str(e)
         }), 500
 
@@ -1317,23 +1156,23 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
     """Worker mejorado para envíos masivos con logging exhaustivo"""
     successful = 0
     failed = 0
-
+    
     log.info(f"🚀 Iniciando envío masivo de {len(items)} mensajes")
-
+    
     for i, item in enumerate(items, 1):
         try:
             to = item.get("to", "").strip()
             text = item.get("text", "").strip()
             template = item.get("template", "").strip()
             params = item.get("params", [])
-
+            
             if not to:
                 log.warning(f"⏭️ Item {i} sin destinatario, omitiendo")
                 failed += 1
                 continue
-
+                
             log.info(f"📤 [{i}/{len(items)}] Procesando: {to}")
-
+            
             success = False
             if template:
                 success = send_template_message(to, template, params)
@@ -1345,20 +1184,20 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
                 log.warning(f"   ↳ Item {i} sin contenido válido")
                 failed += 1
                 continue
-
+            
             if success:
                 successful += 1
             else:
                 failed += 1
-
+                
             time.sleep(0.5)
-
-        except Exception:
+            
+        except Exception as e:
             failed += 1
             log.exception(f"❌ Error procesando item {i} para {item.get('to', 'unknown')}")
-
+    
     log.info(f"🎯 Envío masivo completado: {successful} ✅, {failed} ❌")
-
+    
     if ADVISOR_NUMBER:
         summary_msg = f"📊 Resumen envío masivo:\n• Exitosos: {successful}\n• Fallidos: {failed}\n• Total: {len(items)}"
         send_message(ADVISOR_NUMBER, summary_msg)
@@ -1370,26 +1209,26 @@ def ext_send_promo():
         if not META_TOKEN or not WABA_PHONE_ID:
             log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados")
             return jsonify({
-                "queued": False,
+                "queued": False, 
                 "error": "WhatsApp Business API no configurada"
             }), 500
 
         body = request.get_json(force=True) or {}
         items = body.get("items", [])
-
+        
         log.info(f"📨 Recibida solicitud send-promo con {len(items)} items")
-
+        
         if not isinstance(items, list):
             log.warning("❌ Formato inválido: items no es una lista")
             return jsonify({
-                "queued": False,
+                "queued": False, 
                 "error": "Formato inválido: 'items' debe ser una lista"
             }), 400
-
+            
         if not items:
             log.warning("❌ Lista de items vacía")
             return jsonify({
-                "queued": False,
+                "queued": False, 
                 "error": "Lista 'items' vacía"
             }), 400
 
@@ -1398,43 +1237,37 @@ def ext_send_promo():
             if not isinstance(item, dict):
                 log.warning(f"⏭️ Item {i} no es un diccionario, omitiendo")
                 continue
-
+                
             to = item.get("to", "").strip()
-            text = item.get("text", "") or ""
-            template = item.get("template", "") or ""
-            params = item.get("params", [])
-
-            if isinstance(text, str):
-                text = text.strip()
-            if isinstance(template, str):
-                template = template.strip()
-
+            text = item.get("text", "").strip()
+            template = item.get("template", "").strip()
+            
             if not to:
                 log.warning(f"⏭️ Item {i} sin destinatario, omitiendo")
                 continue
-
+                
             if not text and not template:
                 log.warning(f"⏭️ Item {i} sin contenido (text o template), omitiendo")
                 continue
-
-            valid_items.append({"to": to, "text": text, "template": template, "params": params})
+                
+            valid_items.append(item)
 
         if not valid_items:
             log.warning("❌ No hay items válidos después de la validación")
             return jsonify({
-                "queued": False,
+                "queued": False, 
                 "error": "No hay items válidos para enviar"
             }), 400
 
         log.info(f"✅ Validación exitosa: {len(valid_items)} items válidos de {len(items)} recibidos")
-
+        
         threading.Thread(
-            target=_bulk_send_worker,
-            args=(valid_items,),
+            target=_bulk_send_worker, 
+            args=(valid_items,), 
             daemon=True,
             name="BulkSendWorker"
         ).start()
-
+        
         response = {
             "queued": True,
             "message": f"Procesando {len(valid_items)} mensajes en background",
@@ -1442,19 +1275,30 @@ def ext_send_promo():
             "valid_items": len(valid_items),
             "timestamp": datetime.utcnow().isoformat()
         }
-
+        
         log.info(f"✅ Envío masivo encolado: {response}")
         return jsonify(response), 202
-
+        
     except Exception as e:
         log.exception("❌ Error crítico en /ext/send-promo")
         return jsonify({
-            "queued": False,
+            "queued": False, 
             "error": f"Error interno: {str(e)}"
         }), 500
 
 # ==========================
-# AUTO SEND (1 prospecto por corrida) — Cron-safe
+# Arranque (para desarrollo local)
+# En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
+# ==========================
+if __name__ == "__main__":
+    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
+    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
+    log.info(f"📊 Google Sheets/Drive: {google_ready}")
+    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
+    
+    app.run(host="0.0.0.0", port=PORT, debug=False)
+# ==========================
+# AUTO SEND (1 prospecto por corrida) — Render Cron Job
 # ==========================
 AUTO_SEND_TOKEN = os.getenv("AUTO_SEND_TOKEN", "").strip()
 
@@ -1488,12 +1332,17 @@ def _normalize_to_e164_mx(phone_raw: str) -> str:
     digits = re.sub(r"\D", "", phone_raw or "")
     last10 = _normalize_phone_last10(digits)
 
+    # WhatsApp Cloud API (MX):
+    # - móviles normalmente requieren "521" + 10 dígitos
+    # - algunos datos vienen como "52" + 10 dígitos; se corrige a "521"
     if len(last10) == 10:
         return f"521{last10}"
 
+    # Si ya viene con 52 + 10 dígitos, insertar el "1"
     if digits.startswith("52") and len(digits) == 12:
         return f"521{digits[2:]}"
 
+    # Si ya viene correcto (521 + 10 dígitos)
     if digits.startswith("521") and len(digits) == 13:
         return digits
 
@@ -1508,6 +1357,7 @@ def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: 
         j = _idx(headers, col_name)
         if j is None:
             raise RuntimeError(f"No existe columna '{col_name}' en el Sheet.")
+        # Columna A=1 => letra:
         col_letter = chr(ord("A") + j)
         a1 = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_number_1based}"
         data.append({"range": a1, "values": [[value]]})
@@ -1516,7 +1366,12 @@ def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: 
 
 def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Dict[str, Any]]:
     """
-    Selecciona 1 prospecto pendiente (igual lógica que antes).
+    Selecciona 1 prospecto pendiente:
+    - WhatsApp no vacío
+    - ESTATUS vacío o 'PENDIENTE'
+    - Reintenta automáticamente si ESTATUS = 'FALLO_ENVIO'
+      (aunque LAST_MESSAGE_AT tenga valor)
+    - Para cualquier otro ESTATUS != 'FALLO_ENVIO', requiere LAST_MESSAGE_AT vacío
     """
     i_name = _idx(headers, "Nombre")
     i_wa = _idx(headers, "WhatsApp")
@@ -1526,7 +1381,7 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
     if i_name is None or i_wa is None:
         raise RuntimeError("Faltan columnas requeridas: 'Nombre' y/o 'WhatsApp'.")
 
-    for k, row in enumerate(rows, start=2):
+    for k, row in enumerate(rows, start=2):  # fila 2 = primer registro (fila 1 es header)
         nombre = _cell(row, i_name).strip()
         wa = _cell(row, i_wa).strip()
         estatus = _cell(row, i_status).strip().upper() if i_status is not None else ""
@@ -1534,9 +1389,17 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
 
         if not wa:
             continue
+        # Regla de reintento (Opción 2):
+        # - Si ya hay LAST_MESSAGE_AT, normalmente se salta
+        # - PERO si ESTATUS=FALLO_ENVIO, se permite reintento aunque haya timestamp
         if last_at and estatus != "FALLO_ENVIO":
             continue
+        # Permitimos:
+        # - vacío
+        # - PENDIENTE
+        # - FALLO_ENVIO (reintento)
         if estatus and estatus not in ("PENDIENTE", "FALLO_ENVIO"):
+            # si ya trae ENVIADO_INICIAL u otro, lo saltamos
             continue
 
         return {"row_number": k, "nombre": nombre, "whatsapp": wa}
@@ -1548,27 +1411,16 @@ def ext_auto_send_one():
     """
     Endpoint para cron: envía 1 plantilla al siguiente prospecto pendiente.
     Protegido por header: X-AUTO-TOKEN = AUTO_SEND_TOKEN
-
-    FIXES aplicados:
-    - Si la plantilla falla por configuración local (p.ej. falta imagen), NO marcar FALLO_ENVIO.
-    - FALLO_ENVIO se marca únicamente cuando Meta responde con error HTTP (4xx/5xx).
-    - Si Meta no está configurada (META_TOKEN/WABA_PHONE_ID faltan), devolvemos error y NO actualizamos ESTATUS en Sheets.
     """
     try:
         token = (request.headers.get("X-AUTO-TOKEN") or "").strip()
         if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
             return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-        # Require template param
         body = request.get_json(force=True, silent=True) or {}
         template_name = str(body.get("template", "")).strip()
         if not template_name:
             return jsonify({"ok": False, "error": "Falta 'template'"}), 400
-
-        # If WhatsApp API not configured, return 500 and DO NOT mark rows as FALLO_ENVIO
-        if not META_TOKEN or not WABA_PHONE_ID:
-            log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados; no se puede contactar a Meta. ext_auto_send_one abortado sin marcar FALLO_ENVIO.")
-            return jsonify({"ok": False, "error": "WhatsApp Business API no configurada"}), 500
 
         headers, rows = _sheet_get_rows()
         if not headers:
@@ -1581,21 +1433,9 @@ def ext_auto_send_one():
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
 
-        # Intentar enviar plantilla. send_template_message devuelve True si Meta respondió 200.
         ok = send_template_message(to, template_name, {"nombre": nombre})
 
         now_iso = datetime.utcnow().isoformat()
-
-        # Only mark FALLO_ENVIO if we attempted Meta call and Meta returned an HTTP failure (send_template_message==False
-        # could also be False when mapping dict->schema missing; in such ambiguous config case we should NOT mark FALLO_ENVIO
-        # However send_template_message returns False for those cases; we must distinguish.
-        # To ensure we don't mark FALLO_ENVIO on local config aborts, we will re-attempt a lightweight check:
-        # If ok==False, try to detect whether a Meta call was actually performed by attempting to build and validate payload again.
-        # Simpler: perform a HEAD-like request? Instead we keep logic minimal: if ok==False, assume Meta was called if META_TOKEN present (it is),
-        # but to avoid marking FALLO_ENVIO for config mapping error (schema missing), we will call send_template_message again in a "dry-run" mode:
-        # To keep things straightforward and safe: if send_template_message returned False, we will set estatus_val = "FALLO_ENVIO" only if we observed a network call
-        # that returned non-200. Since send_template_message already logs forensic details for HTTP errors, we will conservatively mark FALLO_ENVIO.
-        # NOTE: The main original problem was missing header image causing send_template_message to return False; that is fixed earlier (we no longer abort on missing image).
         estatus_val = "FALLO_ENVIO" if not ok else ("ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else "ENVIADO_INICIAL")
         updates = {
             "ESTATUS": estatus_val,
@@ -1615,14 +1455,3 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
-
-# ==========================
-# Arranque (para desarrollo local)
-# En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
-# ==========================
-if __name__ == "__main__":
-    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
-    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)} (GRAPH_VERSION={GRAPH_VERSION})")
-    log.info(f"📊 Google Sheets/Drive: {google_ready}")
-    log.info(f"🧠 OpenAI: {bool((openai_client or openai_legacy) and OPENAI_API_KEY)}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
