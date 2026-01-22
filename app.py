@@ -1579,4 +1579,3 @@ if __name__ == "__main__":
     log.info(f"📊 Google Sheets/Drive: {google_ready}")
     log.info(f"🧠 OpenAI: {bool((openai_client or openai_legacy) and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
-    
