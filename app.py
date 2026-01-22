@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-# =========================
-# 🔒 ESTADOS TERMINALES
-# =========================
 STATE_CLOSED = "closed"
 STATE_HANDOFF = "handoff"
 
@@ -12,9 +9,6 @@ def is_close_message(text: str) -> bool:
     return any(w in t for w in CLOSE_WORDS)
 
 
-# =========================
-# 🧠 GPT COPILOTO (IN-FLOW)
-# =========================
 def gpt_copilot_response(user_text: str, context: str = "") -> str:
     try:
         messages = [
@@ -33,18 +27,10 @@ def gpt_copilot_response(user_text: str, context: str = "") -> str:
         return "Entendido. Un asesor te contactará para apoyarte mejor."
 
 
-# =========================
-# ♻️ RESET DURO DE ESTADO
-# =========================
 def reset_state(phone):
     user_state[phone] = STATE_CLOSED
     user_data.pop(phone, None)
 
-
-# =========================
-# 🚫 ANTI-BUCLE
-# =========================
-last_bot_message = {}
 
 def safe_send(phone, text):
     if last_bot_message.get(phone) == text:
