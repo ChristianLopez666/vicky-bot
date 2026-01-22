@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # =========================
 # 🔒 ESTADOS TERMINALES
 # =========================
@@ -63,9 +65,6 @@ def safe_send(phone, text):
 # 6. ✅ Worker para envíos masivos
 # 7. ✅ WEBHOOK FIXED - Detección temprana de respuestas a plantillas
 # ------------------------------------------------------------
-
-from __future__ import annotations
-
 import os
 import io
 import re
