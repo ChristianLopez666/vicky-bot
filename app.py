@@ -451,90 +451,6 @@ def _notify_advisor(text: str) -> None:
         log.exception("❌ Error notificando al asesor")
 
 # --- TPV / Terminal bancaria (solo cuando viene de plantilla promo_tpv) ---
-
-# ==========================
-# GPT Invisible (clasificación de intención, SIN respuesta libre)
-# ==========================
-GPT_INTENTS = {
-    'INTENT_PRESTAMO_IMSS',
-    'INTENT_SEGURO_AUTO',
-    'INTENT_VIDA_SALUD',
-    'INTENT_VRIM',
-    'INTENT_EMPRESARIAL',
-    'INTENT_FINANCIAMIENTO_PRACTICO',
-    'INTENT_CONTACTO_ASESOR',
-    'INTENT_DESCONOCIDO',
-}
-
-def gpt_classify_intent(user_text: str) -> Optional[str]:
-    """
-    Clasifica la intención del usuario para enrutarlo a un flujo existente.
-    Regresa SOLO una etiqueta en GPT_INTENTS o None si no se puede clasificar.
-    """
-    if not (openai and OPENAI_API_KEY):
-        return None
-    t = (user_text or '').strip()
-    if not t:
-        return None
-    try:
-        system = (
-            "Eres un clasificador de intención para un bot de WhatsApp. "
-            "NO debes responder al usuario. "
-            "Debes contestar SOLO con UNA de estas etiquetas exactas: "
-            "INTENT_PRESTAMO_IMSS, INTENT_SEGURO_AUTO, INTENT_VIDA_SALUD, INTENT_VRIM, "
-            "INTENT_EMPRESARIAL, INTENT_FINANCIAMIENTO_PRACTICO, INTENT_CONTACTO_ASESOR, INTENT_DESCONOCIDO. "
-            "Si no estás seguro, responde INTENT_DESCONOCIDO."
-        )
-        completion = openai.chat.completions.create(
-            model=os.getenv('OPENAI_MODEL', 'gpt-4o-mini'),
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": t},
-            ],
-            temperature=0.0,
-        )
-        intent = (completion.choices[0].message.content or '').strip()
-        # Sanitizar: tomar primera línea/primer token
-        intent = intent.splitlines()[0].strip()
-        intent = intent.split()[0].strip()
-        if intent in GPT_INTENTS:
-            return intent
-        return None
-    except Exception:
-        log.exception('❌ Error en gpt_classify_intent')
-        return None
-
-def route_gpt_intent(phone: str, intent: str, match: Optional[Dict[str, Any]]) -> None:
-    """Enruta a los flujos existentes (sin inventar respuestas)."""
-    if intent == 'INTENT_PRESTAMO_IMSS':
-        imss_start(phone, match)
-        return
-    if intent == 'INTENT_SEGURO_AUTO':
-        auto_start(phone, match)
-        return
-    if intent == 'INTENT_EMPRESARIAL':
-        emp_start(phone, match)
-        return
-    if intent == 'INTENT_FINANCIAMIENTO_PRACTICO':
-        fp_start(phone, match)
-        return
-    if intent == 'INTENT_VIDA_SALUD':
-        send_message(phone, '🧬 *Seguros de Vida/Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.')
-        _notify_advisor(f'🔔 Vida/Salud — Solicitud de contacto\nWhatsApp: {phone}')
-        send_main_menu(phone)
-        return
-    if intent == 'INTENT_VRIM':
-        send_message(phone, '🩺 *VRIM* — Membresía médica. Notificaré al asesor para darte detalles.')
-        _notify_advisor(f'🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}')
-        send_main_menu(phone)
-        return
-    if intent == 'INTENT_CONTACTO_ASESOR':
-        _notify_advisor(f'🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}')
-        send_message(phone, '✅ Listo. Avisé a Christian para que te contacte.')
-        send_main_menu(phone)
-        return
-    # Desconocido: fallback a menú
-    send_message(phone, 'No entendí. Escribe *menú* para ver opciones.')
 TPV_TEMPLATE_NAME = "promo_tpv"
 
 def _parse_dt_maybe(value: str) -> Optional[datetime]:
@@ -693,6 +609,38 @@ def _auto_is_context(match: Optional[Dict[str, Any]]) -> bool:
     
     return (now - dt) <= timedelta(hours=24)
 
+
+def _explicit_non_auto_intent(text: str) -> bool:
+    """Devuelve True si el usuario expresa intención clara de OTRO producto distinto a AUTO.
+    Se usa para evitar que el flujo post-campaña AUTO 'secuestré' mensajes como 'crédito'.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    # Señales fuertes de AUTO (si aparecen, NO rompemos el flujo AUTO)
+    auto_signals = (
+        "auto", "seguro auto", "seguro de auto", "póliza", "poliza",
+        "placa", "placas", "tarjeta de circulación", "tarjeta de circulacion",
+        "circulación", "circulacion",
+    )
+    if any(k in t for k in auto_signals):
+        return False
+
+    # Señales fuertes de otros productos
+    other_signals = (
+        "credito", "crédito",
+        "prestamo", "préstamo",
+        "imss", "ley 73",
+        "empresarial", "pyme",
+        "tpv", "terminal", "punto de venta",
+        "vida", "salud",
+        "vrim", "tarjeta medica", "tarjeta médica",
+        "financiamiento", "financiamiento práctico", "financiamiento practico",
+    )
+    return any(k in t for k in other_signals)
+
+
 def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) -> bool:
     """
     Maneja respuestas en contexto AUTO post-campaña.
@@ -707,6 +655,11 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
         return False
     
     if not _auto_is_context(match):
+        return False
+
+    # Escape: si el cliente cambió claramente de intención (p. ej. 'crédito'), NO consumimos en AUTO.
+    if _explicit_non_auto_intent(text):
+        log.info(f"🔀 Escape AUTO→Router por intención explícita: {text}")
         return False
     
     # Respuesta positiva (Sí, 1, etc.)
@@ -949,6 +902,19 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         if tpv_start_from_reply(phone, text, match):
             return
 
+    # Intención genérica de 'crédito' (sin especificar tipo): guiar a opciones correctas
+    tlow = t.lower()
+    if ("credito" in tlow or "crédito" in tlow or "prestamo" in tlow or "préstamo" in tlow) and not any(k in tlow for k in ("auto", "seguro auto", "seguro de auto", "póliza", "poliza", "placa")):
+        send_message(
+            phone,
+            "¿Qué tipo de crédito buscas?\n"
+            "1) Préstamo IMSS (Ley 73)\n"
+            "5) Crédito Empresarial\n"
+            "6) Financiamiento Práctico\n\n"
+            "Responde *1*, *5* o *6*."
+        )
+        return
+
     if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
         imss_start(phone, match)
     elif t in ("2", "auto", "seguros de auto", "seguro auto"):
@@ -1115,10 +1081,15 @@ def webhook_receive():
             # 🔔 INTERCEPTOR POST-CAMPAÑA (AUTO) - PRIORIDAD ALTA
             # =========================================================
             if idle and match:
-                # 1. CONTEXTO AUTO (Seguro de Auto)
-                if _auto_is_context(match):
-                    if _handle_auto_context_response(phone, text, match):
-                        return jsonify({"ok": True}), 200
+                # 0. ESCAPE DE FLUJO: si el cliente expresa intención clara de OTRO producto,
+                #    NO dejamos que el contexto AUTO secuestre el mensaje.
+                if _auto_is_context(match) and _explicit_non_auto_intent(text):
+                    log.info(f"🔀 Escape de flujo AUTO por intención explícita: {text}")
+                else:
+                    # 1. CONTEXTO AUTO (Seguro de Auto)
+                    if _auto_is_context(match):
+                        if _handle_auto_context_response(phone, text, match):
+                            return jsonify({"ok": True}), 200
                 
                 # 2. CONTEXTO TPV
                 if _tpv_is_context(match):
@@ -1136,7 +1107,7 @@ def webhook_receive():
                 "auto","seguro auto","seguros de auto",
                 "vida","salud","seguro de vida","seguro de salud",
                 "vrim","tarjeta medica","tarjeta médica",
-                "empresarial","pyme","credito empresarial","crédito empresarial",
+                "empresarial","pyme","credito","crédito","credito empresarial","crédito empresarial",
                 "financiamiento","financiamiento practico","financiamiento práctico",
                 "contactar","asesor","contactar con christian"
             }
@@ -1160,17 +1131,23 @@ def webhook_receive():
                 if not match:  # Solo saludar si no tenemos match ya
                     _greet_and_match(phone)
 
-            # =========================================================
-            # 🧠 GPT Invisible (clasifica y enruta, SIN comando especial:)
-            # =========================================================
-            if (openai and OPENAI_API_KEY) and idle and text and (not t_lower.isdigit()) and (t_lower not in VALID_COMMANDS):
-                intent = gpt_classify_intent(text)
-                if intent and intent != 'INTENT_DESCONOCIDO':
-                    user_data.setdefault(phone, {})['last_intent'] = intent
-                    log.info(f"🧠 GPT intent detectada para {phone}: {intent}")
-                    route_gpt_intent(phone, intent, match)
-                    return jsonify({"ok": True, "gpt_intent": intent}), 200
-            # =========================================================
+            # Comando especial GPT
+            if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
+                prompt = text.split("sgpt:", 1)[1].strip()
+                try:
+                    log.info(f"🧠 Procesando solicitud GPT para {phone}")
+                    completion = openai.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.4,
+                    )
+                    answer = completion.choices[0].message.content.strip()
+                    send_message(phone, answer)
+                    return jsonify({"ok": True}), 200
+                except Exception:
+                    log.exception("❌ Error llamando a OpenAI")
+                    send_message(phone, "Hubo un detalle al procesar tu solicitud. Intentemos de nuevo.")
+                    return jsonify({"ok": True}), 200
 
             _route_command(phone, text, match)
             return jsonify({"ok": True}), 200
@@ -1368,6 +1345,13 @@ def ext_send_promo():
 # Arranque (para desarrollo local)
 # En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
 # ==========================
+if __name__ == "__main__":
+    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
+    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
+    log.info(f"📊 Google Sheets/Drive: {google_ready}")
+    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
+    
+    app.run(host="0.0.0.0", port=PORT, debug=False)
 # ==========================
 # AUTO SEND (1 prospecto por corrida) — Render Cron Job
 # ==========================
@@ -1526,13 +1510,3 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
-
-
-if __name__ == "__main__":
-    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
-    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
-    log.info(f"📊 Google Sheets/Drive: {google_ready}")
-    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
-    
-    app.run(host="0.0.0.0", port=PORT, debug=False)
-
