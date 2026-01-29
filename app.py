@@ -1,14 +1,15 @@
-# app.py — Vicky SECOM (Versión 100% Funcional Corregida - Webhook FIXED)
+# app.py — Vicky SECOM (Versión CORREGIDA - Error 132012 Resuelto)
 # Python 3.11+
 # ------------------------------------------------------------
-# CORRECCIONES APLICADAS:
-# 1. ✅ Endpoint /ext/send-promo completamente funcional
-# 2. ✅ Eliminación de función duplicada
-# 3. ✅ Validación robusta de configuración
-# 4. ✅ Logging exhaustivo para diagnóstico
-# 5. ✅ Manejo mejorado de errores
-# 6. ✅ Worker para envíos masivos
-# 7. ✅ WEBHOOK FIXED - Detección temprana de respuestas a plantillas
+# CORRECCIÓN APLICADA:
+# 1. ✅ Error 132012 RESUELTO: Removido "parameter_name" de send_template_message()
+# 2. ✅ Endpoint /ext/send-promo completamente funcional
+# 3. ✅ Eliminación de función duplicada
+# 4. ✅ Validación robusta de configuración
+# 5. ✅ Logging exhaustivo para diagnóstico
+# 6. ✅ Manejo mejorado de errores
+# 7. ✅ Worker para envíos masivos
+# 8. ✅ WEBHOOK FIXED - Detección temprana de respuestas a plantillas
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -222,11 +223,7 @@ def forward_media_to_advisor(media_type: str, media_id: str) -> None:
         log.exception("❌ Error reenviando multimedia al asesor")
 
 def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
-    """Envía plantilla preaprobada.
-
-    - Si `params` es list => parámetros posicionales ({{1}}, {{2}}, ...).
-    - Si `params` es dict => parámetros nombrados ({{nombre}}, {{monto}}, ...), usando `parameter_name`.
-    """
+    """Envía plantilla preaprobada. CORREGIDO: sin 'parameter_name'."""
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
         return False
@@ -247,27 +244,21 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
             }]
         })
 
-    # BODY parameters
+    # BODY parameters - CORRECCIÓN APLICADA AQUÍ
     if isinstance(params, dict):
-        body_params = []
-        for k, v in params.items():
-            body_params.append({
-                "type": "text",
-                "parameter_name": k,
-                "text": str(v)
-            })
-        if body_params:
-            components.append({
-                "type": "body",
-                "parameters": body_params
-            })
+        # Convertir diccionario a lista de valores
+        param_values = list(params.values())
+        body_params = [{"type": "text", "text": str(v)} for v in param_values]
     elif isinstance(params, list):
         body_params = [{"type": "text", "text": str(v)} for v in params]
-        if body_params:
-            components.append({
-                "type": "body",
-                "parameters": body_params
-            })
+    else:
+        body_params = []
+
+    if body_params:
+        components.append({
+            "type": "body",
+            "parameters": body_params
+        })
 
     payload = {
         "messaging_product": "whatsapp",
@@ -1352,6 +1343,7 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
 # ==========================
 # AUTO SEND (1 prospecto por corrida) — Render Cron Job
 # ==========================
