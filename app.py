@@ -453,20 +453,6 @@ def _notify_advisor(text: str) -> None:
 # --- TPV / Terminal bancaria (solo cuando viene de plantilla promo_tpv) ---
 TPV_TEMPLATE_NAME = "promo_tpv"
 
-# --- Estatus por plantilla (para activar embudos post-campaña) ---
-def _status_for_template(template_name: str) -> str:
-    tn = (template_name or "").strip().lower()
-    if tn == TPV_TEMPLATE_NAME:
-        return "ENVIADO_TPV"
-    # Préstamo personal (campaña)
-    if tn in {"prestamo_personal", "préstamo_personal", "credito_personal", "crédito_personal"}:
-        return "ENVIADO_PRESTAMO_PERSONAL"
-    # Seguro de auto (campaña)
-    if "seguro_auto" in tn or "seguros_auto" in tn or tn.startswith("promoseguros_auto"):
-        return "ENVIADO_SEGURO_AUTO"
-    return "ENVIADO_INICIAL"
-
-
 def _parse_dt_maybe(value: str) -> Optional[datetime]:
     if not value:
         return None
@@ -511,7 +497,7 @@ def tpv_start_from_reply(phone: str, text: str, match: Optional[Dict[str, Any]])
     intent = interpret_response(text)
 
     # Determina elección
-    if t in ("1","info","informacion","información") or intent == "positive":
+    if t == "1" or intent == "positive":
         user_state[phone] = "tpv_giro"
         send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
         return True
@@ -594,107 +580,6 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
             log.exception("⚠️ No fue posible actualizar ESTATUS TPV_NO_INTERESADO")
 
         user_state[phone] = "__greeted__"
-        return
-
-
-# --- PRÉSTAMO PERSONAL (post-campaña) ---
-def _prestamo_is_context(match: Optional[Dict[str, Any]]) -> bool:
-    """
-    PRÉSTAMO PERSONAL se activa si:
-    - existe match en Sheets
-    - ESTATUS == ENVIADO_PRESTAMO_PERSONAL
-    - LAST_MESSAGE_AT dentro de 24h
-    """
-    if not match:
-        return False
-    if (match.get("estatus") or "").strip().upper() != "ENVIADO_PRESTAMO_PERSONAL":
-        return False
-    dt = _parse_dt_maybe(match.get("last_message_at") or "")
-    if not dt:
-        return False
-    now = datetime.now(dt.tzinfo) if dt.tzinfo is not None else datetime.utcnow()
-    return (now - dt) <= timedelta(hours=24)
-
-def prestamo_start_from_reply(phone: str, text: str, match: Optional[Dict[str, Any]]) -> bool:
-    """
-    Primer respuesta al mensaje de campaña de Préstamo Personal.
-    Acepta: 'info', 'me interesa', 'sí', etc.
-    """
-    t = (text or "").strip().lower()
-    intent = interpret_response(text)
-
-    if t in ("1", "info", "informacion", "información") or "me interesa" in t or "interesa" in t or intent == "positive":
-        user_state[phone] = "pp_monto"
-        nombre = (match or {}).get("nombre", "").strip() or ""
-        send_message(phone, f"✅ Perfecto{(' ' + nombre) if nombre else ''}. ¿Qué *monto* necesitas? (ej. 50000)")
-        _notify_advisor(f"🔔 Préstamo personal — Interés detectado\nWhatsApp: {phone}\nNombre: {nombre or '(sin nombre)'}\nMensaje: {text}")
-        return True
-
-    if t in ("2",) or intent == "negative":
-        user_state[phone] = "__greeted__"
-        nombre = (match or {}).get("nombre", "").strip() or ""
-        send_message(phone, "Entendido. Si en otro momento te interesa, aquí estaré. Escribe *menú* para ver opciones.")
-        try:
-            if match and match.get("row"):
-                headers, _ = _sheet_get_rows()
-                if headers and _idx(headers, "ESTATUS") is not None:
-                    _update_row_cells(int(match["row"]), {"ESTATUS": "PRESTAMO_NO_INTERESADO"}, headers)
-        except Exception:
-            log.exception("⚠️ No fue posible actualizar ESTATUS PRESTAMO_NO_INTERESADO")
-        _notify_advisor(f"ℹ️ Préstamo personal — No interesado\nWhatsApp: {phone}\nNombre: {nombre or '(sin nombre)'}\nMensaje: {text}")
-        return True
-
-    return False
-
-def _pp_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
-    st = user_state.get(phone, "")
-    data = _ensure_user(phone)
-    nombre = (match or {}).get("nombre", "").strip() or ""
-
-    if st == "pp_monto":
-        monto = extract_number(text)
-        if not monto:
-            send_message(phone, "Indícame el *monto* (solo número). Ejemplo: 80000")
-            return
-        data["pp_monto"] = monto
-        user_state[phone] = "pp_plazo"
-        send_message(phone, "¿En cuántos *meses* te gustaría pagarlo? (ej. 12, 24, 36)")
-        return
-
-    if st == "pp_plazo":
-        plazo = extract_number(text)
-        if not plazo:
-            send_message(phone, "Indícame el *plazo* en meses. Ejemplo: 24")
-            return
-        data["pp_plazo"] = int(plazo)
-        user_state[phone] = "pp_confirm"
-        resumen = (
-            "✅ Listo. Con estos datos te preparo una propuesta.\n"
-            f"- Monto: ${data.get('pp_monto',0):,.0f}\n"
-            f"- Plazo: {data.get('pp_plazo',0)} meses\n"
-            "📌 *Nota:* La propuesta es aproximada y puede variar según tu perfil."
-        )
-        send_message(phone, resumen)
-
-        aviso = (
-            "🔔 Préstamo personal — Solicitud\n"
-            f"WhatsApp: {phone}\n"
-            f"Nombre: {nombre or '(sin nombre)'}\n"
-            f"Monto: ${data.get('pp_monto',0):,.0f}\n"
-            f"Plazo: {data.get('pp_plazo',0)} meses\n"
-        )
-        _notify_advisor(aviso)
-
-        try:
-            if match and match.get("row"):
-                headers, _ = _sheet_get_rows()
-                if headers and _idx(headers, "ESTATUS") is not None:
-                    _update_row_cells(int(match["row"]), {"ESTATUS": "PRESTAMO_INTERESADO"}, headers)
-        except Exception:
-            log.exception("⚠️ No fue posible actualizar ESTATUS PRESTAMO_INTERESADO")
-
-        user_state[phone] = "__greeted__"
-        send_main_menu(phone)
         return
 
 # --- AUTO CONTEXT DETECTION (NEW) ---
@@ -1063,10 +948,8 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
             _fp_next(phone, text)
         elif st.startswith("auto_"):
             _auto_next(phone, text)
-        elif st.startswith("pp_"):
-            _pp_next(phone, text, match)
         else:
-            send_message(phone, "En breve, su asesor Christian López se pondrá en contacto con usted para brindarle asesoría personalizada y resolver todas sus dudas de manera directa y segura.")
+            send_message(phone, "En breve, su asesor Christian López se pondrá en contacto con usted para brindarle asesoría personalizada y resolver todas sus dudas de manera directa y segura. Escribe *menú* para ver opciones.")
 
 # ==========================
 # Webhook — verificación
@@ -1197,7 +1080,7 @@ def webhook_receive():
             # =========================================================
             # 🔔 INTERCEPTOR POST-CAMPAÑA (AUTO) - PRIORIDAD ALTA
             # =========================================================
-            if match:
+            if idle and match:
                 # 0. ESCAPE DE FLUJO: si el cliente expresa intención clara de OTRO producto,
                 #    NO dejamos que el contexto AUTO secuestre el mensaje.
                 if _auto_is_context(match) and _explicit_non_auto_intent(text):
@@ -1208,25 +1091,20 @@ def webhook_receive():
                         if _handle_auto_context_response(phone, text, match):
                             return jsonify({"ok": True}), 200
                 
-                # 2. CONTEXTO PRÉSTAMO PERSONAL
-                if _prestamo_is_context(match):
-                    if prestamo_start_from_reply(phone, text, match):
-                        return jsonify({"ok": True}), 200
-
-# 3. CONTEXTO TPV
+                # 2. CONTEXTO TPV
                 if _tpv_is_context(match):
                     if tpv_start_from_reply(phone, text, match):
                         return jsonify({"ok": True}), 200
-                        
+
             # ✅ Respuesta negativa: agradecer + menú
-if idle and interpret_response(text) == "negative":
-    send_message(
-        phone,
-        "Gracias por tu respuesta. Quedo a tus órdenes para cualquier duda o si más adelante deseas revisarlo."
-    )
-    user_state[phone] = "__greeted__"
-    send_main_menu(phone)
-    return jsonify({"ok": True}), 200
+            if idle and interpret_response(text) == "negative":
+                send_message(
+                    phone,
+                    "Gracias por tu respuesta. Quedo a tus órdenes para cualquier duda o si más adelante deseas revisarlo."
+                )
+                user_state[phone] = "__greeted__"
+                send_main_menu(phone)
+                return jsonify({"ok": True}), 200
 
             # =========================================================
             # 🔔 DETECCIÓN DE INTERÉS / DUDA POST-PLANTILLA (GLOBAL)
@@ -1474,6 +1352,17 @@ def ext_send_promo():
         }), 500
 
 # ==========================
+# Arranque (para desarrollo local)
+# En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
+# ==========================
+if __name__ == "__main__":
+    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
+    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
+    log.info(f"📊 Google Sheets/Drive: {google_ready}")
+    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
+    
+    app.run(host="0.0.0.0", port=PORT, debug=False)
+# ==========================
 # AUTO SEND (1 prospecto por corrida) — Render Cron Job
 # ==========================
 AUTO_SEND_TOKEN = os.getenv("AUTO_SEND_TOKEN", "").strip()
@@ -1612,7 +1501,7 @@ def ext_auto_send_one():
         ok = send_template_message(to, template_name, {"nombre": nombre})
 
         now_iso = datetime.utcnow().isoformat()
-        estatus_val = "FALLO_ENVIO" if not ok else _status_for_template(template_name)
+        estatus_val = "FALLO_ENVIO" if not ok else ("ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else "ENVIADO_INICIAL")
         updates = {
             "ESTATUS": estatus_val,
             "LAST_MESSAGE_AT": now_iso
@@ -1631,16 +1520,3 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# ==========================
-# Arranque (para desarrollo local)
-# En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
-# ==========================
-if __name__ == "__main__":
-    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
-    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
-    log.info(f"📊 Google Sheets/Drive: {google_ready}")
-    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
-
