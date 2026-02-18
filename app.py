@@ -1066,7 +1066,7 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         elif st.startswith("pp_"):
             _pp_next(phone, text, match)
         else:
-            send_message(phone, "No entendí. Escribe *menú* para ver opciones.")
+            send_message(phone, "En breve, su asesor Christian López se pondrá en contacto con usted para brindarle asesoría personalizada y resolver todas sus dudas de manera directa y segura.")
 
 # ==========================
 # Webhook — verificación
@@ -1217,6 +1217,16 @@ def webhook_receive():
                 if _tpv_is_context(match):
                     if tpv_start_from_reply(phone, text, match):
                         return jsonify({"ok": True}), 200
+                        
+            # ✅ Respuesta negativa: agradecer + menú
+if idle and interpret_response(text) == "negative":
+    send_message(
+        phone,
+        "Gracias por tu respuesta. Quedo a tus órdenes para cualquier duda o si más adelante deseas revisarlo."
+    )
+    user_state[phone] = "__greeted__"
+    send_main_menu(phone)
+    return jsonify({"ok": True}), 200
 
             # =========================================================
             # 🔔 DETECCIÓN DE INTERÉS / DUDA POST-PLANTILLA (GLOBAL)
@@ -1633,3 +1643,4 @@ if __name__ == "__main__":
     log.info(f"📊 Google Sheets/Drive: {google_ready}")
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
