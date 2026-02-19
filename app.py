@@ -878,6 +878,306 @@ def _retry_after_days(phone: str, days: int) -> None:
     except Exception:
         log.exception("Error en reintento programado")
 
+
+# ==========================
+# Human Conversational Engine (HCE) — Secretos de conversión
+# ==========================
+# Objetivo:
+# - HUMAN FIRST RESPONSE: responder como asesor antes del menú/router cuando aplique
+# - MEMORIA COMERCIAL: recordar intención, producto, etapa, nombre
+# - DETECCIÓN INTELIGENTE: clasificar interés en texto libre y notificar asesor con contexto
+# - FOLLOW-UP INVISIBLE: programar seguimientos suaves (best-effort; depende del uptime)
+
+HCE_ENABLED = os.getenv("HCE_ENABLED", "1").strip() not in ("0", "false", "False")
+HCE_FOLLOWUP_HOURS = float(os.getenv("HCE_FOLLOWUP_HOURS", "48").strip() or 48)  # 48h por defecto
+HCE_MAX_FOLLOWUPS_PER_CONTACT = int(os.getenv("HCE_MAX_FOLLOWUPS_PER_CONTACT", "2").strip() or 2)
+
+# Seguimientos en memoria (best-effort)
+_followup_timers: Dict[Tuple[str, str], threading.Timer] = {}  # (phone, key) -> Timer
+
+def _now_utc() -> datetime:
+    return datetime.utcnow()
+
+def _mem(phone: str) -> Dict[str, Any]:
+    d = _ensure_user(phone)
+    if "mem" not in d:
+        d["mem"] = {
+            "name": "",
+            "product": "",
+            "stage": "",
+            "last_intent": "",
+            "last_text": "",
+            "last_seen_at": "",
+            "followups_sent": 0,
+        }
+    return d["mem"]
+
+def _set_mem(phone: str, **kwargs: Any) -> None:
+    m = _mem(phone)
+    for k, v in kwargs.items():
+        m[k] = v
+    m["last_seen_at"] = _now_utc().isoformat()
+
+def _cancel_followups(phone: str) -> None:
+    # Cancela timers activos para ese phone
+    keys = [k for k in _followup_timers.keys() if k[0] == phone]
+    for k in keys:
+        try:
+            tmr = _followup_timers.pop(k, None)
+            if tmr:
+                tmr.cancel()
+        except Exception:
+            pass
+
+def _schedule_followup(phone: str, key: str, hours: float, message: str) -> None:
+    """Programa un follow-up suave. Best-effort: si el proceso duerme/hiberna, puede no ejecutarse."""
+    if not HCE_ENABLED:
+        return
+    m = _mem(phone)
+    if (m.get("followups_sent") or 0) >= HCE_MAX_FOLLOWUPS_PER_CONTACT:
+        return
+
+    fk = (phone, key)
+    if fk in _followup_timers:
+        return  # ya programado
+
+    def _runner():
+        try:
+            # Si el usuario habló recientemente (últimas 24h), no interrumpimos.
+            last_seen = _parse_dt_maybe(m.get("last_seen_at") or "")
+            if last_seen:
+                # asumimos UTC si viene naive
+                now = _now_utc()
+                if (now - last_seen.replace(tzinfo=None)) <= timedelta(hours=24):
+                    return
+
+            ok = send_message(phone, message)
+            if ok:
+                m["followups_sent"] = int(m.get("followups_sent") or 0) + 1
+                _notify_advisor(
+                    "🕵️ Follow-up invisible enviado\n"
+                    f"WhatsApp: {phone}\n"
+                    f"Mensaje: {message}"
+                )
+        except Exception:
+            log.exception("❌ Error en follow-up invisible")
+        finally:
+            _followup_timers.pop(fk, None)
+
+    try:
+        tmr = threading.Timer(max(60.0, hours * 3600.0), _runner)
+        tmr.daemon = True
+        _followup_timers[fk] = tmr
+        tmr.start()
+    except Exception:
+        log.exception("⚠️ No fue posible programar follow-up")
+
+def _is_menu_request(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in ("menu", "menú", "inicio")
+
+def _is_explicit_command(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if t.isdigit():
+        return True
+    # comandos/categorías
+    cmds = {
+        "1","2","3","4","5","6","7",
+        "hola","imss","ley 73","prestamo","préstamo","pension","pensión",
+        "auto","seguro auto","seguros de auto","seguro de auto",
+        "vida","salud","seguro de vida","seguro de salud",
+        "vrim","tarjeta medica","tarjeta médica",
+        "empresarial","pyme","credito","crédito","credito empresarial","crédito empresarial",
+        "financiamiento","financiamiento practico","financiamiento práctico",
+        "contactar","asesor","contactar con christian",
+        "tpv","terminal","punto de venta",
+    }
+    return t in cmds
+
+def _detect_product_intent(text: str) -> Tuple[str, str]:
+    """
+    Retorna (product, intent):
+      product: auto|imss|empresarial|tpv|vida_salud|vrim|financiamiento|general
+      intent: high|medium|low|negative|neutral
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return ("general", "neutral")
+
+    resp = interpret_response(text)
+    if resp == "negative":
+        return ("general", "negative")
+
+    # producto por señales
+    if any(k in t for k in ("tpv", "terminal", "punto de venta", "cobrar con tarjeta", "link de pago", "tarjeta")):
+        product = "tpv"
+    elif any(k in t for k in ("imss", "ley 73", "pensión", "pension", "jubil", "modalidad", "semanas cotizadas")):
+        product = "imss"
+    elif any(k in t for k in ("empresarial", "pyme", "negocio", "empresa", "capital", "factoraje", "arrendamiento")):
+        product = "empresarial"
+    elif any(k in t for k in ("auto", "seguro de auto", "seguro auto", "póliza", "poliza", "placa", "tarjeta de circulación", "circulacion")):
+        product = "auto"
+    elif any(k in t for k in ("vida", "gastos médicos", "gastos medicos", "salud", "seguro de vida", "seguro de salud")):
+        product = "vida_salud"
+    elif any(k in t for k in ("vrim", "membresía médica", "membresia", "tarjeta médica", "tarjeta medica")):
+        product = "vrim"
+    elif any(k in t for k in ("financiamiento", "crédito simple", "credito simple", "revolvente", "préstamo", "prestamo", "credito", "crédito")):
+        product = "financiamiento"
+    else:
+        product = "general"
+
+    # intención por señales de compra
+    high_signals = ("info", "información", "cotizar", "cotización", "precio", "cuesta", "me interesa", "quiero", "urgente", "requisitos", "documentos", "monto", "$", "cuotas", "tasa", "plazo", "hoy")
+    medium_signals = ("duda", "pregunta", "cómo", "como", "funciona", "detalles", "beneficios", "comisión", "aliar", "alianza")
+    if resp == "positive" or any(k in t for k in high_signals):
+        intent = "high"
+    elif any(k in t for k in medium_signals):
+        intent = "medium"
+    else:
+        intent = "low"
+
+    return (product, intent)
+
+def _human_reply_for(product: str, intent: str, name: str) -> str:
+    n = (name or "").strip()
+    saludo = f"Hola {n} 👋" if n else "Hola 👋"
+    if intent == "negative":
+        return f"{saludo} Entendido. ¿Te apoyo con *algo distinto* o lo dejamos por ahora?"
+    if product == "auto":
+        return f"{saludo} Claro. Para cotizar tu *seguro de auto*, ¿tu vehículo es *particular* o *de trabajo*?"
+    if product == "imss":
+        return f"{saludo} Perfecto. Para el *préstamo IMSS Ley 73*, ¿ya estás *pensionado/jubilado* actualmente?"
+    if product == "empresarial":
+        return f"{saludo} Va. Para tu *crédito empresarial*, ¿tu empresa tiene *ventas comprobables* (facturación) actualmente?"
+    if product == "tpv":
+        return f"{saludo} Con gusto. Para la *terminal/TPV*, ¿qué *giro* es tu negocio?"
+    if product == "vida_salud":
+        return f"{saludo} Claro. ¿Buscas *protección de vida*, *gastos médicos* o *ambos*?"
+    if product == "vrim":
+        return f"{saludo} Perfecto. ¿La membresía sería para *ti* o para tu *familia*?"
+    if product == "financiamiento":
+        return f"{saludo} Entiendo. ¿El crédito es para *IMSS*, *negocio* o *algo personal*?"
+    # general
+    if intent == "high":
+        return f"{saludo} Claro. ¿Qué estás buscando exactamente: *crédito*, *seguro* o *terminal (TPV)*?"
+    return f"{saludo} Dime qué necesitas y te guío como si fuera tu asesor."
+
+def _human_first_layer(phone: str, text: str, match: Optional[Dict[str, Any]], idle: bool) -> bool:
+    """
+    Interceptor humano:
+    - Se activa solo si está idle, no es comando explícito, y no es solicitud de menú.
+    - Registra memoria y notifica al asesor con clasificación.
+    - Devuelve True si consumió el mensaje.
+    """
+    if not (HCE_ENABLED and idle):
+        return False
+
+    if _is_menu_request(text):
+        return False
+
+    if _is_explicit_command(text):
+        return False
+
+    # Contextos campaña ya se procesan antes (AUTO/TPV)
+    # Aquí solo texto libre "humano"
+    nombre = (match.get("nombre") if match else "") or ""
+    if nombre:
+        _set_mem(phone, name=nombre)
+
+    product, intent = _detect_product_intent(text)
+    _set_mem(phone, product=product, last_intent=intent, last_text=text, stage="HUMAN_LAYER")
+
+    # Notificación al asesor (más inteligente)
+    try:
+        aviso = (
+            "🧠 Interés detectado (HCE)\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {nombre or '(sin nombre)'}\n"
+            f"Producto: {product}\n"
+            f"Intención: {intent}\n"
+            f"Mensaje: {text}"
+        )
+        _notify_advisor(aviso)
+    except Exception:
+        pass
+
+    # Respuesta humana + pregunta de calificación (sin menú)
+    reply = _human_reply_for(product, intent, nombre)
+    send_message(phone, reply)
+
+    # Entra a micro-etapa para continuar natural (sin romper flujos: si el user manda "1" después, router toma control)
+    user_state[phone] = "hce_qualify"
+    _ensure_user(phone)["hce_product"] = product
+    _ensure_user(phone)["hce_intent"] = intent
+
+    # Follow-up invisible (best-effort)
+    _cancel_followups(phone)
+    _schedule_followup(
+        phone,
+        key="hce_soft",
+        hours=HCE_FOLLOWUP_HOURS,
+        message="Solo para confirmar 🙂 ¿quieres que lo revisemos ahora o prefieres que te contacte Christian en un horario específico?"
+    )
+    return True
+
+def _hce_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> bool:
+    """Continuación breve del HCE: intenta convertir a un embudo existente sin sonar a bot."""
+    st = user_state.get(phone, "")
+    if st != "hce_qualify":
+        return False
+
+    # si el usuario pide menú o manda un número, no intervenimos
+    if _is_menu_request(text) or (text or "").strip().isdigit():
+        return False
+
+    product = _ensure_user(phone).get("hce_product", "") or "general"
+    nombre = (match.get("nombre") if match else "") or _mem(phone).get("name", "")
+    t = (text or "").strip()
+
+    # Si el usuario da datos típicos, derivamos al embudo correspondiente
+    tl = t.lower()
+
+    if product == "auto":
+        send_message(phone, "Perfecto. Para avanzar, envíame *INE (frente)* y *tarjeta de circulación o placas*.")
+        user_state[phone] = "auto_intro"
+        _cancel_followups(phone)
+        return True
+
+    if product == "imss":
+        # Respuesta rápida: si dice sí => iniciar embudo
+        if interpret_response(t) == "positive" or "pension" in tl or "jubil" in tl:
+            imss_start(phone, match)
+            _cancel_followups(phone)
+            return True
+        send_message(phone, "Entiendo. ¿Tu *pensión mensual* aproximada cuál es? (ej. $8,500)")
+        user_state[phone] = "imss_pension"
+        _cancel_followups(phone)
+        return True
+
+    if product == "empresarial":
+        if interpret_response(t) == "positive" or "si" in tl or "sí" in tl:
+            emp_start(phone, match)
+            _cancel_followups(phone)
+            return True
+        send_message(phone, "Va. ¿Es *empresa* ya operando o apenas la vas a iniciar?")
+        return True
+
+    if product == "tpv":
+        user_state[phone] = "tpv_giro"
+        send_message(phone, "Perfecto. Dime tu *giro* y te digo la opción ideal.")
+        _cancel_followups(phone)
+        return True
+
+    if product == "financiamiento":
+        send_message(phone, "Para ubicarte rápido: ¿es *IMSS*, *negocio* o *personal*?")
+        return True
+
+    # general: ofrecer opciones sin menú
+    send_message(phone, f"{'Hola ' + nombre + ' 👋 ' if nombre else ''}¿Buscas *crédito*, *seguro* o *terminal (TPV)*?")
+    return True
+
 # ==========================
 # Router helpers
 # ==========================
@@ -893,6 +1193,14 @@ def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = text.strip().lower()
     st = user_state.get(phone, "")
+
+    # HCE (Human layer) continuation — intenta convertir sin romper embudos existentes
+    if st == "hce_qualify":
+        try:
+            if _hce_next(phone, text, match):
+                return
+        except Exception:
+            log.exception("⚠️ Error en HCE next; continuando router normal")
 
     # TPV tiene prioridad si el prospecto viene de la plantilla promo_tpv
     if st.startswith("tpv_"):
@@ -1063,6 +1371,11 @@ def webhook_receive():
 
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
 
+        # HCE: al recibir cualquier mensaje, cancelamos follow-ups pendientes
+        _cancel_followups(phone)
+        _set_mem(phone, last_text=f"{msg.get('type','')}:" )
+
+
         # Obtener match SIEMPRE (necesario para contexto de campaña)
         last10 = _normalize_phone_last10(phone)
         match = match_client_in_sheets(last10)
@@ -1096,14 +1409,24 @@ def webhook_receive():
                     if tpv_start_from_reply(phone, text, match):
                         return jsonify({"ok": True}), 200
 
-            # ✅ Respuesta negativa: agradecer + menú
+                        # =========================================================
+            # 🙂 HUMAN FIRST RESPONSE (HCE) — si no es comando ni contexto campaña
+            # =========================================================
+            if idle:
+                try:
+                    if _human_first_layer(phone, text, match, idle=True):
+                        return jsonify({"ok": True}), 200
+                except Exception:
+                    log.exception("⚠️ Error en HCE human layer; continuando flujo normal")
+            # =========================================================
+
+# ✅ Respuesta negativa (humana): agradecer sin menú inmediato
             if idle and interpret_response(text) == "negative":
                 send_message(
                     phone,
-                    "Gracias por tu respuesta. Quedo a tus órdenes para cualquier duda o si más adelante deseas revisarlo."
+                    "Entendido, gracias por responder. ¿Te apoyo con *algo distinto*? Si quieres ver opciones, escribe *menú*."
                 )
                 user_state[phone] = "__greeted__"
-                send_main_menu(phone)
                 return jsonify({"ok": True}), 200
 
             # =========================================================
