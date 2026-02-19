@@ -985,7 +985,7 @@ def _is_explicit_command(text: str) -> bool:
     # comandos/categorías
     cmds = {
         "1","2","3","4","5","6","7",
-        "hola","imss","ley 73","prestamo","préstamo","pension","pensión",
+        "imss","ley 73","prestamo","préstamo","pension","pensión",
         "auto","seguro auto","seguros de auto","seguro de auto",
         "vida","salud","seguro de vida","seguro de salud",
         "vrim","tarjeta medica","tarjeta médica",
