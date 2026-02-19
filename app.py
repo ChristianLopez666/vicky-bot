@@ -1011,7 +1011,7 @@ def _detect_product_intent(text: str) -> Tuple[str, str]:
         return ("general", "negative")
 
     # producto por señales
-    if any(k in t for k in ("tpv", "terminal", "punto de venta", "cobrar con tarjeta", "link de pago", "tarjeta")):
+    if any(k in t for k in ("tpv", "terminal", "terminales", "punto de venta", "punto de venta inbursa", "cobrar con tarjeta", "cobro con tarjeta", "link de pago", "liga de pago", "tarjeta", "cobrar con debito", "cobrar con crédito", "cobrar con credito")):
         product = "tpv"
     elif any(k in t for k in ("imss", "ley 73", "pensión", "pension", "jubil", "modalidad", "semanas cotizadas")):
         product = "imss"
@@ -1132,9 +1132,16 @@ def _hce_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> bool:
     if _is_menu_request(text) or (text or "").strip().isdigit():
         return False
 
+    # Re-evaluar intención en la respuesta (evita loop cuando el 1er mensaje fue ambiguo)
+    t = (text or "").strip()
+    p2, i2 = _detect_product_intent(t)
+    if p2 and p2 != "general":
+        _ensure_user(phone)["hce_product"] = p2
+        _ensure_user(phone)["hce_intent"] = i2
+        _set_mem(phone, product=p2, last_intent=i2, last_text=t, stage="HCE_NEXT")
+
     product = _ensure_user(phone).get("hce_product", "") or "general"
     nombre = (match.get("nombre") if match else "") or _mem(phone).get("name", "")
-    t = (text or "").strip()
 
     # Si el usuario da datos típicos, derivamos al embudo correspondiente
     tl = t.lower()
