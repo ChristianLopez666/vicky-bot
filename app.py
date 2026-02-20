@@ -1062,7 +1062,7 @@ def _human_reply_for(product: str, intent: str, name: str) -> str:
     # general
     if intent == "high":
         return f"{saludo} Claro. ¿Qué estás buscando exactamente: *crédito*, *seguro* o *terminal (TPV)*?"
-    return f"{saludo} Dime qué necesitas y te guío como si fuera tu asesor."
+    return f"{saludo} Dime qué necesitas y con gusto te guío para ayudarte a encontrar el servicio que necesitas."
 
 def _human_first_layer(phone: str, text: str, match: Optional[Dict[str, Any]], idle: bool) -> bool:
     """
@@ -1085,6 +1085,38 @@ def _human_first_layer(phone: str, text: str, match: Optional[Dict[str, Any]], i
     nombre = (match.get("nombre") if match else "") or ""
     if nombre:
         _set_mem(phone, name=nombre)
+
+    # Short-circuit TPV: si el cliente ya menciona terminal/TPV, no preguntamos opciones genéricas
+    t = (text or "").strip().lower()
+    if any(k in t for k in ("tpv", "terminal", "terminales", "punto de venta", "cobrar con tarjeta", "liga de pago", "link de pago", "lector")):
+        product, intent = ("tpv", "medium")
+        _set_mem(phone, product=product, last_intent=intent, last_text=text, stage="TPV_SHORTCIRCUIT")
+        try:
+            aviso = (
+                "🧠 Interés detectado (HCE→TPV)
+"
+                f"WhatsApp: {phone}
+"
+                f"Nombre: {nombre or '(sin nombre)'}
+"
+                f"Producto: tpv
+"
+                f"Intención: {intent}
+"
+                f"Mensaje: {text}"
+            )
+            _notify_advisor(aviso)
+        except Exception:
+            pass
+
+        saludo = _human_greeting(nombre)
+        send_message(phone, f"{saludo} Perfecto. Para la terminal/TPV, ¿qué giro tiene tu negocio?")
+        user_state[phone] = "tpv_giro"
+        _ensure_user(phone)["hce_product"] = "tpv"
+        _ensure_user(phone)["hce_intent"] = intent
+        _cancel_followups(phone)
+        return True
+
 
     product, intent = _detect_product_intent(text)
     _set_mem(phone, product=product, last_intent=intent, last_text=text, stage="HUMAN_LAYER")
