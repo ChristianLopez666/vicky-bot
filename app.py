@@ -1542,7 +1542,7 @@ def ext_auto_send_one():
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
 
-        ok = send_template_message(to, template_name, {"nombre": nombre})
+        ok = send_template_message(to, template_name, {"name": nombre})
 
         now_iso = datetime.utcnow().isoformat()
         estatus_val = "FALLO_ENVIO" if not ok else ("ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else "ENVIADO_INICIAL")
@@ -1564,3 +1564,4 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
+
