@@ -1049,8 +1049,9 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
 def webhook_receive():
     try:
         payload = request.get_json(force=True, silent=True) or {}
-        log.info(f"📥 Webhook recibido: {json.dumps(payload, indent=2)[:500]}...")
-        
+        log.info("📥 Webhook recibido COMPLETO:")
+        log.info(json.dumps(payload, indent=2, ensure_ascii=False))
+
         entry = payload.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
@@ -1564,4 +1565,5 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
