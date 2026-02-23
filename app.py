@@ -1383,6 +1383,7 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
 
 @app.post("/webhook")
 def webhook_receive():
+    intent_handled = False
     try:
         payload = request.get_json(force=True, silent=True) or {}
         log.info(f"📥 Webhook recibido: {json.dumps(payload, indent=2)[:500]}...")
