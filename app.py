@@ -1049,9 +1049,8 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
 def webhook_receive():
     try:
         payload = request.get_json(force=True, silent=True) or {}
-        log.info("📥 Webhook recibido COMPLETO:")
-        log.info(json.dumps(payload, indent=2, ensure_ascii=False))
-
+        log.info(f"📥 Webhook recibido: {json.dumps(payload, indent=2)[:500]}...")
+        
         entry = payload.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
@@ -1543,7 +1542,7 @@ def ext_auto_send_one():
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
 
-        ok = send_template_message(to, template_name, {"name": nombre})
+        ok = send_template_message(to, template_name, {"nombre": nombre})
 
         now_iso = datetime.utcnow().isoformat()
         estatus_val = "FALLO_ENVIO" if not ok else ("ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else "ENVIADO_INICIAL")
@@ -1565,5 +1564,4 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
