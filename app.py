@@ -221,97 +221,113 @@ def forward_media_to_advisor(media_type: str, media_id: str) -> None:
     except Exception:
         log.exception("❌ Error reenviando multimedia al asesor")
 
-def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
-    """Envía plantilla preaprobada.
-
-    - Si `params` es list => parámetros posicionales ({{1}}, {{2}}, ...).
-    - Si `params` es dict => parámetros nombrados ({{nombre}}, {{monto}}, ...), usando `parameter_name`.
+def send_template_message(to: str, template_name: str, params: Optional[Dict[str, str]] = None) -> Tuple[bool, str, Optional[dict]]:
     """
-    if not (META_TOKEN and WPP_API_URL):
-        log.error("❌ WhatsApp no configurado para plantillas.")
+    Envía una plantilla de WhatsApp Cloud API.
+    - Soporta variables con "parameter_name" (placeholders tipo {{name}} / {{nombre}})
+    - Soporta HEADER de imagen por env: TEMPLATE_IMAGE_URL_<TEMPLATE_NAME_SANITIZED>
+      Ej: template alianza_despachos_financiamiento2 -> TEMPLATE_IMAGE_URL_ALIANZA_DESPACHOS_FINANCIAMIENTO2
+    - Si falla por mismatch de parámetro (ej. {{name}} vs {{nombre}}), reintenta 1 vez con el alias.
+    """
+    token = os.getenv("META_TOKEN") or os.getenv("WABA_TOKEN") or ""
+    phone_number_id = os.getenv("PHONE_NUMBER_ID") or os.getenv("WABA_PHONE_ID") or os.getenv("WHATSAPP_PHONE_NUMBER_ID") or ""
+    if not token or not phone_number_id:
+        return False, "Faltan credenciales (META_TOKEN/PHONE_NUMBER_ID).", None
+
+    def _sanitize_env_key(name: str) -> str:
+        return re.sub(r"[^A-Z0-9_]", "_", name.upper())
+
+    def _build_payload(p: Optional[Dict[str, str]]) -> dict:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": "es_MX"},
+            },
+        }
+
+        components = []
+
+        # HEADER imagen opcional por env (para templates con header media)
+        img_env = f"TEMPLATE_IMAGE_URL_{_sanitize_env_key(template_name)}"
+        img_link = os.getenv(img_env)
+        if img_link:
+            components.append({
+                "type": "header",
+                "parameters": [{"type": "image", "image": {"link": img_link}}],
+            })
+
+        # BODY params (named parameters)
+        if p:
+            body_params = []
+            for k, v in p.items():
+                body_params.append({"type": "text", "text": str(v), "parameter_name": str(k)})
+            components.append({"type": "body", "parameters": body_params})
+
+        if components:
+            payload["template"]["components"] = components
+
+        return payload
+
+    def _looks_like_param_mismatch(resp_json: Optional[dict]) -> bool:
+        try:
+            err = (resp_json or {}).get("error", {})
+            code = err.get("code")
+            msg = (err.get("message") or "").lower()
+            # Códigos típicos de mismatch / params
+            if code in (100, 132000, 132012, 131008, 131047):
+                return True
+            if "parameter" in msg and ("mismatch" in msg or "missing" in msg or "does not match" in msg):
+                return True
+        except Exception:
+            pass
         return False
 
-    components: List[Dict[str, Any]] = []
+    url = f"https://graph.facebook.com/v21.0/{phone_number_id}/messages"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # HEADER image (solo plantillas con imagen fija)
-    if template_name == "seguro_auto_70":
-        image_url = os.getenv("SEGURO_AUTO_70_IMAGE_URL")
-        if not image_url:
-            log.error("❌ Falta SEGURO_AUTO_70_IMAGE_URL en entorno.")
-            return False
-        components.append({
-            "type": "header",
-            "parameters": [{
-                "type": "image",
-                "image": {"link": image_url}
-            }]
-        })
+    # Construye payload principal
+    payload = _build_payload(params)
 
-    # BODY parameters
-    if isinstance(params, dict):
-        body_params = []
-        for k, v in params.items():
-            body_params.append({
-                "type": "text",
-                "parameter_name": k,
-                "text": str(v)
-            })
-        if body_params:
-            components.append({
-                "type": "body",
-                "parameters": body_params
-            })
-    elif isinstance(params, list):
-        body_params = [{"type": "text", "text": str(v)} for v in params]
-        if body_params:
-            components.append({
-                "type": "body",
-                "parameters": body_params
-            })
+    # Prepara alias 1-param (nombre <-> name) para retry automático
+    alt_payload = None
+    if params and isinstance(params, dict) and len(params) == 1:
+        k = next(iter(params.keys()))
+        v = params[k]
+        if k in ("nombre", "name"):
+            alt_k = "name" if k == "nombre" else "nombre"
+            alt_payload = _build_payload({alt_k: v})
 
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        "template": {
-            "name": template_name,
-            "language": {"code": "es_MX"},
-            **({"components": components} if components else {})
-        }
-    }
-
-    for attempt in range(3):
+    last_json = None
+    for attempt in range(1, 3):
         try:
-            log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
-            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            try:
+                last_json = resp.json()
+            except Exception:
+                last_json = {"raw": resp.text}
 
-            if resp.status_code == 200:
-                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
-                return True
+            if resp.status_code in (200, 201):
+                return True, "ok", last_json
 
-            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
-            if _should_retry(resp.status_code) and attempt < 2:
-                log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
-                _backoff(attempt)
+            # retry por mismatch de params (solo una vez)
+            if attempt == 1 and alt_payload and _looks_like_param_mismatch(last_json):
+                logger.warning(f"⚠️ Param mismatch detectado en '{template_name}'. Reintentando con alias de parámetro…")
+                payload = alt_payload
                 continue
-            return False
-        except requests.exceptions.Timeout:
-            log.error(f"⏰ Timeout enviando plantilla a {to} (intento {attempt + 1})")
-            if attempt < 2:
-                _backoff(attempt)
-                continue
-            return False
-        except Exception:
-            log.exception(f"❌ Error en send_template_message a {to}")
-            if attempt < 2:
-                _backoff(attempt)
-                continue
-            return False
-    return False
 
-# ==========================
-# Google Helpers
-# ==========================
+            return False, f"HTTP {resp.status_code}", last_json
+
+        except Exception as e:
+            last_json = {"exception": str(e)}
+            if attempt == 2:
+                return False, f"exception: {e}", last_json
+
+    return False, "unknown", last_json
+
+
 def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
     """
     Busca el teléfono (últimos 10 dígitos) en el Sheet y devuelve:
@@ -909,6 +925,30 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
 
     # Intención genérica de 'crédito' (sin especificar tipo): guiar a opciones correctas
     tlow = t.lower()
+
+    # ✅ ALIANZA (despachos contables) — evita que caiga al flujo de AUTO por defecto
+    if "alianza" in tlow:
+        msg = (
+            "Perfecto ✅\n\n"
+            "Esta es la *alianza para despachos contables*:\n"
+            "• Financiamiento para tus clientes (empresarial / capital de trabajo / impuestos)\n"
+            "• Respuesta rápida y tasas según perfil\n"
+            "• Comisión para el despacho por cada financiamiento autorizado\n\n"
+            "Si me dices: *1) giro*, *2) monto aproximado* y *3) ciudad*, te paso el procedimiento y te contacto para avanzar."
+        )
+        send_whatsapp_message(wa_number, msg)
+        try:
+            _notify_advisor(
+                title="🏦 ALIANZA — Interés detectado",
+                wa=wa_number,
+                name=lead_name or "",
+                message=t,
+                extra={"flow": "alianza_despachos"}
+            )
+        except Exception:
+            pass
+        return
+
     if ("credito" in tlow or "crédito" in tlow or "prestamo" in tlow or "préstamo" in tlow) and not any(k in tlow for k in ("auto", "seguro auto", "seguro de auto", "póliza", "poliza", "placa")):
         send_message(
             phone,
@@ -1564,4 +1604,3 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
-
