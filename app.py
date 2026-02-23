@@ -1,4 +1,3 @@
-# :contentReference[oaicite:0]{index=0}
 # app.py — Vicky SECOM (Versión 100% Funcional Corregida - Webhook FIXED)
 # Python 3.11+
 # ------------------------------------------------------------
@@ -104,6 +103,154 @@ if GOOGLE_CREDENTIALS_JSON and service_account and build:
 else:
     log.warning("⚠️ Credenciales de Google no disponibles. Modo mínimo activo.")
 
+
+# ==========================
+# Sheets LOGS (envíos/respuestas + delivery)
+# ==========================
+LOG_SHEET_TITLE = os.getenv("SHEETS_TITLE_LOGS", "VICKY_LOGS").strip() or "VICKY_LOGS"
+
+def _sheet_meta() -> Optional[Dict[str, Any]]:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return None
+    return sheets_svc.spreadsheets().get(spreadsheetId=SHEETS_ID_LEADS).execute()
+
+def _sheet_tabs() -> List[str]:
+    meta = _sheet_meta()
+    if not meta:
+        return []
+    return [s.get("properties", {}).get("title", "") for s in meta.get("sheets", [])]
+
+def _ensure_log_sheet() -> bool:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return False
+    try:
+        tabs = _sheet_tabs()
+        if LOG_SHEET_TITLE in tabs:
+            return True
+
+        reqs = [{
+            "addSheet": {
+                "properties": {"title": LOG_SHEET_TITLE}
+            }
+        }]
+        sheets_svc.spreadsheets().batchUpdate(
+            spreadsheetId=SHEETS_ID_LEADS,
+            body={"requests": reqs}
+        ).execute()
+
+        # Header
+        header = [[
+            "CreatedAtUTC", "Direction", "Phone", "MsgType", "Template", "Text",
+            "MessageId", "LeadRow", "Status", "StatusAtUTC", "FinalStatus", "RawJSON"
+        ]]
+        sheets_svc.spreadsheets().values().update(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range=f"{LOG_SHEET_TITLE}!A1:L1",
+            valueInputOption="USER_ENTERED",
+            body={"values": header}
+        ).execute()
+        return True
+    except Exception:
+        log.exception("❌ No fue posible crear/asegurar hoja de logs")
+        return False
+
+def _append_log(direction: str, phone: str, msg_type: str, template: str, text_body: str,
+                message_id: str, lead_row: str, status: str, status_at: str, final_status: str,
+                raw: Dict[str, Any]) -> None:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return
+    if not _ensure_log_sheet():
+        return
+    try:
+        created_at = datetime.utcnow().isoformat()
+        row = [[
+            created_at,
+            direction,
+            str(phone or ""),
+            str(msg_type or ""),
+            str(template or ""),
+            (text_body or "")[:2000],
+            str(message_id or ""),
+            str(lead_row or ""),
+            str(status or ""),
+            str(status_at or ""),
+            str(final_status or ""),
+            json.dumps(raw or {}, ensure_ascii=False)[:30000],
+        ]]
+        sheets_svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range=f"{LOG_SHEET_TITLE}!A:L",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": row}
+        ).execute()
+    except Exception:
+        log.exception("❌ Error escribiendo log en Sheets")
+
+def _find_log_row_by_message_id(message_id: str) -> Optional[int]:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return None
+    if not message_id:
+        return None
+    if not _ensure_log_sheet():
+        return None
+    try:
+        rng = f"{LOG_SHEET_TITLE}!A:L"
+        values = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range=rng
+        ).execute().get("values", [])
+        if not values:
+            return None
+        # Column G (index 6) = MessageId
+        for i in range(2, len(values) + 1):
+            row = values[i-1]
+            mid = (row[6] if len(row) > 6 else "") or ""
+            if mid == message_id:
+                return i
+        return None
+    except Exception:
+        log.exception("❌ Error buscando message_id en logs")
+        return None
+
+def _read_log_fields(row_1based: int) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    try:
+        rng = f"{LOG_SHEET_TITLE}!A{row_1based}:L{row_1based}"
+        row = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=SHEETS_ID_LEADS, range=rng
+        ).execute().get("values", [[]])[0]
+        out["message_id"] = row[6] if len(row) > 6 else ""
+        out["lead_row"] = row[7] if len(row) > 7 else ""
+        out["final_status"] = row[10] if len(row) > 10 else ""
+        return out
+    except Exception:
+        return out
+
+def _update_log_status(message_id: str, status: str, status_at: str, raw: Dict[str, Any]) -> None:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return
+    rownum = _find_log_row_by_message_id(message_id)
+    if not rownum:
+        return
+    try:
+        # I=Status, J=StatusAtUTC, L=RawJSON
+        updates = {
+            "I": status,
+            "J": status_at,
+            "L": json.dumps(raw or {}, ensure_ascii=False)[:30000],
+        }
+        data = []
+        for col, val in updates.items():
+            data.append({"range": f"{LOG_SHEET_TITLE}!{col}{rownum}", "values": [[val]]})
+        sheets_svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=SHEETS_ID_LEADS,
+            body={"valueInputOption": "USER_ENTERED", "data": data}
+        ).execute()
+    except Exception:
+        log.exception("❌ Error actualizando status en logs")
+
+
 # =================================
 # Estado por usuario en memoria
 # =================================
@@ -112,47 +259,22 @@ user_state: Dict[str, str] = {}
 user_data: Dict[str, Dict[str, Any]] = {}
 
 # ==========================
-# Deduplicación / Anti-loop
+# Anti-loop / Anti-duplicado
 # ==========================
-_processed_message_ids: Dict[str, float] = {}
-_processed_status_ids: Dict[str, float] = {}
-_processed_lock = threading.Lock()
+_outgoing_msg_ids: Dict[str, float] = {}
+_incoming_msg_ids: Dict[str, float] = {}
+_ids_lock = threading.Lock()
 
-# message_id -> {"row": int, "template": str, "to": str, "sent_at": str, "estatus_on_delivered": str}
-_pending_delivery: Dict[str, Dict[str, Any]] = {}
-_pending_lock = threading.Lock()
+_ID_TTL_SECONDS = 60 * 60  # 1h
 
-def _gc_processed_maps(now_ts: float) -> None:
-    """Limpia caches de deduplicación (TTL 2 horas)."""
-    ttl = 2 * 60 * 60
-    cutoff = now_ts - ttl
-    with _processed_lock:
-        for d in (_processed_message_ids, _processed_status_ids):
-            old = [k for k, v in d.items() if v < cutoff]
-            for k in old:
-                d.pop(k, None)
-
-def _is_duplicate_message(msg_id: Optional[str]) -> bool:
-    if not msg_id:
-        return False
-    now_ts = time.time()
-    _gc_processed_maps(now_ts)
-    with _processed_lock:
-        if msg_id in _processed_message_ids:
-            return True
-        _processed_message_ids[msg_id] = now_ts
-        return False
-
-def _is_duplicate_status(status_id: Optional[str]) -> bool:
-    if not status_id:
-        return False
-    now_ts = time.time()
-    _gc_processed_maps(now_ts)
-    with _processed_lock:
-        if status_id in _processed_status_ids:
-            return True
-        _processed_status_ids[status_id] = now_ts
-        return False
+def _gc_ids(now_ts: Optional[float] = None) -> None:
+    now = now_ts or time.time()
+    cutoff = now - _ID_TTL_SECONDS
+    with _ids_lock:
+        for d in (_outgoing_msg_ids, _incoming_msg_ids):
+            for k in list(d.keys()):
+                if d[k] < cutoff:
+                    d.pop(k, None)
 
 
 # ==========================
@@ -192,52 +314,6 @@ def _ensure_user(phone: str) -> Dict[str, Any]:
         user_data[phone] = {}
     return user_data[phone]
 
-def _gpt_available() -> bool:
-    return bool(openai and OPENAI_API_KEY)
-
-def _gpt_reply(phone: str, user_text: str, match: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not _gpt_available():
-        return None
-
-    try:
-        data = _ensure_user(phone)
-        hist: List[Dict[str, str]] = data.get("gpt_history") or []
-        hist = hist[-12:]
-
-        nombre = ""
-        if match and match.get("nombre"):
-            nombre = str(match.get("nombre") or "").strip()
-
-        system_msg = (
-            "Eres Vicky, asistente de Christian López - Asesor Financiero (Inbursa). "
-            "Responde SOLO texto libre, sin acciones, sin JSON, sin comandos. "
-            "Sé breve, clara y útil. No inventes datos. "
-            "Si falta información, pide 1 dato puntual. "
-        )
-        if nombre:
-            system_msg += f"El cliente se llama {nombre}. Úsalo de forma natural."
-
-        messages: List[Dict[str, str]] = [{"role": "system", "content": system_msg}]
-        messages.extend(hist)
-        messages.append({"role": "user", "content": user_text})
-
-        completion = openai.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=messages,
-            temperature=0.4,
-        )
-        answer = (completion.choices[0].message.content or "").strip()
-
-        hist.append({"role": "user", "content": user_text})
-        hist.append({"role": "assistant", "content": answer})
-        data["gpt_history"] = hist[-12:]
-
-        return answer[:4096] if answer else None
-    except Exception:
-        log.exception("❌ Error llamando a OpenAI")
-        return None
-
-
 # ==========================
 # WhatsApp Helpers (retries)
 # ==========================
@@ -254,7 +330,9 @@ def _backoff(attempt: int) -> None:
     time.sleep(2 ** attempt)
 
 def send_message(to: str, text: str) -> bool:
-    """Envía mensaje de texto WPP. Reintentos exponenciales en 429/5xx."""
+    """Envía mensaje de texto WPP. Reintentos exponenciales en 429/5xx.
+    Registra envío en Sheets logs y guarda message_id para anti-loop.
+    """
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID faltan).")
         return False
@@ -263,7 +341,7 @@ def send_message(to: str, text: str) -> bool:
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"body": text[:4096]},
+        "text": {"body": (text or "")[:4096]},
     }
 
     for attempt in range(3):
@@ -272,6 +350,35 @@ def send_message(to: str, text: str) -> bool:
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
 
             if resp.status_code == 200:
+                try:
+                    j = resp.json() if resp.text else {}
+                except Exception:
+                    j = {}
+                message_id = ""
+                try:
+                    message_id = (j.get("messages") or [{}])[0].get("id", "") or ""
+                except Exception:
+                    message_id = ""
+
+                if message_id:
+                    with _ids_lock:
+                        _outgoing_msg_ids[message_id] = time.time()
+                    _gc_ids()
+
+                _append_log(
+                    direction="OUT",
+                    phone=to,
+                    msg_type="text",
+                    template="",
+                    text_body=(text or ""),
+                    message_id=message_id,
+                    lead_row="",
+                    status="sent",
+                    status_at=datetime.utcnow().isoformat(),
+                    final_status="",
+                    raw={"request": payload, "response": j},
+                )
+
                 log.info(f"✅ Mensaje enviado exitosamente a {to}")
                 return True
 
@@ -280,18 +387,59 @@ def send_message(to: str, text: str) -> bool:
                 log.info(f"🔄 Reintentando en {2 ** attempt} segundos...")
                 _backoff(attempt)
                 continue
+
+            _append_log(
+                direction="OUT",
+                phone=to,
+                msg_type="text",
+                template="",
+                text_body=(text or ""),
+                message_id="",
+                lead_row="",
+                status=f"http_{resp.status_code}",
+                status_at=datetime.utcnow().isoformat(),
+                final_status="",
+                raw={"request": payload, "response_text": resp.text[:5000]},
+            )
             return False
+
         except requests.exceptions.Timeout:
             log.error(f"⏰ Timeout enviando mensaje a {to} (intento {attempt + 1})")
             if attempt < 2:
                 _backoff(attempt)
                 continue
+            _append_log(
+                direction="OUT",
+                phone=to,
+                msg_type="text",
+                template="",
+                text_body=(text or ""),
+                message_id="",
+                lead_row="",
+                status="timeout",
+                status_at=datetime.utcnow().isoformat(),
+                final_status="",
+                raw={"request": payload},
+            )
             return False
         except Exception:
             log.exception(f"❌ Error en send_message a {to}")
             if attempt < 2:
                 _backoff(attempt)
                 continue
+            _append_log(
+                direction="OUT",
+                phone=to,
+                msg_type="text",
+                template="",
+                text_body=(text or ""),
+                message_id="",
+                lead_row="",
+                status="exception",
+                status_at=datetime.utcnow().isoformat(),
+                final_status="",
+                raw={"request": payload},
+            )
             return False
     return False
 
@@ -312,52 +460,39 @@ def forward_media_to_advisor(media_type: str, media_id: str) -> None:
     except Exception:
         log.exception("❌ Error reenviando multimedia al asesor")
 
-
-def send_template_message(to: str, template_name: str, params: Dict | List | None) -> Dict[str, Any]:
+def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
     """Envía plantilla preaprobada.
 
-    - Todas las plantillas operativas de Vicky SECOM usan variables *nombradas* (ej. {{name}}).
-    - Esta función normaliza automáticamente cualquier entrada para nunca disparar error #100
-      (Parameter name is missing) ni errores por desajuste de parámetros.
-
-    Retorna dict:
-      {"ok": bool, "message_id": str|None, "status_code": int|None, "error": str|None}
+    Reglas:
+    - Plantillas con variables nombradas ({{name}}): SIEMPRE envía 1 parámetro con:
+        {"type":"text","parameter_name":"name","text":"..."}
+    - Detecta valor desde params (dict): name / nombre / primer valor.
+    - Permite metadatos internos en dict:
+        __lead_row, __final_status, __text_note
     """
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
-        return {"ok": False, "message_id": None, "status_code": None, "error": "whatsapp_not_configured"}
+        return False
 
-    normalized_named: Dict[str, str] = {}
-    if params is None:
-        normalized_named = {}
-    elif isinstance(params, dict):
-        if "name" in params:
-            normalized_named["name"] = str(params.get("name", ""))
-        elif "nombre" in params:
-            normalized_named["name"] = str(params.get("nombre", ""))
-        else:
-            if len(params) == 1:
-                normalized_named["name"] = str(next(iter(params.values())))
-            else:
-                for k, v in params.items():
-                    normalized_named[str(k)] = str(v)
-                if "name" not in normalized_named:
-                    normalized_named["name"] = str(next(iter(params.values()))) if params else ""
-    elif isinstance(params, list):
-        if len(params) >= 1:
-            normalized_named["name"] = str(params[0])
-        else:
-            normalized_named = {}
-    else:
-        normalized_named["name"] = str(params)
+    lead_row = ""
+    final_status = ""
+    text_note = ""
+    clean_params = params
+
+    if isinstance(params, dict):
+        lead_row = str(params.get("__lead_row", "") or "")
+        final_status = str(params.get("__final_status", "") or "")
+        text_note = str(params.get("__text_note", "") or "")
+        clean_params = {k: v for k, v in params.items() if not str(k).startswith("__")}
 
     components: List[Dict[str, Any]] = []
 
+    # HEADER image (solo plantillas con imagen fija)
     if template_name == "seguro_auto_70":
         image_url = os.getenv("SEGURO_AUTO_70_IMAGE_URL")
         if not image_url:
             log.error("❌ Falta SEGURO_AUTO_70_IMAGE_URL en entorno.")
-            return {"ok": False, "message_id": None, "status_code": None, "error": "missing_header_image_url"}
+            return False
         components.append({
             "type": "header",
             "parameters": [{
@@ -366,15 +501,40 @@ def send_template_message(to: str, template_name: str, params: Dict | List | Non
             }]
         })
 
-    if normalized_named:
-        body_params: List[Dict[str, Any]] = []
-        for k, v in normalized_named.items():
-            body_params.append({
-                "type": "text",
-                "parameter_name": str(k),
-                "text": str(v)
-            })
-        components.append({"type": "body", "parameters": body_params})
+    # BODY parameters: SIEMPRE variables nombradas: {{name}}
+    body_params: List[Dict[str, Any]] = []
+    if isinstance(clean_params, dict):
+        val = ""
+        if "name" in clean_params:
+            val = clean_params.get("name")
+        elif "nombre" in clean_params:
+            val = clean_params.get("nombre")
+        else:
+            try:
+                # primer valor
+                val = next(iter(clean_params.values()))
+            except Exception:
+                val = ""
+        val_s = str(val if val is not None else "")
+        body_params = [{
+            "type": "text",
+            "parameter_name": "name",
+            "text": val_s
+        }]
+    elif isinstance(clean_params, list):
+        # Compatibilidad: usa primer elemento como name
+        val = clean_params[0] if len(clean_params) > 0 else ""
+        body_params = [{
+            "type": "text",
+            "parameter_name": "name",
+            "text": str(val if val is not None else "")
+        }]
+
+    if body_params:
+        components.append({
+            "type": "body",
+            "parameters": body_params
+        })
 
     payload = {
         "messaging_product": "whatsapp",
@@ -391,39 +551,99 @@ def send_template_message(to: str, template_name: str, params: Dict | List | Non
         try:
             log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-            status_code = resp.status_code
 
-            if status_code == 200:
+            if resp.status_code == 200:
                 try:
-                    j = resp.json()
+                    j = resp.json() if resp.text else {}
                 except Exception:
                     j = {}
-                msg_id = None
+                message_id = ""
                 try:
-                    msg_id = (j.get("messages") or [{}])[0].get("id")
+                    message_id = (j.get("messages") or [{}])[0].get("id", "") or ""
                 except Exception:
-                    msg_id = None
-                log.info(f"✅ Plantilla '{template_name}' aceptada por Meta (message_id={msg_id})")
-                return {"ok": True, "message_id": msg_id, "status_code": status_code, "error": None}
+                    message_id = ""
 
-            log.warning(f"⚠️ WPP send_template fallo {status_code}: {resp.text[:300]}")
-            if _should_retry(status_code) and attempt < 2:
+                if message_id:
+                    with _ids_lock:
+                        _outgoing_msg_ids[message_id] = time.time()
+                    _gc_ids()
+
+                _append_log(
+                    direction="OUT",
+                    phone=to,
+                    msg_type="template",
+                    template=template_name,
+                    text_body=text_note,
+                    message_id=message_id,
+                    lead_row=lead_row,
+                    status="sent",
+                    status_at=datetime.utcnow().isoformat(),
+                    final_status=final_status,
+                    raw={"request": payload, "response": j},
+                )
+
+                log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
+                return True
+
+            log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
+            if _should_retry(resp.status_code) and attempt < 2:
+                log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
                 _backoff(attempt)
                 continue
-            return {"ok": False, "message_id": None, "status_code": status_code, "error": resp.text[:500]}
+
+            _append_log(
+                direction="OUT",
+                phone=to,
+                msg_type="template",
+                template=template_name,
+                text_body=text_note,
+                message_id="",
+                lead_row=lead_row,
+                status=f"http_{resp.status_code}",
+                status_at=datetime.utcnow().isoformat(),
+                final_status=final_status,
+                raw={"request": payload, "response_text": resp.text[:5000]},
+            )
+            return False
         except requests.exceptions.Timeout:
             log.error(f"⏰ Timeout enviando plantilla a {to} (intento {attempt + 1})")
             if attempt < 2:
                 _backoff(attempt)
                 continue
-            return {"ok": False, "message_id": None, "status_code": None, "error": "timeout"}
+            _append_log(
+                direction="OUT",
+                phone=to,
+                msg_type="template",
+                template=template_name,
+                text_body=text_note,
+                message_id="",
+                lead_row=lead_row,
+                status="timeout",
+                status_at=datetime.utcnow().isoformat(),
+                final_status=final_status,
+                raw={"request": payload},
+            )
+            return False
         except Exception:
             log.exception(f"❌ Error en send_template_message a {to}")
             if attempt < 2:
                 _backoff(attempt)
                 continue
-            return {"ok": False, "message_id": None, "status_code": None, "error": "exception"}
-    return {"ok": False, "message_id": None, "status_code": None, "error": "unknown"}
+            _append_log(
+                direction="OUT",
+                phone=to,
+                msg_type="template",
+                template=template_name,
+                text_body=text_note,
+                message_id="",
+                lead_row=lead_row,
+                status="exception",
+                status_at=datetime.utcnow().isoformat(),
+                final_status=final_status,
+                raw={"request": payload},
+            )
+            return False
+    return False
 
 # ==========================
 # Google Helpers
@@ -441,7 +661,7 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
         log.warning("⚠️ Sheets no disponible; no se puede hacer matching.")
         return None
     try:
-        headers, rows = _sheet_get_rows()
+        headers, rows = _sheet_get_rows()  # usa el sheet principal (SHEETS_TITLE_LEADS)
         if not headers:
             return None
 
@@ -455,7 +675,7 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
             return None
 
         target = str(phone_last10).strip()
-        for k, row in enumerate(rows, start=2):
+        for k, row in enumerate(rows, start=2):  # fila 2 = primer registro
             wa_cell = _cell(row, i_wa)
             wa_last10 = _normalize_phone_last10(wa_cell)
             if target and wa_last10 == target:
@@ -574,6 +794,7 @@ def _parse_dt_maybe(value: str) -> Optional[datetime]:
         return None
     v = value.strip()
     try:
+        # Soporta "2026-01-08T18:03:24.442624545Z"
         if v.endswith("Z"):
             v = v[:-1] + "+00:00"
         return datetime.fromisoformat(v)
@@ -581,13 +802,20 @@ def _parse_dt_maybe(value: str) -> Optional[datetime]:
         return None
 
 def _tpv_is_context(match: Optional[Dict[str, Any]]) -> bool:
+    """
+    TPV se activa únicamente si:
+    - existe match en Sheets
+    - ESTATUS == ENVIADO_TPV
+    - LAST_MESSAGE_AT dentro de 24h
+    """
     if not match:
         return False
-    if (match.get("estatus") or "").strip().upper() != "ENVIADO_TPV":
+    if (match.get("estatus") or "").strip().upper() not in {"ENVIADO_TPV","ENVIADO_TPV_PEND"}:
         return False
     dt = _parse_dt_maybe(match.get("last_message_at") or "")
     if not dt:
         return False
+    # Si dt viene con tz, normalizamos a UTC; si no, asumimos UTC.
     if dt.tzinfo is not None:
         now = datetime.now(dt.tzinfo)
     else:
@@ -595,9 +823,16 @@ def _tpv_is_context(match: Optional[Dict[str, Any]]) -> bool:
     return (now - dt) <= timedelta(hours=24)
 
 def tpv_start_from_reply(phone: str, text: str, match: Optional[Dict[str, Any]]) -> bool:
+    """
+    Procesa la respuesta inmediata del prospecto al mensaje TPV (plantilla):
+      - 1 / sí => pide solo giro => horario => notifica => cierra
+      - 2 / no => pide motivo (opcional) => cierra
+    Retorna True si consumió el mensaje (no debe seguir al menú general).
+    """
     t = (text or "").strip().lower()
     intent = interpret_response(text)
 
+    # Determina elección
     if t == "1" or intent == "positive":
         user_state[phone] = "tpv_giro"
         send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
@@ -614,6 +849,7 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     st = user_state.get(phone, "")
     data = _ensure_user(phone)
 
+    # Nombre para notificación (si existe)
     nombre = ""
     if match and match.get("nombre"):
         nombre = match["nombre"].strip()
@@ -652,6 +888,7 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
 
         _notify_advisor(aviso)
 
+        # Opcional: marcar estatus si existe row
         try:
             if match and match.get("row"):
                 headers, _ = _sheet_get_rows()
@@ -681,12 +918,19 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
         user_state[phone] = "__greeted__"
         return
 
+# --- AUTO CONTEXT DETECTION (NEW) ---
 def _auto_is_context(match: Optional[Dict[str, Any]]) -> bool:
+    """
+    AUTO (seguro de auto) se activa si:
+    - existe match en Sheets
+    - ESTATUS en (ENVIADO_INICIAL, ENVIADO_AUTO, ENVIADO_SEGURO_AUTO)
+    - LAST_MESSAGE_AT dentro de 24h
+    """
     if not match:
         return False
 
     estatus = (match.get("estatus") or "").strip().upper()
-    valid_status = {"ENVIADO_INICIAL", "ENVIADO_AUTO", "ENVIADO_SEGURO_AUTO"}
+    valid_status = {"ENVIADO_INICIAL", "ENVIADO_AUTO", "ENVIADO_SEGURO_AUTO", "ENVIADO_INICIAL_PEND", "ENVIADO_AUTO_PEND", "ENVIADO_SEGURO_AUTO_PEND"}
     if estatus not in valid_status:
         return False
 
@@ -703,10 +947,14 @@ def _auto_is_context(match: Optional[Dict[str, Any]]) -> bool:
 
 
 def _explicit_non_auto_intent(text: str) -> bool:
+    """Devuelve True si el usuario expresa intención clara de OTRO producto distinto a AUTO.
+    Se usa para evitar que el flujo post-campaña AUTO 'secuestré' mensajes como 'crédito'.
+    """
     t = (text or "").strip().lower()
     if not t:
         return False
 
+    # Señales fuertes de AUTO (si aparecen, NO rompemos el flujo AUTO)
     auto_signals = (
         "auto", "seguro auto", "seguro de auto", "póliza", "poliza",
         "placa", "placas", "tarjeta de circulación", "tarjeta de circulacion",
@@ -715,6 +963,7 @@ def _explicit_non_auto_intent(text: str) -> bool:
     if any(k in t for k in auto_signals):
         return False
 
+    # Señales fuertes de otros productos
     other_signals = (
         "credito", "crédito",
         "prestamo", "préstamo",
@@ -729,6 +978,10 @@ def _explicit_non_auto_intent(text: str) -> bool:
 
 
 def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) -> bool:
+    """
+    Maneja respuestas en contexto AUTO post-campaña.
+    Retorna True si consumió el mensaje.
+    """
     t = (text or "").strip().lower()
     intent = interpret_response(text)
     st_now = user_state.get(phone, "")
@@ -740,20 +993,24 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
     if not _auto_is_context(match):
         return False
 
+    # Escape: si el cliente cambió claramente de intención (p. ej. 'crédito'), NO consumimos en AUTO.
     if _explicit_non_auto_intent(text):
         log.info(f"🔀 Escape AUTO→Router por intención explícita: {text}")
         return False
 
+    # Respuesta positiva (Sí, 1, etc.)
     if t in ("1", "si", "sí", "ok", "claro") or intent == "positive":
         user_state[phone] = "auto_intro"
         auto_start(phone, match)
         return True
 
+    # Respuesta negativa (No, 2, etc.)
     if t in ("2", "no", "nel") or intent == "negative":
         user_state[phone] = "auto_vencimiento_fecha"
         nombre = match.get("nombre", "").strip() or "Cliente"
         send_message(phone, f"Entendido {nombre}. Para poder recordarte a tiempo, ¿cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)")
 
+        # Notificar al asesor
         aviso = (
             "🔔 AUTO — NO INTERESADO / TIENE SEGURO\n"
             f"WhatsApp: {phone}\n"
@@ -763,11 +1020,13 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
         _notify_advisor(aviso)
         return True
 
+    # Menú
     if t in ("menu", "menú", "inicio"):
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
         return True
 
+    # Cualquier otra cosa: notificar asesor como DUDA
     nombre = match.get("nombre", "").strip() or "Cliente"
     aviso = (
         "📩 AUTO — DUDA / INTERÉS detectada\n"
@@ -777,9 +1036,11 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
     )
     _notify_advisor(aviso)
 
+    # Pregunta cerrada de confirmación
     send_message(phone, "¿Deseas cotizar tu seguro de auto ahora? Responde *Sí* o *No*")
     return True
 
+# --- IMSS (opción 1) ---
 def imss_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "imss_beneficios"
     log.info(f"🏥 Iniciando embudo IMSS para {phone}")
@@ -834,6 +1095,7 @@ def _imss_next(phone: str, text: str) -> None:
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
 
+# --- Crédito Empresarial (opción 5) ---
 def emp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "emp_confirma"
     log.info(f"🏢 Iniciando embudo empresarial para {phone}")
@@ -878,6 +1140,7 @@ def _emp_next(phone: str, text: str) -> None:
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
 
+# --- Financiamiento Práctico (opción 6) ---
 FP_QUESTIONS = [f"Pregunta {i}" for i in range(1, 12)]
 def fp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "fp_q1"
@@ -909,6 +1172,7 @@ def _fp_next(phone: str, text: str) -> None:
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
 
+# --- Seguros de Auto (opción 2) ---
 def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "auto_intro"
     log.info(f"🚗 Iniciando embudo seguro auto para {phone}")
@@ -950,6 +1214,9 @@ def _retry_after_days(phone: str, days: int) -> None:
     except Exception:
         log.exception("Error en reintento programado")
 
+# ==========================
+# Router helpers
+# ==========================
 def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     last10 = _normalize_phone_last10(phone)
     match = match_client_in_sheets(last10)
@@ -968,6 +1235,7 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
     t = text.strip().lower()
     st = user_state.get(phone, "")
 
+    # TPV tiene prioridad si el prospecto viene de la plantilla promo_tpv
     if st.startswith("tpv_"):
         _tpv_next(phone, text, match)
         return
@@ -975,6 +1243,7 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         if tpv_start_from_reply(phone, text, match):
             return
 
+    # Intención genérica de 'crédito' (sin especificar tipo): guiar a opciones correctas
     tlow = t.lower()
     if ("credito" in tlow or "crédito" in tlow or "prestamo" in tlow or "préstamo" in tlow) and not any(k in tlow for k in ("auto", "seguro auto", "seguro de auto", "póliza", "poliza", "placa")):
         send_message(
@@ -1021,11 +1290,7 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         elif st.startswith("auto_"):
             _auto_next(phone, text)
         else:
-            answer = _gpt_reply(phone, text, match)
-            if answer:
-                send_message(phone, answer)
-            else:
-                send_message(phone, "En breve, su asesor Christian López se pondrá en contacto con usted para brindarle asesoría personalizada y resolver todas sus dudas de manera directa y segura. Escribe *menú* para ver opciones.")
+            send_message(phone, "En breve, su asesor Christian López se pondrá en contacto con usted para brindarle asesoría personalizada y resolver todas sus dudas de manera directa y segura. Escribe *menú* para ver opciones.")
 
 # ==========================
 # Webhook — verificación
@@ -1092,6 +1357,7 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
             send_message(phone, "Recibí tu archivo, gracias. (No se pudo identificar el contenido).")
             return
 
+        # 🔁 Reenviar inmediatamente la multimedia al asesor
         forward_media_to_advisor(msg.get("type"), media_id)
 
         file_bytes, mime, fname = _download_media(media_id)
@@ -1115,57 +1381,6 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
         log.exception("❌ Error manejando multimedia")
         send_message(phone, "Recibí tu archivo, gracias. Si algo falla, lo reviso de inmediato.")
 
-
-def _register_pending_delivery(message_id: Optional[str], row_number: Optional[int], template_name: str, to: str, estatus_on_delivered: str) -> None:
-    if not message_id or not row_number:
-        return
-    with _pending_lock:
-        _pending_delivery[message_id] = {
-            "row": int(row_number),
-            "template": template_name,
-            "to": to,
-            "sent_at": datetime.utcnow().isoformat(),
-            "estatus_on_delivered": estatus_on_delivered,
-        }
-
-def _consume_pending_delivery(message_id: str) -> Optional[Dict[str, Any]]:
-    with _pending_lock:
-        return _pending_delivery.pop(message_id, None)
-
-def _handle_status_updates(statuses: List[Dict[str, Any]]) -> None:
-    """Procesa callbacks de estado (delivered/failed/read)."""
-    if not statuses:
-        return
-
-    for st in statuses:
-        try:
-            status_id = st.get("id") or st.get("message_id") or st.get("wamid")
-            if _is_duplicate_status(status_id):
-                continue
-
-            status_val = (st.get("status") or "").strip().lower()
-            if not status_id or not status_val:
-                continue
-
-            if status_val in ("delivered", "failed", "sent", "read"):
-                pending = _consume_pending_delivery(status_id) if status_val in ("delivered", "failed") else None
-
-                if pending and google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS:
-                    try:
-                        headers, _ = _sheet_get_rows()
-                        if headers and _idx(headers, "ESTATUS") is not None:
-                            if status_val == "delivered":
-                                _update_row_cells(int(pending["row"]), {"ESTATUS": pending.get("estatus_on_delivered", "ENVIADO_INICIAL")}, headers)
-                                log.info(f"✅ Delivery confirmado (row={pending['row']}, estatus={pending.get('estatus_on_delivered')})")
-                            elif status_val == "failed":
-                                _update_row_cells(int(pending["row"]), {"ESTATUS": "FALLO_ENVIO"}, headers)
-                                log.warning(f"❌ Delivery failed (row={pending['row']})")
-                    except Exception:
-                        log.exception("❌ Error actualizando ESTATUS por status webhook")
-
-        except Exception:
-            log.exception("❌ Error procesando status webhook")
-
 @app.post("/webhook")
 def webhook_receive():
     try:
@@ -1175,16 +1390,62 @@ def webhook_receive():
         entry = payload.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
-        statuses = value.get("statuses", []) or []
-        if statuses:
-            _handle_status_updates(statuses)
-
         messages = value.get("messages", [])
+        statuses = value.get("statuses", [])
+
+        # Status updates (delivery/read/failed) — NO son mensajes de usuario
+        if statuses and not messages:
+            try:
+                for st in statuses:
+                    mid = st.get("id", "") or ""
+                    s = st.get("status", "") or ""
+                    ts = st.get("timestamp", "") or ""
+                    status_at = ""
+                    try:
+                        status_at = datetime.utcfromtimestamp(int(ts)).isoformat() if ts else datetime.utcnow().isoformat()
+                    except Exception:
+                        status_at = datetime.utcnow().isoformat()
+
+                    _update_log_status(mid, s, status_at, st)
+
+                    # Si es delivered, actualizar ESTATUS del lead usando LeadRow + FinalStatus del log
+                    if s == "delivered" and google_ready and sheets_svc and SHEETS_ID_LEADS:
+                        rownum = _find_log_row_by_message_id(mid)
+                        if rownum:
+                            fields = _read_log_fields(rownum)
+                            lead_row = fields.get("lead_row", "")
+                            fin = fields.get("final_status", "")
+                            if lead_row and fin:
+                                try:
+                                    headers, _ = _sheet_get_rows()
+                                    if headers and _idx(headers, "ESTATUS") is not None:
+                                        _update_row_cells(int(lead_row), {"ESTATUS": fin}, headers)
+                                except Exception:
+                                    log.exception("⚠️ No fue posible actualizar ESTATUS por delivered")
+                return jsonify({"ok": True}), 200
+            except Exception:
+                log.exception("❌ Error procesando status updates")
+                return jsonify({"ok": True}), 200
+
         if not messages:
-            log.info("ℹ️ Webhook sin mensajes (posible status update)")
+            log.info("ℹ️ Webhook sin mensajes")
             return jsonify({"ok": True}), 200
 
         msg = messages[0]
+        msg_id = (msg.get("id") or "").strip()
+        if msg_id:
+            _gc_ids()
+            with _ids_lock:
+                # Anti-loop: no responder mensajes propios
+                if msg_id in _outgoing_msg_ids:
+                    log.info("🔁 Ignorando mensaje propio (anti-loop)")
+                    return jsonify({"ok": True}), 200
+                # Anti-duplicado webhook: no procesar el mismo evento dos veces
+                if msg_id in _incoming_msg_ids:
+                    log.info("🔁 Evento duplicado ignorado (anti-duplicado)")
+                    return jsonify({"ok": True}), 200
+                _incoming_msg_ids[msg_id] = time.time()
+
         phone = msg.get("from")
 
         if not phone:
@@ -1192,46 +1453,64 @@ def webhook_receive():
             return jsonify({"ok": True}), 200
 
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
-        # Anti-loop: ignorar mensajes originados por el propio número de negocio (eco)
-        try:
-            meta_disp = (value.get("metadata") or {}).get("display_phone_number") or ""
-            if meta_disp and _normalize_phone_last10(meta_disp) == _normalize_phone_last10(phone):
-                log.info("🔁 Anti-loop: mensaje del propio bot ignorado")
-                return jsonify({"ok": True}), 200
-        except Exception:
-            pass
 
-        # Anti-duplicado: ignorar si este message_id ya fue procesado
-        if _is_duplicate_message(msg.get("id")):
-            log.info("♻️ Evento duplicado ignorado")
-            return jsonify({"ok": True}), 200
-
+        # Obtener match SIEMPRE (necesario para contexto de campaña)
         last10 = _normalize_phone_last10(phone)
         match = match_client_in_sheets(last10)
 
+        # Estado actual del usuario
         st_now = user_state.get(phone, "")
         idle = st_now in ("", "__greeted__")
 
+        # Manejo de mensajes de texto
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
+            try:
+                _append_log(
+                    direction="IN",
+                    phone=phone,
+                    msg_type="text",
+                    template="",
+                    text_body=text,
+                    message_id=msg_id,
+                    lead_row=str(match.get("row","") if match else ""),
+                    status="received",
+                    status_at=datetime.utcnow().isoformat(),
+                    final_status="",
+                    raw=msg,
+                )
+            except Exception:
+                pass
 
+            # =========================================================
+            # 🔔 INTERCEPTOR POST-CAMPAÑA (AUTO) - PRIORIDAD ALTA
+            # =========================================================
             if idle and match:
+                # 0. ESCAPE DE FLUJO: si el cliente expresa intención clara de OTRO producto,
+                #    NO dejamos que el contexto AUTO secuestre el mensaje.
                 if _auto_is_context(match) and _explicit_non_auto_intent(text):
                     log.info(f"🔀 Escape de flujo AUTO por intención explícita: {text}")
                 else:
+                    # 1. CONTEXTO AUTO (Seguro de Auto)
                     if _auto_is_context(match):
                         if _handle_auto_context_response(phone, text, match):
                             return jsonify({"ok": True}), 200
 
+                # 2. CONTEXTO TPV
                 if _tpv_is_context(match):
                     if tpv_start_from_reply(phone, text, match):
                         return jsonify({"ok": True}), 200
 
+
+            # =========================================================
+            # ✅ HUMAN FIRST RESPONSE + SHORT-CIRCUIT DE INTENCIÓN (TPV)
+            # =========================================================
             if idle:
                 t_norm = (text or "").strip().lower()
 
+                # Saludo humano (sin menú)
                 GREET_WORDS = {
                     "hola", "buenas", "buenos dias", "buenos días", "buen dia", "buen día",
                     "buenas tardes", "buenas noches", "hey", "que tal", "qué tal", "holi"
@@ -1244,6 +1523,7 @@ def webhook_receive():
                     user_state[phone] = "__greeted__"
                     return jsonify({"ok": True}), 200
 
+                # Detección directa de TPV/Terminal (entra al embudo sin preguntar de más)
                 TPV_KEYWORDS = (
                     "tpv", "terminal", "terminales", "punto de venta", "punto-de-venta",
                     "cobrar con tarjeta", "cobro con tarjeta", "pagar con tarjeta",
@@ -1260,7 +1540,9 @@ def webhook_receive():
                     )
                     send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
                     return jsonify({"ok": True}), 200
+            # =========================================================
 
+            # ✅ Respuesta negativa: agradecer + menú
             if idle and interpret_response(text) == "negative":
                 send_message(
                     phone,
@@ -1270,6 +1552,9 @@ def webhook_receive():
                 send_main_menu(phone)
                 return jsonify({"ok": True}), 200
 
+            # =========================================================
+            # 🔔 DETECCIÓN DE INTERÉS / DUDA POST-PLANTILLA (GLOBAL)
+            # =========================================================
             t_lower = text.lower().strip()
             VALID_COMMANDS = {
                 "1","2","3","4","5","6","7",
@@ -1294,12 +1579,15 @@ def webhook_receive():
                     f"Mensaje: {text}"
                 )
                 _notify_advisor(aviso)
+            # =========================================================
 
+            # Inicialización del estado si es nuevo usuario
             if phone not in user_state:
                 user_state[phone] = "__greeted__"
-                if not match:
+                if not match:  # Solo saludar si no tenemos match ya
                     _greet_and_match(phone)
 
+            # Comando especial GPT
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
@@ -1398,7 +1686,7 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
 
             success = False
             if template:
-                success = bool(send_template_message(to, template, params).get("ok"))
+                success = send_template_message(to, template, params)
                 log.info(f"   ↳ Plantilla '{template}' a {to}: {'✅' if success else '❌'}")
             elif text:
                 success = send_message(to, text)
@@ -1415,7 +1703,7 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
 
             time.sleep(0.5)
 
-        except Exception:
+        except Exception as e:
             failed += 1
             log.exception(f"❌ Error procesando item {i} para {item.get('to', 'unknown')}")
 
@@ -1520,7 +1808,6 @@ if __name__ == "__main__":
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
 
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
 # ==========================
 # AUTO SEND (1 prospecto por corrida) — Render Cron Job
 # ==========================
@@ -1556,12 +1843,17 @@ def _normalize_to_e164_mx(phone_raw: str) -> str:
     digits = re.sub(r"\D", "", phone_raw or "")
     last10 = _normalize_phone_last10(digits)
 
+    # WhatsApp Cloud API (MX):
+    # - móviles normalmente requieren "521" + 10 dígitos
+    # - algunos datos vienen como "52" + 10 dígitos; se corrige a "521"
     if len(last10) == 10:
         return f"521{last10}"
 
+    # Si ya viene con 52 + 10 dígitos, insertar el "1"
     if digits.startswith("52") and len(digits) == 12:
         return f"521{digits[2:]}"
 
+    # Si ya viene correcto (521 + 10 dígitos)
     if digits.startswith("521") and len(digits) == 13:
         return digits
 
@@ -1576,6 +1868,7 @@ def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: 
         j = _idx(headers, col_name)
         if j is None:
             raise RuntimeError(f"No existe columna '{col_name}' en el Sheet.")
+        # Columna A=1 => letra:
         col_letter = chr(ord("A") + j)
         a1 = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_number_1based}"
         data.append({"range": a1, "values": [[value]]})
@@ -1599,7 +1892,7 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
     if i_name is None or i_wa is None:
         raise RuntimeError("Faltan columnas requeridas: 'Nombre' y/o 'WhatsApp'.")
 
-    for k, row in enumerate(rows, start=2):
+    for k, row in enumerate(rows, start=2):  # fila 2 = primer registro (fila 1 es header)
         nombre = _cell(row, i_name).strip()
         wa = _cell(row, i_wa).strip()
         estatus = _cell(row, i_status).strip().upper() if i_status is not None else ""
@@ -1607,9 +1900,17 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
 
         if not wa:
             continue
+        # Regla de reintento (Opción 2):
+        # - Si ya hay LAST_MESSAGE_AT, normalmente se salta
+        # - PERO si ESTATUS=FALLO_ENVIO, se permite reintento aunque haya timestamp
         if last_at and estatus != "FALLO_ENVIO":
             continue
+        # Permitimos:
+        # - vacío
+        # - PENDIENTE
+        # - FALLO_ENVIO (reintento)
         if estatus and estatus not in ("PENDIENTE", "FALLO_ENVIO"):
+            # si ya trae ENVIADO_INICIAL u otro, lo saltamos
             continue
 
         return {"row_number": k, "nombre": nombre, "whatsapp": wa}
@@ -1643,17 +1944,11 @@ def ext_auto_send_one():
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
 
-        result = send_template_message(to, template_name, {"name": nombre})
+        final_status = ("ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else "ENVIADO_INICIAL")
+        ok = send_template_message(to, template_name, {"name": nombre, "__lead_row": str(nxt["row_number"]), "__final_status": final_status, "__text_note": nombre})
 
         now_iso = datetime.utcnow().isoformat()
-
-        if result.get("ok"):
-            estatus_on_delivered = "ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else "ENVIADO_INICIAL"
-            estatus_val = "PENDIENTE_DELIVERY"
-            _register_pending_delivery(result.get("message_id"), nxt.get("row_number"), template_name, to, estatus_on_delivered)
-        else:
-            estatus_val = "FALLO_ENVIO"
-
+        estatus_val = "FALLO_ENVIO" if not ok else (final_status + "_PEND")
         updates = {
             "ESTATUS": estatus_val,
             "LAST_MESSAGE_AT": now_iso
@@ -1662,13 +1957,11 @@ def ext_auto_send_one():
 
         return jsonify({
             "ok": True,
-            "sent": bool(result.get("ok")),
-            "message_id": result.get("message_id"),
+            "sent": bool(ok),
             "to": to,
             "row": nxt["row_number"],
             "nombre": nombre,
-            "timestamp": now_iso,
-            "status_code": result.get("status_code"),
+            "timestamp": now_iso
         }), 200
 
     except Exception as e:
