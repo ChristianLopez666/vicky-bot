@@ -65,7 +65,7 @@ PORT = int(os.getenv("PORT", "5000"))
 
 # Configuración de logging robusta
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO, 
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     datefmt="%Y-%m-d %H:%M:%S"
 )
@@ -103,179 +103,12 @@ if GOOGLE_CREDENTIALS_JSON and service_account and build:
 else:
     log.warning("⚠️ Credenciales de Google no disponibles. Modo mínimo activo.")
 
-
-# ==========================
-# Sheets LOGS (envíos/respuestas + delivery)
-# ==========================
-LOG_SHEET_TITLE = os.getenv("SHEETS_TITLE_LOGS", "VICKY_LOGS").strip() or "VICKY_LOGS"
-
-def _sheet_meta() -> Optional[Dict[str, Any]]:
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
-        return None
-    return sheets_svc.spreadsheets().get(spreadsheetId=SHEETS_ID_LEADS).execute()
-
-def _sheet_tabs() -> List[str]:
-    meta = _sheet_meta()
-    if not meta:
-        return []
-    return [s.get("properties", {}).get("title", "") for s in meta.get("sheets", [])]
-
-def _ensure_log_sheet() -> bool:
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
-        return False
-    try:
-        tabs = _sheet_tabs()
-        if LOG_SHEET_TITLE in tabs:
-            return True
-
-        reqs = [{
-            "addSheet": {
-                "properties": {"title": LOG_SHEET_TITLE}
-            }
-        }]
-        sheets_svc.spreadsheets().batchUpdate(
-            spreadsheetId=SHEETS_ID_LEADS,
-            body={"requests": reqs}
-        ).execute()
-
-        # Header
-        header = [[
-            "CreatedAtUTC", "Direction", "Phone", "MsgType", "Template", "Text",
-            "MessageId", "LeadRow", "Status", "StatusAtUTC", "FinalStatus", "RawJSON"
-        ]]
-        sheets_svc.spreadsheets().values().update(
-            spreadsheetId=SHEETS_ID_LEADS,
-            range=f"{LOG_SHEET_TITLE}!A1:L1",
-            valueInputOption="USER_ENTERED",
-            body={"values": header}
-        ).execute()
-        return True
-    except Exception:
-        log.exception("❌ No fue posible crear/asegurar hoja de logs")
-        return False
-
-def _append_log(direction: str, phone: str, msg_type: str, template: str, text_body: str,
-                message_id: str, lead_row: str, status: str, status_at: str, final_status: str,
-                raw: Dict[str, Any]) -> None:
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
-        return
-    if not _ensure_log_sheet():
-        return
-    try:
-        created_at = datetime.utcnow().isoformat()
-        row = [[
-            created_at,
-            direction,
-            str(phone or ""),
-            str(msg_type or ""),
-            str(template or ""),
-            (text_body or "")[:2000],
-            str(message_id or ""),
-            str(lead_row or ""),
-            str(status or ""),
-            str(status_at or ""),
-            str(final_status or ""),
-            json.dumps(raw or {}, ensure_ascii=False)[:30000],
-        ]]
-        sheets_svc.spreadsheets().values().append(
-            spreadsheetId=SHEETS_ID_LEADS,
-            range=f"{LOG_SHEET_TITLE}!A:L",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": row}
-        ).execute()
-    except Exception:
-        log.exception("❌ Error escribiendo log en Sheets")
-
-def _find_log_row_by_message_id(message_id: str) -> Optional[int]:
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
-        return None
-    if not message_id:
-        return None
-    if not _ensure_log_sheet():
-        return None
-    try:
-        rng = f"{LOG_SHEET_TITLE}!A:L"
-        values = sheets_svc.spreadsheets().values().get(
-            spreadsheetId=SHEETS_ID_LEADS,
-            range=rng
-        ).execute().get("values", [])
-        if not values:
-            return None
-        # Column G (index 6) = MessageId
-        for i in range(2, len(values) + 1):
-            row = values[i-1]
-            mid = (row[6] if len(row) > 6 else "") or ""
-            if mid == message_id:
-                return i
-        return None
-    except Exception:
-        log.exception("❌ Error buscando message_id en logs")
-        return None
-
-def _read_log_fields(row_1based: int) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    try:
-        rng = f"{LOG_SHEET_TITLE}!A{row_1based}:L{row_1based}"
-        row = sheets_svc.spreadsheets().values().get(
-            spreadsheetId=SHEETS_ID_LEADS, range=rng
-        ).execute().get("values", [[]])[0]
-        out["message_id"] = row[6] if len(row) > 6 else ""
-        out["lead_row"] = row[7] if len(row) > 7 else ""
-        out["final_status"] = row[10] if len(row) > 10 else ""
-        return out
-    except Exception:
-        return out
-
-def _update_log_status(message_id: str, status: str, status_at: str, raw: Dict[str, Any]) -> None:
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
-        return
-    rownum = _find_log_row_by_message_id(message_id)
-    if not rownum:
-        return
-    try:
-        # I=Status, J=StatusAtUTC, L=RawJSON
-        updates = {
-            "I": status,
-            "J": status_at,
-            "L": json.dumps(raw or {}, ensure_ascii=False)[:30000],
-        }
-        data = []
-        for col, val in updates.items():
-            data.append({"range": f"{LOG_SHEET_TITLE}!{col}{rownum}", "values": [[val]]})
-        sheets_svc.spreadsheets().values().batchUpdate(
-            spreadsheetId=SHEETS_ID_LEADS,
-            body={"valueInputOption": "USER_ENTERED", "data": data}
-        ).execute()
-    except Exception:
-        log.exception("❌ Error actualizando status en logs")
-
-
 # =================================
 # Estado por usuario en memoria
 # =================================
 app = Flask(__name__)
 user_state: Dict[str, str] = {}
 user_data: Dict[str, Dict[str, Any]] = {}
-
-# ==========================
-# Anti-loop / Anti-duplicado
-# ==========================
-_outgoing_msg_ids: Dict[str, float] = {}
-_incoming_msg_ids: Dict[str, float] = {}
-_ids_lock = threading.Lock()
-
-_ID_TTL_SECONDS = 60 * 60  # 1h
-
-def _gc_ids(now_ts: Optional[float] = None) -> None:
-    now = now_ts or time.time()
-    cutoff = now - _ID_TTL_SECONDS
-    with _ids_lock:
-        for d in (_outgoing_msg_ids, _incoming_msg_ids):
-            for k in list(d.keys()):
-                if d[k] < cutoff:
-                    d.pop(k, None)
-
 
 # ==========================
 # Utilidades generales
@@ -330,116 +163,44 @@ def _backoff(attempt: int) -> None:
     time.sleep(2 ** attempt)
 
 def send_message(to: str, text: str) -> bool:
-    """Envía mensaje de texto WPP. Reintentos exponenciales en 429/5xx.
-    Registra envío en Sheets logs y guarda message_id para anti-loop.
-    """
+    """Envía mensaje de texto WPP. Reintentos exponenciales en 429/5xx."""
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID faltan).")
         return False
-
+    
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
-        "text": {"body": (text or "")[:4096]},
+        "text": {"body": text[:4096]},
     }
-
+    
     for attempt in range(3):
         try:
             log.info(f"📤 Enviando mensaje a {to} (intento {attempt + 1})")
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-
+            
             if resp.status_code == 200:
-                try:
-                    j = resp.json() if resp.text else {}
-                except Exception:
-                    j = {}
-                message_id = ""
-                try:
-                    message_id = (j.get("messages") or [{}])[0].get("id", "") or ""
-                except Exception:
-                    message_id = ""
-
-                if message_id:
-                    with _ids_lock:
-                        _outgoing_msg_ids[message_id] = time.time()
-                    _gc_ids()
-
-                _append_log(
-                    direction="OUT",
-                    phone=to,
-                    msg_type="text",
-                    template="",
-                    text_body=(text or ""),
-                    message_id=message_id,
-                    lead_row="",
-                    status="sent",
-                    status_at=datetime.utcnow().isoformat(),
-                    final_status="",
-                    raw={"request": payload, "response": j},
-                )
-
                 log.info(f"✅ Mensaje enviado exitosamente a {to}")
                 return True
-
+            
             log.warning(f"⚠️ WPP send_message fallo {resp.status_code}: {resp.text[:200]}")
             if _should_retry(resp.status_code) and attempt < 2:
                 log.info(f"🔄 Reintentando en {2 ** attempt} segundos...")
                 _backoff(attempt)
                 continue
-
-            _append_log(
-                direction="OUT",
-                phone=to,
-                msg_type="text",
-                template="",
-                text_body=(text or ""),
-                message_id="",
-                lead_row="",
-                status=f"http_{resp.status_code}",
-                status_at=datetime.utcnow().isoformat(),
-                final_status="",
-                raw={"request": payload, "response_text": resp.text[:5000]},
-            )
             return False
-
         except requests.exceptions.Timeout:
             log.error(f"⏰ Timeout enviando mensaje a {to} (intento {attempt + 1})")
             if attempt < 2:
                 _backoff(attempt)
                 continue
-            _append_log(
-                direction="OUT",
-                phone=to,
-                msg_type="text",
-                template="",
-                text_body=(text or ""),
-                message_id="",
-                lead_row="",
-                status="timeout",
-                status_at=datetime.utcnow().isoformat(),
-                final_status="",
-                raw={"request": payload},
-            )
             return False
-        except Exception:
+        except Exception as e:
             log.exception(f"❌ Error en send_message a {to}")
             if attempt < 2:
                 _backoff(attempt)
                 continue
-            _append_log(
-                direction="OUT",
-                phone=to,
-                msg_type="text",
-                template="",
-                text_body=(text or ""),
-                message_id="",
-                lead_row="",
-                status="exception",
-                status_at=datetime.utcnow().isoformat(),
-                final_status="",
-                raw={"request": payload},
-            )
             return False
     return False
 
@@ -463,27 +224,12 @@ def forward_media_to_advisor(media_type: str, media_id: str) -> None:
 def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
     """Envía plantilla preaprobada.
 
-    Reglas:
-    - Plantillas con variables nombradas ({{name}}): SIEMPRE envía 1 parámetro con:
-        {"type":"text","parameter_name":"name","text":"..."}
-    - Detecta valor desde params (dict): name / nombre / primer valor.
-    - Permite metadatos internos en dict:
-        __lead_row, __final_status, __text_note
+    - Si `params` es list => parámetros posicionales ({{1}}, {{2}}, ...).
+    - Si `params` es dict => parámetros nombrados ({{nombre}}, {{monto}}, ...), usando `parameter_name`.
     """
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
         return False
-
-    lead_row = ""
-    final_status = ""
-    text_note = ""
-    clean_params = params
-
-    if isinstance(params, dict):
-        lead_row = str(params.get("__lead_row", "") or "")
-        final_status = str(params.get("__final_status", "") or "")
-        text_note = str(params.get("__text_note", "") or "")
-        clean_params = {k: v for k, v in params.items() if not str(k).startswith("__")}
 
     components: List[Dict[str, Any]] = []
 
@@ -501,40 +247,27 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
             }]
         })
 
-    # BODY parameters: SIEMPRE variables nombradas: {{name}}
-    body_params: List[Dict[str, Any]] = []
-    if isinstance(clean_params, dict):
-        val = ""
-        if "name" in clean_params:
-            val = clean_params.get("name")
-        elif "nombre" in clean_params:
-            val = clean_params.get("nombre")
-        else:
-            try:
-                # primer valor
-                val = next(iter(clean_params.values()))
-            except Exception:
-                val = ""
-        val_s = str(val if val is not None else "")
-        body_params = [{
-            "type": "text",
-            "parameter_name": "name",
-            "text": val_s
-        }]
-    elif isinstance(clean_params, list):
-        # Compatibilidad: usa primer elemento como name
-        val = clean_params[0] if len(clean_params) > 0 else ""
-        body_params = [{
-            "type": "text",
-            "parameter_name": "name",
-            "text": str(val if val is not None else "")
-        }]
-
-    if body_params:
-        components.append({
-            "type": "body",
-            "parameters": body_params
-        })
+    # BODY parameters
+    if isinstance(params, dict):
+        body_params = []
+        for k, v in params.items():
+            body_params.append({
+                "type": "text",
+                "parameter_name": k,
+                "text": str(v)
+            })
+        if body_params:
+            components.append({
+                "type": "body",
+                "parameters": body_params
+            })
+    elif isinstance(params, list):
+        body_params = [{"type": "text", "text": str(v)} for v in params]
+        if body_params:
+            components.append({
+                "type": "body",
+                "parameters": body_params
+            })
 
     payload = {
         "messaging_product": "whatsapp",
@@ -553,35 +286,6 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
 
             if resp.status_code == 200:
-                try:
-                    j = resp.json() if resp.text else {}
-                except Exception:
-                    j = {}
-                message_id = ""
-                try:
-                    message_id = (j.get("messages") or [{}])[0].get("id", "") or ""
-                except Exception:
-                    message_id = ""
-
-                if message_id:
-                    with _ids_lock:
-                        _outgoing_msg_ids[message_id] = time.time()
-                    _gc_ids()
-
-                _append_log(
-                    direction="OUT",
-                    phone=to,
-                    msg_type="template",
-                    template=template_name,
-                    text_body=text_note,
-                    message_id=message_id,
-                    lead_row=lead_row,
-                    status="sent",
-                    status_at=datetime.utcnow().isoformat(),
-                    final_status=final_status,
-                    raw={"request": payload, "response": j},
-                )
-
                 log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
                 return True
 
@@ -590,58 +294,18 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
                 log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
                 _backoff(attempt)
                 continue
-
-            _append_log(
-                direction="OUT",
-                phone=to,
-                msg_type="template",
-                template=template_name,
-                text_body=text_note,
-                message_id="",
-                lead_row=lead_row,
-                status=f"http_{resp.status_code}",
-                status_at=datetime.utcnow().isoformat(),
-                final_status=final_status,
-                raw={"request": payload, "response_text": resp.text[:5000]},
-            )
             return False
         except requests.exceptions.Timeout:
             log.error(f"⏰ Timeout enviando plantilla a {to} (intento {attempt + 1})")
             if attempt < 2:
                 _backoff(attempt)
                 continue
-            _append_log(
-                direction="OUT",
-                phone=to,
-                msg_type="template",
-                template=template_name,
-                text_body=text_note,
-                message_id="",
-                lead_row=lead_row,
-                status="timeout",
-                status_at=datetime.utcnow().isoformat(),
-                final_status=final_status,
-                raw={"request": payload},
-            )
             return False
         except Exception:
             log.exception(f"❌ Error en send_template_message a {to}")
             if attempt < 2:
                 _backoff(attempt)
                 continue
-            _append_log(
-                direction="OUT",
-                phone=to,
-                msg_type="template",
-                template=template_name,
-                text_body=text_note,
-                message_id="",
-                lead_row=lead_row,
-                status="exception",
-                status_at=datetime.utcnow().isoformat(),
-                final_status=final_status,
-                raw={"request": payload},
-            )
             return False
     return False
 
@@ -789,6 +453,11 @@ def _notify_advisor(text: str) -> None:
 # --- TPV / Terminal bancaria (solo cuando viene de plantilla promo_tpv) ---
 TPV_TEMPLATE_NAME = "promo_tpv"
 
+# Plantillas de alianza (despachos contables)
+ALLIANCE_TEMPLATES = {
+    "despachis_contables",
+}
+
 def _parse_dt_maybe(value: str) -> Optional[datetime]:
     if not value:
         return None
@@ -810,7 +479,7 @@ def _tpv_is_context(match: Optional[Dict[str, Any]]) -> bool:
     """
     if not match:
         return False
-    if (match.get("estatus") or "").strip().upper() not in {"ENVIADO_TPV","ENVIADO_TPV_PEND"}:
+    if (match.get("estatus") or "").strip().upper() != "ENVIADO_TPV":
         return False
     dt = _parse_dt_maybe(match.get("last_message_at") or "")
     if not dt:
@@ -928,21 +597,21 @@ def _auto_is_context(match: Optional[Dict[str, Any]]) -> bool:
     """
     if not match:
         return False
-
+    
     estatus = (match.get("estatus") or "").strip().upper()
-    valid_status = {"ENVIADO_INICIAL", "ENVIADO_AUTO", "ENVIADO_SEGURO_AUTO", "ENVIADO_INICIAL_PEND", "ENVIADO_AUTO_PEND", "ENVIADO_SEGURO_AUTO_PEND"}
+    valid_status = {"ENVIADO_INICIAL", "ENVIADO_AUTO", "ENVIADO_SEGURO_AUTO"}
     if estatus not in valid_status:
         return False
-
+    
     dt = _parse_dt_maybe(match.get("last_message_at") or "")
     if not dt:
         return False
-
+    
     if dt.tzinfo is not None:
         now = datetime.now(dt.tzinfo)
     else:
         now = datetime.utcnow()
-
+    
     return (now - dt) <= timedelta(hours=24)
 
 
@@ -986,10 +655,10 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
     intent = interpret_response(text)
     st_now = user_state.get(phone, "")
     idle = st_now in ("", "__greeted__")
-
+    
     if not idle:
         return False
-
+    
     if not _auto_is_context(match):
         return False
 
@@ -997,19 +666,19 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
     if _explicit_non_auto_intent(text):
         log.info(f"🔀 Escape AUTO→Router por intención explícita: {text}")
         return False
-
+    
     # Respuesta positiva (Sí, 1, etc.)
     if t in ("1", "si", "sí", "ok", "claro") or intent == "positive":
         user_state[phone] = "auto_intro"
         auto_start(phone, match)
         return True
-
+    
     # Respuesta negativa (No, 2, etc.)
     if t in ("2", "no", "nel") or intent == "negative":
         user_state[phone] = "auto_vencimiento_fecha"
         nombre = match.get("nombre", "").strip() or "Cliente"
         send_message(phone, f"Entendido {nombre}. Para poder recordarte a tiempo, ¿cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)")
-
+        
         # Notificar al asesor
         aviso = (
             "🔔 AUTO — NO INTERESADO / TIENE SEGURO\n"
@@ -1019,13 +688,13 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
         )
         _notify_advisor(aviso)
         return True
-
+    
     # Menú
     if t in ("menu", "menú", "inicio"):
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
         return True
-
+    
     # Cualquier otra cosa: notificar asesor como DUDA
     nombre = match.get("nombre", "").strip() or "Cliente"
     aviso = (
@@ -1035,7 +704,7 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
         f"Mensaje: {text}"
     )
     _notify_advisor(aviso)
-
+    
     # Pregunta cerrada de confirmación
     send_message(phone, "¿Deseas cotizar tu seguro de auto ahora? Responde *Sí* o *No*")
     return True
@@ -1383,72 +1052,22 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
 
 @app.post("/webhook")
 def webhook_receive():
-    intent_handled = False
     try:
+        intent_handled = False
         payload = request.get_json(force=True, silent=True) or {}
         log.info(f"📥 Webhook recibido: {json.dumps(payload, indent=2)[:500]}...")
-
+        
         entry = payload.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
         messages = value.get("messages", [])
-        statuses = value.get("statuses", [])
-
-        # Status updates (delivery/read/failed) — NO son mensajes de usuario
-        if statuses and not messages:
-            try:
-                for st in statuses:
-                    mid = st.get("id", "") or ""
-                    s = st.get("status", "") or ""
-                    ts = st.get("timestamp", "") or ""
-                    status_at = ""
-                    try:
-                        status_at = datetime.utcfromtimestamp(int(ts)).isoformat() if ts else datetime.utcnow().isoformat()
-                    except Exception:
-                        status_at = datetime.utcnow().isoformat()
-
-                    _update_log_status(mid, s, status_at, st)
-
-                    # Si es delivered, actualizar ESTATUS del lead usando LeadRow + FinalStatus del log
-                    if s == "delivered" and google_ready and sheets_svc and SHEETS_ID_LEADS:
-                        rownum = _find_log_row_by_message_id(mid)
-                        if rownum:
-                            fields = _read_log_fields(rownum)
-                            lead_row = fields.get("lead_row", "")
-                            fin = fields.get("final_status", "")
-                            if lead_row and fin:
-                                try:
-                                    headers, _ = _sheet_get_rows()
-                                    if headers and _idx(headers, "ESTATUS") is not None:
-                                        _update_row_cells(int(lead_row), {"ESTATUS": fin}, headers)
-                                except Exception:
-                                    log.exception("⚠️ No fue posible actualizar ESTATUS por delivered")
-                return jsonify({"ok": True}), 200
-            except Exception:
-                log.exception("❌ Error procesando status updates")
-                return jsonify({"ok": True}), 200
-
         if not messages:
-            log.info("ℹ️ Webhook sin mensajes")
+            log.info("ℹ️ Webhook sin mensajes (posible status update)")
             return jsonify({"ok": True}), 200
 
         msg = messages[0]
-        msg_id = (msg.get("id") or "").strip()
-        if msg_id:
-            _gc_ids()
-            with _ids_lock:
-                # Anti-loop: no responder mensajes propios
-                if msg_id in _outgoing_msg_ids:
-                    log.info("🔁 Ignorando mensaje propio (anti-loop)")
-                    return jsonify({"ok": True}), 200
-                # Anti-duplicado webhook: no procesar el mismo evento dos veces
-                if msg_id in _incoming_msg_ids:
-                    log.info("🔁 Evento duplicado ignorado (anti-duplicado)")
-                    return jsonify({"ok": True}), 200
-                _incoming_msg_ids[msg_id] = time.time()
-
         phone = msg.get("from")
-
+        
         if not phone:
             log.warning("⚠️ Mensaje sin número de teléfono")
             return jsonify({"ok": True}), 200
@@ -1458,33 +1077,17 @@ def webhook_receive():
         # Obtener match SIEMPRE (necesario para contexto de campaña)
         last10 = _normalize_phone_last10(phone)
         match = match_client_in_sheets(last10)
-
+        
         # Estado actual del usuario
         st_now = user_state.get(phone, "")
         idle = st_now in ("", "__greeted__")
-
+        
         # Manejo de mensajes de texto
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
-            try:
-                _append_log(
-                    direction="IN",
-                    phone=phone,
-                    msg_type="text",
-                    template="",
-                    text_body=text,
-                    message_id=msg_id,
-                    lead_row=str(match.get("row","") if match else ""),
-                    status="received",
-                    status_at=datetime.utcnow().isoformat(),
-                    final_status="",
-                    raw=msg,
-                )
-            except Exception:
-                pass
-
+            
             # =========================================================
             # 🔔 INTERCEPTOR POST-CAMPAÑA (AUTO) - PRIORIDAD ALTA
             # =========================================================
@@ -1497,14 +1100,18 @@ def webhook_receive():
                     # 1. CONTEXTO AUTO (Seguro de Auto)
                     if _auto_is_context(match):
                         if _handle_auto_context_response(phone, text, match):
-                            return jsonify({"ok": True}), 200
-
+                            intent_handled = True
+                    if intent_handled:
+                        return jsonify({"ok": True}), 200
+                
                 # 2. CONTEXTO TPV
                 if _tpv_is_context(match):
                     if tpv_start_from_reply(phone, text, match):
-                        return jsonify({"ok": True}), 200
+                        intent_handled = True
+                if intent_handled:
+                    return jsonify({"ok": True}), 200
 
-
+            
             # =========================================================
             # ✅ HUMAN FIRST RESPONSE + SHORT-CIRCUIT DE INTENCIÓN (TPV)
             # =========================================================
@@ -1543,7 +1150,7 @@ def webhook_receive():
                     return jsonify({"ok": True}), 200
             # =========================================================
 
-            # ✅ Respuesta negativa: agradecer + menú
+# ✅ Respuesta negativa: agradecer + menú
             if idle and interpret_response(text) == "negative":
                 send_message(
                     phone,
@@ -1626,7 +1233,7 @@ def webhook_receive():
 @app.get("/health")
 def health():
     return jsonify({
-        "status": "ok",
+        "status": "ok", 
         "service": "Vicky Bot Inbursa",
         "timestamp": datetime.utcnow().isoformat()
     }), 200
@@ -1647,20 +1254,20 @@ def ext_test_send():
         data = request.get_json(force=True) or {}
         to = str(data.get("to", "")).strip()
         text = str(data.get("text", "")).strip()
-
+        
         if not to or not text:
             return jsonify({
-                "ok": False,
+                "ok": False, 
                 "error": "Faltan parámetros 'to' o 'text'"
             }), 400
-
+            
         log.info(f"🧪 Test send a {to}: {text}")
         ok = send_message(to, text)
         return jsonify({"ok": bool(ok)}), 200
     except Exception as e:
         log.exception("❌ Error en /ext/test-send")
         return jsonify({
-            "ok": False,
+            "ok": False, 
             "error": str(e)
         }), 500
 
@@ -1668,23 +1275,23 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
     """Worker mejorado para envíos masivos con logging exhaustivo"""
     successful = 0
     failed = 0
-
+    
     log.info(f"🚀 Iniciando envío masivo de {len(items)} mensajes")
-
+    
     for i, item in enumerate(items, 1):
         try:
             to = item.get("to", "").strip()
             text = item.get("text", "").strip()
             template = item.get("template", "").strip()
             params = item.get("params", [])
-
+            
             if not to:
                 log.warning(f"⏭️ Item {i} sin destinatario, omitiendo")
                 failed += 1
                 continue
-
+                
             log.info(f"📤 [{i}/{len(items)}] Procesando: {to}")
-
+            
             success = False
             if template:
                 success = send_template_message(to, template, params)
@@ -1696,20 +1303,20 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
                 log.warning(f"   ↳ Item {i} sin contenido válido")
                 failed += 1
                 continue
-
+            
             if success:
                 successful += 1
             else:
                 failed += 1
-
+                
             time.sleep(0.5)
-
+            
         except Exception as e:
             failed += 1
             log.exception(f"❌ Error procesando item {i} para {item.get('to', 'unknown')}")
-
+    
     log.info(f"🎯 Envío masivo completado: {successful} ✅, {failed} ❌")
-
+    
     if ADVISOR_NUMBER:
         summary_msg = f"📊 Resumen envío masivo:\n• Exitosos: {successful}\n• Fallidos: {failed}\n• Total: {len(items)}"
         send_message(ADVISOR_NUMBER, summary_msg)
@@ -1721,26 +1328,26 @@ def ext_send_promo():
         if not META_TOKEN or not WABA_PHONE_ID:
             log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados")
             return jsonify({
-                "queued": False,
+                "queued": False, 
                 "error": "WhatsApp Business API no configurada"
             }), 500
 
         body = request.get_json(force=True) or {}
         items = body.get("items", [])
-
+        
         log.info(f"📨 Recibida solicitud send-promo con {len(items)} items")
-
+        
         if not isinstance(items, list):
             log.warning("❌ Formato inválido: items no es una lista")
             return jsonify({
-                "queued": False,
+                "queued": False, 
                 "error": "Formato inválido: 'items' debe ser una lista"
             }), 400
-
+            
         if not items:
             log.warning("❌ Lista de items vacía")
             return jsonify({
-                "queued": False,
+                "queued": False, 
                 "error": "Lista 'items' vacía"
             }), 400
 
@@ -1749,37 +1356,37 @@ def ext_send_promo():
             if not isinstance(item, dict):
                 log.warning(f"⏭️ Item {i} no es un diccionario, omitiendo")
                 continue
-
+                
             to = item.get("to", "").strip()
             text = item.get("text", "").strip()
             template = item.get("template", "").strip()
-
+            
             if not to:
                 log.warning(f"⏭️ Item {i} sin destinatario, omitiendo")
                 continue
-
+                
             if not text and not template:
                 log.warning(f"⏭️ Item {i} sin contenido (text o template), omitiendo")
                 continue
-
+                
             valid_items.append(item)
 
         if not valid_items:
             log.warning("❌ No hay items válidos después de la validación")
             return jsonify({
-                "queued": False,
+                "queued": False, 
                 "error": "No hay items válidos para enviar"
             }), 400
 
         log.info(f"✅ Validación exitosa: {len(valid_items)} items válidos de {len(items)} recibidos")
-
+        
         threading.Thread(
-            target=_bulk_send_worker,
-            args=(valid_items,),
+            target=_bulk_send_worker, 
+            args=(valid_items,), 
             daemon=True,
             name="BulkSendWorker"
         ).start()
-
+        
         response = {
             "queued": True,
             "message": f"Procesando {len(valid_items)} mensajes en background",
@@ -1787,14 +1394,14 @@ def ext_send_promo():
             "valid_items": len(valid_items),
             "timestamp": datetime.utcnow().isoformat()
         }
-
+        
         log.info(f"✅ Envío masivo encolado: {response}")
         return jsonify(response), 202
-
+        
     except Exception as e:
         log.exception("❌ Error crítico en /ext/send-promo")
         return jsonify({
-            "queued": False,
+            "queued": False, 
             "error": f"Error interno: {str(e)}"
         }), 500
 
@@ -1807,7 +1414,7 @@ if __name__ == "__main__":
     log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
     log.info(f"📊 Google Sheets/Drive: {google_ready}")
     log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
-
+    
     app.run(host="0.0.0.0", port=PORT, debug=False)
 # ==========================
 # AUTO SEND (1 prospecto por corrida) — Render Cron Job
@@ -1945,11 +1552,13 @@ def ext_auto_send_one():
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
 
-        final_status = ("ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else "ENVIADO_INICIAL")
-        ok = send_template_message(to, template_name, {"name": nombre, "__lead_row": str(nxt["row_number"]), "__final_status": final_status, "__text_note": nombre})
+        ok = send_template_message(to, template_name, {"nombre": nombre})
 
         now_iso = datetime.utcnow().isoformat()
-        estatus_val = "FALLO_ENVIO" if not ok else (final_status + "_PEND")
+        estatus_val = "FALLO_ENVIO" if not ok else (
+            "ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else
+            ("ENVIADO_ALIANZA" if template_name in ALLIANCE_TEMPLATES else "ENVIADO_INICIAL")
+        )
         updates = {
             "ESTATUS": estatus_val,
             "LAST_MESSAGE_AT": now_iso
