@@ -1159,7 +1159,15 @@ def webhook_receive():
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
         messages = value.get("messages", [])
+        statuses = value.get("statuses", [])
         if not messages:
+            if statuses:
+                for st in statuses:
+                    try:
+                        if (st.get("status") or "").lower() == "failed":
+                            log.warning("❌ STATUS failed (detalle): %s", json.dumps(st, ensure_ascii=False))
+                    except Exception:
+                        pass
             log.info("ℹ️ Webhook sin mensajes (posible status update)")
             return jsonify({"ok": True}), 200
 
@@ -1682,3 +1690,4 @@ def ext_auto_send_one():
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
+
