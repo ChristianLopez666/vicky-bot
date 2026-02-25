@@ -249,8 +249,14 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
 
     # BODY parameters
     if isinstance(params, dict):
+        # Mapeo mínimo para plantillas con placeholder {{name}}
+        # (Meta requiere parameter_name exacto: "name")
+        send_params = dict(params)
+        if "name" not in send_params and "nombre" in send_params:
+            send_params["name"] = send_params.pop("nombre")
+
         body_params = []
-        for k, v in params.items():
+        for k, v in send_params.items():
             body_params.append({
                 "type": "text",
                 "parameter_name": k,
@@ -588,6 +594,98 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
         return
 
 # --- AUTO CONTEXT DETECTION (NEW) ---
+def _alianza_is_context(match: Optional[Dict[str, Any]]) -> bool:
+    """
+    ALIANZA (despachos contables) se activa si:
+    - existe match en Sheets
+    - ESTATUS == ENVIADO_ALIANZA
+    - LAST_MESSAGE_AT dentro de 24h
+    """
+    if not match:
+        return False
+
+    estatus = (match.get("estatus") or "").strip().upper()
+    if estatus != "ENVIADO_ALIANZA":
+        return False
+
+    dt = _parse_dt_maybe(match.get("last_message_at") or "")
+    if not dt:
+        return False
+
+    if dt.tzinfo is not None:
+        now = datetime.now(dt.tzinfo)
+    else:
+        now = datetime.utcnow()
+
+    return (now - dt) <= timedelta(hours=24)
+
+
+def _explicit_non_alianza_intent(text: str) -> bool:
+    """Devuelve True si el usuario expresa intención clara de OTRO producto distinto a ALIANZA.
+    Se usa para permitir que el usuario cambie de tema sin que ALIANZA secuestre el mensaje.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    # Señales fuertes de ALIANZA (si aparecen, NO rompemos el flujo ALIANZA)
+    alianza_signals = (
+        "alianza", "despacho", "contable", "contables", "contador", "contadores",
+        "comision", "comisión", "referir", "referencia",
+    )
+    if any(k in t for k in alianza_signals):
+        return False
+
+    # Señales fuertes de otros productos
+    other_signals = (
+        "auto", "seguro", "póliza", "poliza", "placa", "tarjeta de circulación", "circulacion",
+        "tpv", "terminal", "punto de venta", "liga de pago", "link de pago",
+        "imss", "ley 73", "modalidad", "pension", "pensión",
+        "prestamo", "préstamo", "credito", "crédito", "empresarial", "pyme",
+        "vida", "salud", "gmm", "gastos medicos", "gastos médicos",
+        "vrim", "tarjeta medica", "tarjeta médica",
+    )
+    return any(k in t for k in other_signals)
+
+
+def _handle_alianza_context_response(phone: str, text: str, match: Dict[str, Any]) -> bool:
+    """
+    Maneja respuestas en contexto ALIANZA post-campaña.
+    Retorna True si consumió el mensaje.
+    """
+    st_now = user_state.get(phone, "")
+    idle = st_now in ("", "__greeted__")
+    if not idle:
+        return False
+
+    if not _alianza_is_context(match):
+        return False
+
+    # Escape: si el cliente cambió claramente de intención (p. ej. 'seguro'), NO consumimos en ALIANZA.
+    if _explicit_non_alianza_intent(text):
+        log.info(f"🔀 Escape ALIANZA→Router por intención explícita: {text}")
+        return False
+
+    nombre = (match.get("nombre") or "").strip() or "Cliente"
+    msg_in = (text or "").strip()
+
+    _notify_advisor(
+        "🤝 ALIANZA — Interés/Respuesta detectada\n"
+        f"WhatsApp: {phone}\n"
+        f"Nombre: {nombre}\n"
+        f"Mensaje: {msg_in}"
+    )
+
+    send_message(
+        phone,
+        "✅ Gracias. Ya tengo tu interés en la *alianza para despachos contables*.\n"
+        "En breve te comparto la información y un asesor te contactará.\n"
+        "Para avanzar: ¿cómo se llama tu despacho y en qué ciudad estás?"
+    )
+
+    user_state[phone] = "__greeted__"
+    return True
+
 def _auto_is_context(match: Optional[Dict[str, Any]]) -> bool:
     """
     AUTO (seguro de auto) se activa si:
@@ -1097,6 +1195,13 @@ def webhook_receive():
                 if _auto_is_context(match) and _explicit_non_auto_intent(text):
                     log.info(f"🔀 Escape de flujo AUTO por intención explícita: {text}")
                 else:
+                    # 0.5. CONTEXTO ALIANZA (Despachos contables)
+                    if _alianza_is_context(match):
+                        if _handle_alianza_context_response(phone, text, match):
+                            intent_handled = True
+                    if intent_handled:
+                        return jsonify({"ok": True}), 200
+
                     # 1. CONTEXTO AUTO (Seguro de Auto)
                     if _auto_is_context(match):
                         if _handle_auto_context_response(phone, text, match):
