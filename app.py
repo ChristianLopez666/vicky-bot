@@ -60,9 +60,6 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
 SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto")
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
-LOG_SHEET_ENVIOS = os.getenv("LOG_SHEET_ENVIOS", "LogEnvios")
-LOG_SHEET_RESPUESTAS = os.getenv("LOG_SHEET_RESPUESTAS", "LogRespuestas")
-LOG_SHEET_STATUSES = os.getenv("LOG_SHEET_STATUSES", "LogStatuses")
 
 PORT = int(os.getenv("PORT", "5000"))
 
@@ -318,182 +315,9 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
             return False
     return False
 
-def send_template_message_meta(to: str, template_name: str, params: Dict | List) -> Dict[str, Any]:
-    """Como send_template_message pero devuelve metadata (message_id, http_status, error)."""
-    if not (META_TOKEN and WPP_API_URL):
-        return {"ok": False, "message_id": "", "http_status": 0, "error": "WhatsApp no configurado"}
-    # Reutiliza la lógica actual construyendo el mismo payload
-    components: List[Dict[str, Any]] = []
-
-    if template_name == "seguro_auto_70":
-        image_url = os.getenv("SEGURO_AUTO_70_IMAGE_URL")
-        if not image_url:
-            return {"ok": False, "message_id": "", "http_status": 0, "error": "Falta SEGURO_AUTO_70_IMAGE_URL"}
-        components.append({
-            "type": "header",
-            "parameters": [{
-                "type": "image",
-                "image": {"link": image_url}
-            }]
-        })
-
-    if isinstance(params, dict):
-        send_params = dict(params)
-        if "name" not in send_params and "nombre" in send_params:
-            send_params["name"] = send_params.pop("nombre")
-        body_params = []
-        for k, v in send_params.items():
-            body_params.append({"type": "text", "parameter_name": k, "text": str(v)})
-        if body_params:
-            components.append({"type": "body", "parameters": body_params})
-    elif isinstance(params, list):
-        body_params = [{"type": "text", "text": str(v)} for v in params]
-        if body_params:
-            components.append({"type": "body", "parameters": body_params})
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
-        "template": {
-            "name": template_name,
-            "language": {"code": "es_MX"},
-            **({"components": components} if components else {})
-        }
-    }
-
-    last_error = ""
-    last_status = 0
-    for attempt in range(3):
-        try:
-            log.info(f"📤 Enviando plantilla(meta) '{template_name}' a {to} (intento {attempt + 1})")
-            resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-            last_status = resp.status_code
-            if resp.status_code == 200:
-                try:
-                    j = resp.json() if resp.content else {}
-                except Exception:
-                    j = {}
-                mid = ""
-                try:
-                    mid = ((j.get("messages") or [{}])[0].get("id") or "")
-                except Exception:
-                    mid = ""
-                return {"ok": True, "message_id": mid, "http_status": resp.status_code, "error": ""}
-            last_error = resp.text[:500]
-            log.warning(f"⚠️ WPP send_template(meta) fallo {resp.status_code}: {last_error}")
-            if _should_retry(resp.status_code) and attempt < 2:
-                _backoff(attempt)
-                continue
-            return {"ok": False, "message_id": "", "http_status": resp.status_code, "error": last_error}
-        except requests.exceptions.Timeout:
-            last_error = "timeout"
-            last_status = 0
-            if attempt < 2:
-                _backoff(attempt)
-                continue
-            return {"ok": False, "message_id": "", "http_status": last_status, "error": last_error}
-        except Exception as e:
-            last_error = str(e)[:500]
-            last_status = 0
-            if attempt < 2:
-                _backoff(attempt)
-                continue
-            return {"ok": False, "message_id": "", "http_status": last_status, "error": last_error}
-
-    return {"ok": False, "message_id": "", "http_status": last_status, "error": last_error}
-
 # ==========================
 # Google Helpers
 # ==========================
-def _sheet_titles() -> List[str]:
-    try:
-        meta = sheets_svc.spreadsheets().get(spreadsheetId=SHEETS_ID_LEADS, fields="sheets(properties(title))").execute()
-        return [s["properties"]["title"] for s in meta.get("sheets", [])]
-    except Exception:
-        return []
-
-def _ensure_sheet_exists(title: str, headers: List[str]) -> None:
-    """Crea la hoja si no existe y escribe encabezados en la fila 1."""
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS and title):
-        return
-    try:
-        if title in _sheet_titles():
-            return
-        # Crear hoja
-        req = {
-            "requests": [{
-                "addSheet": {
-                    "properties": {"title": title}
-                }
-            }]
-        }
-        sheets_svc.spreadsheets().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=req).execute()
-        # Escribir headers
-        sheets_svc.spreadsheets().values().update(
-            spreadsheetId=SHEETS_ID_LEADS,
-            range=f"{title}!A1",
-            valueInputOption="RAW",
-            body={"values": [headers]}
-        ).execute()
-        log.info(f"✅ Hoja creada: {title}")
-    except Exception:
-        log.exception(f"❌ No se pudo crear/asegurar hoja: {title}")
-
-def _append_row(title: str, values: List[Any], headers: List[str]) -> None:
-    """Append 1 fila. Si no existe la hoja, la crea."""
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS and title):
-        return
-    _ensure_sheet_exists(title, headers)
-    try:
-        sheets_svc.spreadsheets().values().append(
-            spreadsheetId=SHEETS_ID_LEADS,
-            range=f"{title}!A:Z",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": [values]}
-        ).execute()
-    except Exception:
-        log.exception(f"❌ Error append en hoja {title}")
-
-def log_envio(nombre: str, to: str, template: str, ok: bool, message_id: str, lead_row: Any = "", http_status: Any = "", error: str = "") -> None:
-    headers = ["utc_iso", "lead_row", "nombre", "to", "template", "ok", "message_id", "http_status", "error"]
-    values = [datetime.utcnow().isoformat(), lead_row, nombre, to, template, str(bool(ok)), message_id or "", http_status or "", error or ""]
-    _append_row(LOG_SHEET_ENVIOS, values, headers)
-
-def log_status_event(st: Dict[str, Any]) -> None:
-    headers = ["utc_iso", "message_id", "status", "recipient_id", "timestamp", "raw"]
-    values = [
-        datetime.utcnow().isoformat(),
-        st.get("id", ""),
-        st.get("status", ""),
-        st.get("recipient_id", ""),
-        st.get("timestamp", ""),
-        json.dumps(st, ensure_ascii=False)[:2000]
-    ]
-    _append_row(LOG_SHEET_STATUSES, values, headers)
-
-def log_respuesta(phone: str, nombre: str, msg: Dict[str, Any]) -> None:
-    headers = ["utc_iso", "from", "nombre", "type", "text", "message_id_in", "context_id", "raw"]
-    mtype = msg.get("type", "")
-    text_body = ""
-    if mtype == "text":
-        text_body = ((msg.get("text") or {}).get("body") or "")
-    elif mtype in ("image", "document", "audio", "video"):
-        text_body = (msg.get(mtype, {}) or {}).get("id", "")
-    ctx = (msg.get("context") or {}).get("id", "")
-    values = [
-        datetime.utcnow().isoformat(),
-        phone,
-        nombre or "",
-        mtype,
-        text_body,
-        msg.get("id", ""),
-        ctx,
-        json.dumps(msg, ensure_ascii=False)[:2000]
-    ]
-    _append_row(LOG_SHEET_RESPUESTAS, values, headers)
-
 def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
     """
     Busca el teléfono (últimos 10 dígitos) en el Sheet y devuelve:
@@ -1163,7 +987,6 @@ def _retry_after_days(phone: str, days: int) -> None:
 def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     last10 = _normalize_phone_last10(phone)
     match = match_client_in_sheets(last10)
-
     base = "Dime qué necesitas y con gusto te guío para ayudarte a encontrar el servicio que necesitas."
     if match and match.get("nombre"):
         nombre = (match["nombre"] or "").strip()
@@ -1341,7 +1164,6 @@ def webhook_receive():
             if statuses:
                 for st in statuses:
                     try:
-                        log_status_event(st)
                         if (st.get("status") or "").lower() == "failed":
                             log.warning("❌ STATUS failed (detalle): %s", json.dumps(st, ensure_ascii=False))
                     except Exception:
@@ -1362,11 +1184,6 @@ def webhook_receive():
         last10 = _normalize_phone_last10(phone)
         match = match_client_in_sheets(last10)
         
-        try:
-            log_respuesta(phone, (match.get("nombre","") if match else ""), msg)
-        except Exception:
-            pass
-
         # Estado actual del usuario
         st_now = user_state.get(phone, "")
         idle = st_now in ("", "__greeted__")
@@ -1848,25 +1665,7 @@ def ext_auto_send_one():
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
 
-        meta = send_template_message_meta(to, template_name, {"nombre": nombre})
-
-
-        ok = bool(meta.get("ok"))
-
-
-        message_id = str(meta.get("message_id") or "")
-
-
-        http_status = meta.get("http_status")
-
-
-        error_txt = str(meta.get("error") or "")
-
-
-        # Log envío real
-
-
-        log_envio(nombre=nombre, to=to, template=template_name, ok=ok, message_id=message_id, lead_row=nxt["row_number"], http_status=http_status, error=error_txt)
+        ok = send_template_message(to, template_name, {"nombre": nombre})
 
         now_iso = datetime.utcnow().isoformat()
         estatus_val = "FALLO_ENVIO" if not ok else (
@@ -1885,8 +1684,7 @@ def ext_auto_send_one():
             "to": to,
             "row": nxt["row_number"],
             "nombre": nombre,
-            "timestamp": now_iso,
-            "message_id": message_id
+            "timestamp": now_iso
         }), 200
 
     except Exception as e:
