@@ -289,6 +289,18 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
 
             if resp.status_code == 200:
+                msg_id = ""
+                try:
+                    j = resp.json() if resp.text else {}
+                    msgs = (j or {}).get("messages") or []
+                    if msgs and isinstance(msgs, list):
+                        msg_id = (msgs[0] or {}).get("id", "")
+                except Exception:
+                    msg_id = ""
+                try:
+                    append_envio_status(to, msg_id, "sent", template_name, datetime.utcnow().isoformat())
+                except Exception:
+                    pass
                 log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
                 return True
 
@@ -379,6 +391,58 @@ def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
     except Exception:
         log.exception("❌ Error escribiendo seguimiento en Sheets")
 
+
+def append_envio_status(phone: str, message_id: str, status: str, template_name: str, timestamp_iso: str) -> None:
+    """Append a row into ENVIO_STATUS tab: Phone | MessageID | Status | Timestamp | Template."""
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return
+    try:
+        p10 = _normalize_phone_last10(phone)
+        body = {"values": [[p10, message_id or "", status or "", timestamp_iso or "", template_name or ""]]}
+        sheets_svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range="ENVIO_STATUS!A:E",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body
+        ).execute()
+    except Exception:
+        log.exception("❌ Error escribiendo ENVIO_STATUS")
+
+def append_respuesta_cliente(phone: str, nombre: str, mensaje: str, fecha_iso: str) -> None:
+    """Append a row into RESPUESTAS_CLIENTE tab: Phone | Nombre | Mensaje | Fecha."""
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return
+    try:
+        p10 = _normalize_phone_last10(phone)
+        body = {"values": [[p10, nombre or "", mensaje or "", fecha_iso or ""]]}
+        sheets_svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range="RESPUESTAS_CLIENTE!A:D",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body
+        ).execute()
+    except Exception:
+        log.exception("❌ Error escribiendo RESPUESTAS_CLIENTE")
+
+def get_last_envio_template(phone_last10: str) -> str:
+    """Returns last template_name sent to this phone_last10 from ENVIO_STATUS, or ""."""
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return ""
+    try:
+        resp = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=SHEETS_ID_LEADS, range="ENVIO_STATUS!A:E").execute()
+        vals = resp.get("values") or []
+        # Scan from bottom up for matching phone
+        target = (phone_last10 or "").strip()
+        for row in reversed(vals[1:]):  # skip header if present
+            if len(row) >= 1 and _normalize_phone_last10(row[0]) == target:
+                return (row[4] if len(row) >= 5 else "").strip()
+        return ""
+    except Exception:
+        log.exception("❌ Error leyendo ENVIO_STATUS")
+        return ""
 def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
     """Ubica/crea subcarpeta dentro de DRIVE_PARENT_FOLDER_ID."""
     if not (google_ready and drive_svc and DRIVE_PARENT_FOLDER_ID):
@@ -1190,6 +1254,39 @@ def webhook_receive():
         if mtype == "text" and "text" in msg:
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
+
+            # Registrar respuesta entrante en Sheets (RESPUESTAS_CLIENTE)
+            try:
+                now_iso = datetime.utcnow().isoformat()
+                nombre_sheet = (match.get("nombre", "").strip() if match else "")
+                append_respuesta_cliente(phone, nombre_sheet, text, now_iso)
+            except Exception:
+                pass
+
+            # Interceptor ultra-prioritario: si responden "info" a una plantilla, NO caer al menú/auto
+            t_norm_info = (text or "").strip().lower()
+            if t_norm_info in ("info", "informacion", "información", "mas info", "más info"):
+                last_tpl = ""
+                st = user_state.get(phone, "")
+                if st.startswith("awaiting_info:"):
+                    last_tpl = st.split(":", 1)[1].strip()
+                if not last_tpl:
+                    last_tpl = get_last_envio_template(last10)
+                if last_tpl in ("tpv_3", "promo_tpv", TPV_TEMPLATE_NAME):
+                    user_state[phone] = "tpv_giro"
+                    try:
+                        _notify_advisor(
+                            "🧾 Respuesta a plantilla (TPV)\n"
+                            f"Template: {last_tpl}\n"
+                            f"WhatsApp: {phone}\n"
+                            f"Nombre: {(match.get('nombre', '') if match else '') or '(sin nombre)'}\n"
+                            f"Mensaje: {text}"
+                        )
+                    except Exception:
+                        pass
+                    send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+                    return jsonify({"ok": True}), 200
+
             
             # =========================================================
             # 🔔 INTERCEPTOR POST-CAMPAÑA (AUTO) - PRIORIDAD ALTA
@@ -1572,118 +1669,4 @@ def _normalize_to_e164_mx(phone_raw: str) -> str:
         return f"521{digits[2:]}"
 
     # Si ya viene correcto (521 + 10 dígitos)
-    if digits.startswith("521") and len(digits) == 13:
-        return digits
-
-    return digits
-
-def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: List[str]) -> None:
-    """Actualiza celdas por header (ej. ESTATUS, LAST_MESSAGE_AT). row_number_1based incluye header como fila 1."""
-    if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
-        raise RuntimeError("Sheets no disponible para update.")
-    data = []
-    for col_name, value in updates.items():
-        j = _idx(headers, col_name)
-        if j is None:
-            raise RuntimeError(f"No existe columna '{col_name}' en el Sheet.")
-        # Columna A=1 => letra:
-        col_letter = chr(ord("A") + j)
-        a1 = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_number_1based}"
-        data.append({"range": a1, "values": [[value]]})
-    body = {"valueInputOption": "USER_ENTERED", "data": data}
-    sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
-
-def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Dict[str, Any]]:
-    """
-    Selecciona 1 prospecto pendiente:
-    - WhatsApp no vacío
-    - ESTATUS vacío o 'PENDIENTE'
-    - Reintenta automáticamente si ESTATUS = 'FALLO_ENVIO'
-      (aunque LAST_MESSAGE_AT tenga valor)
-    - Para cualquier otro ESTATUS != 'FALLO_ENVIO', requiere LAST_MESSAGE_AT vacío
-    """
-    i_name = _idx(headers, "Nombre")
-    i_wa = _idx(headers, "WhatsApp")
-    i_status = _idx(headers, "ESTATUS")
-    i_last = _idx(headers, "LAST_MESSAGE_AT")
-
-    if i_name is None or i_wa is None:
-        raise RuntimeError("Faltan columnas requeridas: 'Nombre' y/o 'WhatsApp'.")
-
-    for k, row in enumerate(rows, start=2):  # fila 2 = primer registro (fila 1 es header)
-        nombre = _cell(row, i_name).strip()
-        wa = _cell(row, i_wa).strip()
-        estatus = _cell(row, i_status).strip().upper() if i_status is not None else ""
-        last_at = _cell(row, i_last).strip() if i_last is not None else ""
-
-        if not wa:
-            continue
-        # Regla de reintento (Opción 2):
-        # - Si ya hay LAST_MESSAGE_AT, normalmente se salta
-        # - PERO si ESTATUS=FALLO_ENVIO, se permite reintento aunque haya timestamp
-        if last_at and estatus != "FALLO_ENVIO":
-            continue
-        # Permitimos:
-        # - vacío
-        # - PENDIENTE
-        # - FALLO_ENVIO (reintento)
-        if estatus and estatus not in ("PENDIENTE", "FALLO_ENVIO"):
-            # si ya trae ENVIADO_INICIAL u otro, lo saltamos
-            continue
-
-        return {"row_number": k, "nombre": nombre, "whatsapp": wa}
-
-    return None
-
-@app.post("/ext/auto-send-one")
-def ext_auto_send_one():
-    """
-    Endpoint para cron: envía 1 plantilla al siguiente prospecto pendiente.
-    Protegido por header: X-AUTO-TOKEN = AUTO_SEND_TOKEN
-    """
-    try:
-        token = (request.headers.get("X-AUTO-TOKEN") or "").strip()
-        if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-        body = request.get_json(force=True, silent=True) or {}
-        template_name = str(body.get("template", "")).strip()
-        if not template_name:
-            return jsonify({"ok": False, "error": "Falta 'template'"}), 400
-
-        headers, rows = _sheet_get_rows()
-        if not headers:
-            return jsonify({"ok": False, "error": "Sheet vacío"}), 400
-
-        nxt = _pick_next_pending(headers, rows)
-        if not nxt:
-            return jsonify({"ok": True, "sent": False, "reason": "no_pending"}), 200
-
-        to = _normalize_to_e164_mx(nxt["whatsapp"])
-        nombre = (nxt["nombre"] or "").strip() or "Cliente"
-
-        ok = send_template_message(to, template_name, ({} if template_name == "vrim_ideal" else {"nombre": nombre}))
-
-        now_iso = datetime.utcnow().isoformat()
-        estatus_val = "FALLO_ENVIO" if not ok else (
-            "ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else
-            ("ENVIADO_ALIANZA" if template_name in ALLIANCE_TEMPLATES else "ENVIADO_INICIAL")
-        )
-        updates = {
-            "ESTATUS": estatus_val,
-            "LAST_MESSAGE_AT": now_iso
-        }
-        _update_row_cells(nxt["row_number"], updates, headers)
-
-        return jsonify({
-            "ok": True,
-            "sent": bool(ok),
-            "to": to,
-            "row": nxt["row_number"],
-            "nombre": nombre,
-            "timestamp": now_iso
-        }), 200
-
-    except Exception as e:
-        log.exception("❌ Error en /ext/auto-send-one")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    if digits.startswith("521") and len(
