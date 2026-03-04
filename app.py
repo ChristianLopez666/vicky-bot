@@ -1669,4 +1669,127 @@ def _normalize_to_e164_mx(phone_raw: str) -> str:
         return f"521{digits[2:]}"
 
     # Si ya viene correcto (521 + 10 dígitos)
-    if digits.startswith("521") and len(
+    if digits.startswith("521") and len(digits) == 13:
+        return digits
+
+    return digits
+
+def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: List[str]) -> None:
+    """Actualiza celdas por header (ej. ESTATUS, LAST_MESSAGE_AT). row_number_1based incluye header como fila 1."""
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+        raise RuntimeError("Sheets no disponible para update.")
+    data = []
+    for col_name, value in updates.items():
+        j = _idx(headers, col_name)
+        if j is None:
+            raise RuntimeError(f"No existe columna '{col_name}' en el Sheet.")
+        # Columna A=1 => letra:
+        col_letter = chr(ord("A") + j)
+        a1 = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_number_1based}"
+        data.append({"range": a1, "values": [[value]]})
+    body = {"valueInputOption": "USER_ENTERED", "data": data}
+    sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
+
+def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Dict[str, Any]]:
+    """
+    Selecciona 1 prospecto pendiente:
+    - WhatsApp no vacío
+    - ESTATUS vacío o 'PENDIENTE'
+    - Reintenta automáticamente si ESTATUS = 'FALLO_ENVIO'
+      (aunque LAST_MESSAGE_AT tenga valor)
+    - Para cualquier otro ESTATUS != 'FALLO_ENVIO', requiere LAST_MESSAGE_AT vacío
+    """
+    i_name = _idx(headers, "Nombre")
+    i_wa = _idx(headers, "WhatsApp")
+    i_status = _idx(headers, "ESTATUS")
+    i_last = _idx(headers, "LAST_MESSAGE_AT")
+
+    if i_name is None or i_wa is None:
+        raise RuntimeError("Faltan columnas requeridas: 'Nombre' y/o 'WhatsApp'.")
+
+    for k, row in enumerate(rows, start=2):  # fila 2 = primer registro (fila 1 es header)
+        nombre = _cell(row, i_name).strip()
+        wa = _cell(row, i_wa).strip()
+        estatus = _cell(row, i_status).strip().upper() if i_status is not None else ""
+        last_at = _cell(row, i_last).strip() if i_last is not None else ""
+
+        if not wa:
+            continue
+        # Regla de reintento (Opción 2):
+        # - Si ya hay LAST_MESSAGE_AT, normalmente se salta
+        # - PERO si ESTATUS=FALLO_ENVIO, se permite reintento aunque haya timestamp
+        if last_at and estatus != "FALLO_ENVIO":
+            continue
+        # Permitimos:
+        # - vacío
+        # - PENDIENTE
+        # - FALLO_ENVIO (reintento)
+        if estatus and estatus not in ("PENDIENTE", "FALLO_ENVIO"):
+            # si ya trae ENVIADO_INICIAL u otro, lo saltamos
+            continue
+
+        return {"row_number": k, "nombre": nombre, "whatsapp": wa}
+
+    return None
+
+@app.post("/ext/auto-send-one")
+def ext_auto_send_one():
+    """
+    Endpoint para cron: envía 1 plantilla al siguiente prospecto pendiente.
+    Protegido por header: X-AUTO-TOKEN = AUTO_SEND_TOKEN
+    """
+    try:
+        token = (request.headers.get("X-AUTO-TOKEN") or "").strip()
+        if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        body = request.get_json(force=True, silent=True) or {}
+        template_name = str(body.get("template", "")).strip()
+        if not template_name:
+            return jsonify({"ok": False, "error": "Falta 'template'"}), 400
+
+        headers, rows = _sheet_get_rows()
+        if not headers:
+            return jsonify({"ok": False, "error": "Sheet vacío"}), 400
+
+        nxt = _pick_next_pending(headers, rows)
+        if not nxt:
+            return jsonify({"ok": True, "sent": False, "reason": "no_pending"}), 200
+
+        to = _normalize_to_e164_mx(nxt["whatsapp"])
+        nombre = (nxt["nombre"] or "").strip() or "Cliente"
+
+        ok = send_template_message(to, template_name, ({} if template_name == "vrim_ideal" else {"nombre": nombre}))
+
+        # Guardar contexto del último template enviado para interceptar respuestas como "info"
+        if ok:
+            user_state[to] = f"awaiting_info:{template_name}"
+        else:
+            try:
+                append_envio_status(to, "", "failed", template_name, datetime.utcnow().isoformat())
+            except Exception:
+                pass
+
+        now_iso = datetime.utcnow().isoformat()
+        estatus_val = "FALLO_ENVIO" if not ok else (
+            "ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else
+            ("ENVIADO_ALIANZA" if template_name in ALLIANCE_TEMPLATES else "ENVIADO_INICIAL")
+        )
+        updates = {
+            "ESTATUS": estatus_val,
+            "LAST_MESSAGE_AT": now_iso
+        }
+        _update_row_cells(nxt["row_number"], updates, headers)
+
+        return jsonify({
+            "ok": True,
+            "sent": bool(ok),
+            "to": to,
+            "row": nxt["row_number"],
+            "nombre": nombre,
+            "timestamp": now_iso
+        }), 200
+
+    except Exception as e:
+        log.exception("❌ Error en /ext/auto-send-one")
+        return jsonify({"ok": False, "error": str(e)}), 500
