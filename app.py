@@ -249,11 +249,8 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
 
     # BODY parameters
     if isinstance(params, dict):
-        # Mapeo mínimo para plantillas con placeholder {{name}}
-        # (Meta requiere parameter_name exacto: "name")
+        # Respetar nombres reales de placeholders (parameter_name) tal cual están en la plantilla
         send_params = dict(params)
-        if "name" not in send_params and "nombre" in send_params:
-            send_params["name"] = send_params.pop("nombre")
 
         body_params = []
         for k, v in send_params.items():
@@ -1665,7 +1662,7 @@ def ext_auto_send_one():
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
 
-        ok = send_template_message(to, template_name, {"nombre": nombre})
+        ok = send_template_message(to, template_name, ({} if template_name == "vrim_ideal" else {"nombre": nombre}))
 
         now_iso = datetime.utcnow().isoformat()
         estatus_val = "FALLO_ENVIO" if not ok else (
