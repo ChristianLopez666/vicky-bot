@@ -491,16 +491,16 @@ def upload_to_drive(file_name: str, file_bytes: bytes, mime_type: str, folder_na
 # Menú principal
 # ==========================
 MAIN_MENU = (
-    "🟦 *Vicky Bot — Inbursa*\n"
-    "Elige una opción:\n"
-    "1) Préstamo IMSS (Ley 73)\n"
-    "2) Seguro de Auto (cotización)\n"
-    "3) Seguros de Vida / Salud\n"
-    "4) Tarjeta médica VRIM\n"
-    "5) Crédito Empresarial\n"
-    "6) Financiamiento Práctico\n"
-    "7) Contactar con Christian\n"
-    "\nEscribe el número u opción (ej. 'imss', 'auto', 'empresarial', 'contactar')."
+    "Hola 👋 Soy *Vicky*, tu asistente de *COHIFIS — Inbursa Ahome*.\n\n"
+    "¿En qué te puedo orientar hoy?\n\n"
+    "1️⃣  Préstamo IMSS (Ley 73)\n"
+    "2️⃣  Seguro de Auto\n"
+    "3️⃣  Seguro de Vida / Salud\n"
+    "4️⃣  Tarjeta médica VRIM\n"
+    "5️⃣  Crédito Empresarial\n"
+    "6️⃣  Financiamiento Práctico\n"
+    "7️⃣  Hablar con Christian\n\n"
+    "Responde con el número o el nombre del servicio."
 )
 
 def send_main_menu(phone: str) -> None:
@@ -1002,14 +1002,47 @@ def _fp_next(phone: str, text: str) -> None:
 
 # --- Seguros de Auto (opción 2) ---
 def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
-    user_state[phone] = "auto_intro"
+    user_state[phone] = "auto_califica"
     log.info(f"🚗 Iniciando embudo seguro auto para {phone}")
     send_message(phone,
-        "🚗 *Seguro de Auto*\nEnvíame por favor:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas\n\nCuando lo envíes, te confirmaré recepción y procesaré la cotización."
+        "🚗 *Seguro de Auto — Inbursa*\n\n"
+        "Para orientarte mejor, ¿cuál es tu situación actual?\n\n"
+        "1) Tengo seguro y quiero comparar precios\n"
+        "2) Es mi primera vez contratando\n"
+        "3) Mi póliza está por vencer"
     )
 
 def _auto_next(phone: str, text: str) -> None:
     st = user_state.get(phone, "")
+    if st == "auto_califica":
+        t = text.strip().lower()
+        if t in ("1", "comparar", "tengo seguro"):
+            user_state[phone] = "auto_intro"
+            send_message(phone,
+                "Perfecto. Para prepararte una comparativa necesito:\n\n"
+                "• *Año y modelo* de tu vehículo\n"
+                "• *Número de placas*\n"
+                "• *Aseguradora actual* (si recuerdas)\n\n"
+                "Mándame esos datos 👇"
+            )
+        elif t in ("2", "primera vez", "primera contratación"):
+            user_state[phone] = "auto_intro"
+            send_message(phone,
+                "Con gusto te orientamos. Para cotizarte el mejor plan necesito:\n\n"
+                "• *Año y modelo* de tu vehículo\n"
+                "• *Número de placas* (si ya los tienes)\n\n"
+                "Mándame esa información 👇"
+            )
+        elif t in ("3", "vencer", "vencimiento", "por vencer"):
+            user_state[phone] = "auto_vencimiento_fecha"
+            send_message(phone,
+                "Bien hecho que lo piensas con tiempo. "
+                "¿Cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)\n\n"
+                "Te contactamos antes para que no quedes sin cobertura."
+            )
+        else:
+            send_message(phone, "Responde *1*, *2* o *3* para continuar.")
+        return
     if st == "auto_intro":
         intent = interpret_response(text)
         if "vencimiento" in text.lower() or "vence" in text.lower() or "fecha" in text.lower():
@@ -1048,7 +1081,7 @@ def _retry_after_days(phone: str, days: int) -> None:
 def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     last10 = _normalize_phone_last10(phone)
     match = match_client_in_sheets(last10)
-    base = "Dime qué necesitas y con gusto te guío para ayudarte a encontrar el servicio que necesitas."
+    base = "¿En qué te puedo orientar hoy? Escribe *menú* para ver las opciones disponibles."
     if match and match.get("nombre"):
         nombre = (match["nombre"] or "").strip()
         if nombre:
@@ -1331,7 +1364,7 @@ def webhook_receive():
                     "buenas tardes", "buenas noches", "hey", "que tal", "qué tal", "holi"
                 }
                 if t_norm in GREET_WORDS:
-                    base = "Dime qué necesitas y con gusto te guío para ayudarte a encontrar el servicio que necesitas."
+                    base = "¿En qué te puedo orientar hoy? Escribe *menú* para ver las opciones disponibles."
                     nombre = (match.get("nombre", "").strip() if match else "")
                     saludo = f"Hola {nombre} 👋 {base}" if nombre else f"Hola 👋 {base}"
                     send_message(phone, saludo)
