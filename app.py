@@ -1679,6 +1679,34 @@ def ext_send_promo():
         }), 500
 
 # ==========================
+# Keepalive asesor (Render Cron: cada 23h)
+# GET /ext/ping-advisor?token=AUTO_SEND_TOKEN
+# Mantiene abierta la ventana de 24h de WhatsApp con el número asesor
+# ==========================
+@app.get("/ext/ping-advisor")
+def ext_ping_advisor():
+    """
+    Envía un mensaje simple al asesor para mantener la ventana de 24h abierta.
+    Llamar con Render Cron cada 23 horas.
+    Protegido por query param: ?token=AUTO_SEND_TOKEN
+    """
+    try:
+        token = (request.args.get("token") or "").strip()
+        if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        if not ADVISOR_NUMBER:
+            return jsonify({"ok": False, "error": "ADVISOR_NUMBER no configurado"}), 500
+        ok = send_message(
+            ADVISOR_NUMBER,
+            "🤖 Vicky SECOM activa. Este mensaje mantiene la ventana de notificaciones abierta."
+        )
+        log.info(f"{'✅' if ok else '❌'} Ping al asesor ({ADVISOR_NUMBER}): {'ok' if ok else 'fallo'}")
+        return jsonify({"ok": bool(ok), "to": ADVISOR_NUMBER}), 200
+    except Exception as e:
+        log.exception("❌ Error en /ext/ping-advisor")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# ==========================
 # Arranque (para desarrollo local)
 # En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
 # ==========================
