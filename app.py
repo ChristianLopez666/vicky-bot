@@ -1016,7 +1016,8 @@ def _auto_next(phone: str, text: str) -> None:
     st = user_state.get(phone, "")
     if st == "auto_califica":
         t = text.strip().lower()
-        if t in ("1", "comparar", "tengo seguro"):
+        # Opción 1: ya tiene seguro / comparar
+        if t in ("1", "comparar", "tengo seguro", "ya tengo") or any(k in t for k in ("ya tengo", "ya cuento", "ya tengo seguro", "quiero comparar")):
             user_state[phone] = "auto_intro"
             send_message(phone,
                 "Perfecto. Para prepararte una comparativa necesito:\n\n"
@@ -1025,7 +1026,8 @@ def _auto_next(phone: str, text: str) -> None:
                 "• *Aseguradora actual* (si recuerdas)\n\n"
                 "Mándame esos datos 👇"
             )
-        elif t in ("2", "primera vez", "primera contratación"):
+        # Opción 2: primera vez
+        elif t in ("2", "primera vez", "primera contratación") or any(k in t for k in ("primera vez", "nunca he tenido", "no tengo seguro", "no tengo")):
             user_state[phone] = "auto_intro"
             send_message(phone,
                 "Con gusto te orientamos. Para cotizarte el mejor plan necesito:\n\n"
@@ -1033,15 +1035,46 @@ def _auto_next(phone: str, text: str) -> None:
                 "• *Número de placas* (si ya los tienes)\n\n"
                 "Mándame esa información 👇"
             )
-        elif t in ("3", "vencer", "vencimiento", "por vencer"):
+        # Opción 3: póliza por vencer
+        elif t in ("3", "vencer", "vencimiento", "por vencer") or any(k in t for k in ("por vencer", "se vence", "vence pronto", "vencimiento")):
             user_state[phone] = "auto_vencimiento_fecha"
             send_message(phone,
                 "Bien hecho que lo piensas con tiempo. "
                 "¿Cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)\n\n"
                 "Te contactamos antes para que no quedes sin cobertura."
             )
+        # Escape: menú
+        elif t in ("menu", "menú", "inicio", "salir", "cancelar"):
+            user_state[phone] = "__greeted__"
+            send_main_menu(phone)
+        # Objección de precio: capturar como lead y notificar
+        elif any(k in t for k in ("caro", "precio", "cuanto", "cuánto", "cuesta", "cobran", "vale")):
+            _notify_advisor(
+                "💬 Objeción de precio en Auto\n"
+                f"WhatsApp: {phone}\n"
+                f"Mensaje: {text}"
+            )
+            user_state[phone] = "__greeted__"
+            send_message(phone,
+                "Entiendo tu preocupación. El precio depende del vehículo y cobertura — "
+                "hay opciones desde cobertura básica hasta amplia.\n\n"
+                "Christian te contactará para darte una cotización exacta sin compromiso. "
+                "Escribe *menú* si necesitas otra cosa."
+            )
+        # Cualquier otro texto: notificar asesor y dar salida limpia
         else:
-            send_message(phone, "Responde *1*, *2* o *3* para continuar.")
+            _notify_advisor(
+                "📩 Respuesta libre en flujo Auto\n"
+                f"WhatsApp: {phone}\n"
+                f"Mensaje: {text}"
+            )
+            send_message(phone,
+                "Recibido. Para continuar con el seguro de auto elige:\n\n"
+                "1) Tengo seguro y quiero comparar\n"
+                "2) Primera vez contratando\n"
+                "3) Mi póliza está por vencer\n\n"
+                "O escribe *menú* para ver otras opciones."
+            )
         return
     if st == "auto_intro":
         intent = interpret_response(text)
