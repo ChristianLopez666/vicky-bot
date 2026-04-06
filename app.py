@@ -914,7 +914,8 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         if tpv_start_from_reply(phone, text, match):
             return
     tlow = t.lower()
-    if ("credito" in tlow or "crédito" in tlow or "prestamo" in tlow or "préstamo" in tlow) and not any(k in tlow for k in ("auto", "seguro auto", "seguro de auto", "póliza", "poliza", "placa")):
+    imss_signals = ("imss", "ley 73", "pensionado", "jubilado", "pension", "pensión", "modalidad 40")
+    if ("credito" in tlow or "crédito" in tlow or "prestamo" in tlow or "préstamo" in tlow) and not any(k in tlow for k in ("auto", "seguro auto", "seguro de auto", "póliza", "poliza", "placa")) and not any(k in tlow for k in imss_signals):
         send_message(phone, "¿Qué tipo de crédito buscas?\n1) Préstamo IMSS (Ley 73)\n5) Crédito Empresarial\n6) Financiamiento Práctico\n\nResponde *1*, *5* o *6*.")
         return
     if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
@@ -1408,5 +1409,4 @@ def ext_auto_send_one():
         return jsonify({"ok": True, "sent": bool(ok), "to": to, "row": nxt["row_number"], "nombre": nombre, "timestamp": now_iso}), 200
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
-        return jsonify({"ok": False, "error": str(e)}), 500
-        
+        return jsonify({"ok": False, "error": str(e)}), 500      
