@@ -1409,4 +1409,4 @@ def ext_auto_send_one():
         return jsonify({"ok": True, "sent": bool(ok), "to": to, "row": nxt["row_number"], "nombre": nombre, "timestamp": now_iso}), 200
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
-        return jsonify({"ok": False, "error": str(e)}), 500      
+        return jsonify({"ok": False, "error": str(e)}), 500    
