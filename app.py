@@ -254,9 +254,9 @@ def send_message(to: str, text: str) -> bool:
     return False
 
 
-def forward_media_to_advisor(media_type: str, media_id: str) -> None:
+def forward_media_to_advisor(media_type: str, media_id: str) -> bool:
     if not (META_TOKEN and WPP_API_URL and ADVISOR_NUMBER):
-        return
+        return False
     payload = {
         "messaging_product": "whatsapp",
         "to": ADVISOR_NUMBER,
@@ -264,10 +264,15 @@ def forward_media_to_advisor(media_type: str, media_id: str) -> None:
         media_type: {"id": media_id}
     }
     try:
-        requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-        log.info(f"📤 Multimedia reenviada al asesor ({media_type})")
+        resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+        if resp.status_code == 200:
+            log.info(f"📤 Multimedia reenviada al asesor ({media_type})")
+            return True
+        log.warning(f"⚠️ Reenvío multimedia falló {resp.status_code}: {resp.text[:200]}")
+        return False
     except Exception:
         log.exception("❌ Error reenviando multimedia al asesor")
+        return False
 
 def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
     if not (META_TOKEN and WPP_API_URL):
@@ -844,7 +849,7 @@ def _auto_next(phone: str, text: str) -> None:
             send_message(phone, "Con gusto te orientamos. Para cotizarte el mejor plan necesito:\n\n• *Año y modelo* de tu vehículo\n• *Número de placas* (si ya los tienes)\n\nMándame esa información 👇")
         elif t in ("3", "vencer", "vencimiento", "por vencer") or any(k in t for k in ("por vencer", "se vence", "vence pronto", "vencimiento")):
             user_state[phone] = "auto_vencimiento_fecha"
-            send_message(phone, "Bien hecho que lo piensas con tiempo. ¿Cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)\n\nTe contactamos antes para que no quedes sin cobertura.")
+            send_message(phone, "Bien hecho que lo piensas con tiempo. ¿Cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)\n\nChristian te contactará antes del vencimiento para que no quedes sin cobertura.")
         elif t in ("menu", "menú", "inicio", "salir", "cancelar"):
             user_state[phone] = "__greeted__"
             send_main_menu(phone)
@@ -872,20 +877,20 @@ def _auto_next(phone: str, text: str) -> None:
             fecha = datetime.fromisoformat(text.strip()).date()
             objetivo = fecha - timedelta(days=30)
             write_followup_to_sheets("auto_recordatorio", f"Recordatorio póliza -30d para {phone}", objetivo.isoformat())
-            threading.Thread(target=_retry_after_days, args=(phone, 7), daemon=True).start()
-            send_message(phone, f"✅ Gracias. Te contactaré *un mes antes* ({objetivo.isoformat()}).")
+            send_message(phone,
+                f"✅ Gracias. Registré la fecha de vencimiento ({fecha.isoformat()}). "
+                f"Christian te contactará antes del {objetivo.isoformat()} para que no quedes sin cobertura."
+            )
+            _notify_advisor(
+                f"📅 Recordatorio de póliza registrado\nWhatsApp: {phone}\n"
+                f"Vencimiento: {fecha.isoformat()}\nContactar antes de: {objetivo.isoformat()}"
+            )
             user_state[phone] = "__greeted__"
             send_main_menu(phone)
         except Exception:
             send_message(phone, "Formato inválido. Usa AAAA-MM-DD. Ejemplo: 2025-12-31")
 
-def _retry_after_days(phone: str, days: int) -> None:
-    try:
-        time.sleep(days * 24 * 60 * 60)
-        send_message(phone, "⏰ Seguimos a tus órdenes. ¿Deseas que coticemos tu seguro de auto cuando se acerque el vencimiento?")
-        write_followup_to_sheets("auto_reintento", f"Reintento +{days}d enviado a {phone}", datetime.utcnow().isoformat())
-    except Exception:
-        log.exception("Error en reintento programado")
+
 
 # ==========================
 # Router helpers
@@ -918,9 +923,11 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
     if ("credito" in tlow or "crédito" in tlow or "prestamo" in tlow or "préstamo" in tlow) and not any(k in tlow for k in ("auto", "seguro auto", "seguro de auto", "póliza", "poliza", "placa")) and not any(k in tlow for k in imss_signals):
         send_message(phone, "¿Qué tipo de crédito buscas?\n1) Préstamo IMSS (Ley 73)\n5) Crédito Empresarial\n6) Financiamiento Práctico\n\nResponde *1*, *5* o *6*.")
         return
-    if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
+    imss_keywords = ("imss", "ley 73", "pensionado", "jubilado", "préstamo imss", "prestamo imss", "credito imss", "crédito imss")
+    auto_keywords = ("seguro de auto", "seguro auto", "cotizar auto", "póliza auto", "poliza auto")
+    if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión") or any(k in t for k in imss_keywords):
         imss_start(phone, match)
-    elif t in ("2", "auto", "seguros de auto", "seguro auto"):
+    elif t in ("2", "auto", "seguros de auto", "seguro auto") or any(k in t for k in auto_keywords):
         auto_start(phone, match)
     elif t in ("3", "vida", "salud", "seguro de vida", "seguro de salud"):
         send_message(phone, "🧬 *Seguros de Vida/Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.")
@@ -1031,23 +1038,29 @@ def webhook_receive():
         payload = request.get_json(force=True, silent=True) or {}
         log.info(f"📥 Webhook recibido: {json.dumps(payload, indent=2)[:500]}...")
         
-        entry = payload.get("entry", [{}])[0]
-        changes = entry.get("changes", [{}])[0]
-        value = changes.get("value", {})
-        messages = value.get("messages", [])
-        statuses = value.get("statuses", [])
-        if not messages:
-            if statuses:
-                for st in statuses:
-                    try:
-                        if (st.get("status") or "").lower() == "failed":
-                            log.warning("❌ STATUS failed (detalle): %s", json.dumps(st, ensure_ascii=False))
-                    except Exception:
-                        pass
+        # Iterar todos los entries y changes del payload
+        all_messages = []
+        all_statuses = []
+        for entry in payload.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                all_messages.extend(value.get("messages", []))
+                all_statuses.extend(value.get("statuses", []))
+
+        if not all_messages:
+            for st in all_statuses:
+                try:
+                    if (st.get("status") or "").lower() == "failed":
+                        log.warning("❌ STATUS failed (detalle): %s", json.dumps(st, ensure_ascii=False))
+                except Exception:
+                    pass
             log.info("ℹ️ Webhook sin mensajes (posible status update)")
             return jsonify({"ok": True}), 200
 
-        msg = messages[0]
+        if len(all_messages) > 1:
+            log.info(f"ℹ️ Payload con {len(all_messages)} mensajes — procesando el primero (comportamiento estándar Meta)")
+
+        msg = all_messages[0]
         phone = msg.get("from")
         if not phone:
             log.warning("⚠️ Mensaje sin número de teléfono")
@@ -1085,9 +1098,10 @@ def webhook_receive():
                     interest = decision.get("interest", "")
                     active_campaign = decision.get("active_campaign", "")
                     hint = decision.get("vicky_context_hint", "")
-                    if hint:
-                        user_data.setdefault(phone, {})
-                        user_data[phone]["vicky_hint"] = hint
+                    udata = user_data.setdefault(phone, {})
+                    # Actualizar hint y bonus — limpiar si no vienen activos
+                    udata["vicky_hint"] = hint if hint else ""
+                    udata["campaign_bonus_eligible"] = bool(decision.get("campaign_bonus_eligible"))
                     if route_to == "VICKY_CAMPANAS" and existing_client != "true":
                         _notify_advisor(
                             "🧠 BOARDROOM — Lead enrutable a VICKY_CAMPANAS\n"
@@ -1096,6 +1110,7 @@ def webhook_receive():
                             f"Campaña activa: {active_campaign or '-'}\n"
                             f"Hint: {hint or '-'}"
                         )
+                        udata["boardroom_notified"] = True
             except Exception as e:
                 logging.exception("[decision-layer] integración no bloqueante: %s", e)
             # --- Fin Decision Layer ---
@@ -1149,11 +1164,8 @@ def webhook_receive():
                 t_norm = (text or "").strip().lower()
                 GREET_WORDS = {"hola", "buenas", "buenos dias", "buenos días", "buen dia", "buen día", "buenas tardes", "buenas noches", "hey", "que tal", "qué tal", "holi"}
                 if t_norm in GREET_WORDS:
-                    base = "¿En qué te puedo orientar hoy? Escribe *menú* para ver las opciones disponibles."
-                    nombre = (match.get("nombre", "").strip() if match else "")
-                    saludo = f"Hola {nombre} 👋 {base}" if nombre else f"Hola 👋 {base}"
-                    send_message(phone, saludo)
                     user_state[phone] = "__greeted__"
+                    _greet_and_match(phone)
                     return jsonify({"ok": True}), 200
                 TPV_KEYWORDS = ("tpv", "terminal", "terminales", "punto de venta", "punto-de-venta", "cobrar con tarjeta", "cobro con tarjeta", "pagar con tarjeta", "ligas de pago", "link de pago", "link pago", "cobro a distancia")
                 if any(k in t_norm for k in TPV_KEYWORDS):
@@ -1172,12 +1184,26 @@ def webhook_receive():
             t_lower = text.lower().strip()
             VALID_COMMANDS = {"1","2","3","4","5","6","7","menu","menú","inicio","hola","imss","ley 73","prestamo","préstamo","pension","pensión","auto","seguro auto","seguros de auto","vida","salud","seguro de vida","seguro de salud","vrim","tarjeta medica","tarjeta médica","empresarial","pyme","credito","crédito","credito empresarial","crédito empresarial","financiamiento","financiamiento practico","financiamiento práctico","contactar","asesor","contactar con christian"}
             if not t_lower.isdigit() and t_lower not in VALID_COMMANDS and idle:
-                _notify_advisor(f"📩 Cliente INTERESADO / DUDA detectada\nWhatsApp: {phone}\nMensaje: {text}")
+                if not user_data.get(phone, {}).get("boardroom_notified", False):
+                    _notify_advisor(f"📩 Cliente INTERESADO / DUDA detectada\nWhatsApp: {phone}\nMensaje: {text}")
+                # No resetear boardroom_notified aquí — se limpia en el siguiente ciclo de Boardroom
 
             if phone not in user_state:
                 user_state[phone] = "__greeted__"
-                if not match:
+                # Solo saludar si el mensaje no contiene intención procesable
+                _t = text.strip().lower()
+                _tiene_intencion = any(k in _t for k in (
+                    "imss", "préstamo", "prestamo", "ley 73", "pensión", "pension",
+                    "auto", "seguro", "póliza", "poliza", "placa",
+                    "vida", "salud", "vrim", "tarjeta medica",
+                    "empresarial", "pyme", "crédito", "credito",
+                    "financiamiento", "tpv", "terminal", "nómina", "nomina",
+                ))
+                if not _tiene_intencion:
                     _greet_and_match(phone)
+                    return jsonify({"ok": True}), 200
+                # Si hay intención: saludar brevemente y continuar al router
+                _greet_and_match(phone)
 
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
@@ -1299,10 +1325,6 @@ def ext_ping_advisor():
         log.exception("❌ Error en /ext/ping-advisor")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-if __name__ == "__main__":
-    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
-
 # ==========================
 # AUTO SEND
 # ==========================
@@ -1409,4 +1431,9 @@ def ext_auto_send_one():
         return jsonify({"ok": True, "sent": bool(ok), "to": to, "row": nxt["row_number"], "nombre": nombre, "timestamp": now_iso}), 200
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
-        return jsonify({"ok": False, "error": str(e)}), 500    
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+if __name__ == "__main__":
+    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
+    
