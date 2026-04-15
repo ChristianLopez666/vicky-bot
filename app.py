@@ -487,16 +487,16 @@ def upload_to_drive(file_name: str, file_bytes: bytes, mime_type: str, folder_na
 # Menú principal
 # ==========================
 MAIN_MENU = (
-    "Hola 👋 Soy *Vicky*, tu asistente de *COHIFIS — Inbursa Ahome*.\n\n"
-    "¿En qué te puedo orientar hoy?\n\n"
-    "1️⃣  Préstamo IMSS (Ley 73)\n"
-    "2️⃣  Seguro de Auto\n"
-    "3️⃣  Seguro de Vida / Salud\n"
-    "4️⃣  Tarjeta médica VRIM\n"
-    "5️⃣  Crédito Empresarial\n"
-    "6️⃣  Financiamiento Práctico\n"
-    "7️⃣  Hablar con Christian\n\n"
-    "Responde con el número o el nombre del servicio."
+     "Hola 👋 Soy Vicky, asistente de tu Asesor Financiero Christian López — INBURSA.\n\n"
+    "😊 ¿En qué te puedo orientar hoy?\n\n"
+    "1️⃣ Préstamo IMSS (Ley 73)\n"
+    "2️⃣ Seguro de Auto 🚗\n"
+    "3️⃣ Seguro de Vida / Salud ❤️\n"
+    "4️⃣ Tarjeta médica VRIM 🩺\n"
+    "5️⃣ Crédito Empresarial 🏢\n"
+    "6️⃣ Financiamiento Práctico 💳\n"
+    "7️⃣ Hablar con Christian 📞\n\n"
+    "✍️ Responde con el número o el nombre del servicio."
 )
 
 def send_main_menu(phone: str) -> None:
