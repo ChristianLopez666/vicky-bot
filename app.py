@@ -682,10 +682,16 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
     if _explicit_non_auto_intent(text):
         log.info(f"🔀 Escape AUTO→Router por intención explícita: {text}")
         return False
-    if t in ("1", "si", "sí", "ok", "claro") or intent == "positive":
-        user_state[phone] = "auto_intro"
-        auto_start(phone, match)
-        return True
+   def _notify_advisor(text: str) -> None:
+    try:
+        log.info(f"👨‍💼 Notificando al asesor: {text}")
+        ok = send_message(ADVISOR_NUMBER, text)
+        if ok:
+            log.info(f"✅ Notificación enviada al asesor: {ADVISOR_NUMBER}")
+        else:
+            log.error(f"❌ No se pudo enviar la notificación al asesor: {ADVISOR_NUMBER}")
+    except Exception:
+        log.exception("❌ Error notificando al asesor")
     if t in ("2", "no", "nel") or intent == "negative":
         user_state[phone] = "auto_vencimiento_fecha"
         nombre = match.get("nombre", "").strip() or "Cliente"
