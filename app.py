@@ -9,6 +9,7 @@
 # 5. ✅ Manejo mejorado de errores
 # 6. ✅ Worker para envíos masivos
 # 7. ✅ WEBHOOK FIXED - Detección temprana de respuestas a plantillas
+# 8. ✅ Decision Layer integrado (Boardroom Engine)
 # ------------------------------------------------------------
 
 from __future__ import annotations
@@ -62,6 +63,16 @@ SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto")
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID")
 
 PORT = int(os.getenv("PORT", "5000"))
+
+# ==========================
+# Decision Layer (Boardroom)
+# ==========================
+BOARDROOM_DECISION_URL = os.getenv(
+    "BOARDROOM_DECISION_URL",
+    "https://boardroom-engine.onrender.com/api/decision/process",
+)
+BOARDROOM_AUTH_TOKEN = os.getenv("BOARDROOM_AUTH_TOKEN", "")
+DECISION_TIMEOUT_SECONDS = int(os.getenv("DECISION_TIMEOUT_SECONDS", "5"))
 
 # Configuración de logging robusta
 logging.basicConfig(
@@ -148,6 +159,50 @@ def _ensure_user(phone: str) -> Dict[str, Any]:
     return user_data[phone]
 
 # ==========================
+# Decision Layer Helper
+# ==========================
+def call_decision_layer(telefono: str, mensaje: str, nombre: str = "") -> Optional[Dict[str, Any]]:
+    if not BOARDROOM_DECISION_URL or not BOARDROOM_AUTH_TOKEN:
+        logging.warning("[decision-layer] configuración incompleta; se omite llamada")
+        return None
+    payload = {
+        "source": "whatsapp_inbound",
+        "telefono": telefono,
+        "mensaje": mensaje or "",
+        "nombre": nombre or "",
+    }
+    headers = {
+        "Authorization": f"Bearer {BOARDROOM_AUTH_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(
+            BOARDROOM_DECISION_URL,
+            headers=headers,
+            json=payload,
+            timeout=DECISION_TIMEOUT_SECONDS,
+        )
+        if resp.status_code != 200:
+            logging.warning(
+                "[decision-layer] HTTP %s: %s",
+                resp.status_code,
+                resp.text[:500],
+            )
+            return None
+        data = resp.json()
+        if not isinstance(data, dict) or not data.get("ok"):
+            logging.warning("[decision-layer] respuesta inválida: %s", data)
+            return None
+        decision = data.get("decision")
+        if not isinstance(decision, dict):
+            logging.warning("[decision-layer] 'decision' ausente o inválido")
+            return None
+        return decision
+    except Exception as e:
+        logging.exception("[decision-layer] fallo en POST /api/decision/process: %s", e)
+        return None
+
+# ==========================
 # WhatsApp Helpers (retries)
 # ==========================
 def _wpp_headers() -> Dict[str, str]:
@@ -163,30 +218,24 @@ def _backoff(attempt: int) -> None:
     time.sleep(2 ** attempt)
 
 def send_message(to: str, text: str) -> bool:
-    """Envía mensaje de texto WPP. Reintentos exponenciales en 429/5xx."""
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID faltan).")
         return False
-    
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
         "type": "text",
         "text": {"body": text[:4096]},
     }
-    
     for attempt in range(3):
         try:
             log.info(f"📤 Enviando mensaje a {to} (intento {attempt + 1})")
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-            
             if resp.status_code == 200:
                 log.info(f"✅ Mensaje enviado exitosamente a {to}")
                 return True
-            
             log.warning(f"⚠️ WPP send_message fallo {resp.status_code}: {resp.text[:200]}")
             if _should_retry(resp.status_code) and attempt < 2:
-                log.info(f"🔄 Reintentando en {2 ** attempt} segundos...")
                 _backoff(attempt)
                 continue
             return False
@@ -196,7 +245,7 @@ def send_message(to: str, text: str) -> bool:
                 _backoff(attempt)
                 continue
             return False
-        except Exception as e:
+        except Exception:
             log.exception(f"❌ Error en send_message a {to}")
             if attempt < 2:
                 _backoff(attempt)
@@ -205,10 +254,9 @@ def send_message(to: str, text: str) -> bool:
     return False
 
 
-def forward_media_to_advisor(media_type: str, media_id: str) -> None:
-    """Reenvía la multimedia recibida al número del asesor usando el media_id original."""
+def forward_media_to_advisor(media_type: str, media_id: str) -> bool:
     if not (META_TOKEN and WPP_API_URL and ADVISOR_NUMBER):
-        return
+        return False
     payload = {
         "messaging_product": "whatsapp",
         "to": ADVISOR_NUMBER,
@@ -216,24 +264,21 @@ def forward_media_to_advisor(media_type: str, media_id: str) -> None:
         media_type: {"id": media_id}
     }
     try:
-        requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-        log.info(f"📤 Multimedia reenviada al asesor ({media_type})")
+        resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+        if resp.status_code == 200:
+            log.info(f"📤 Multimedia reenviada al asesor ({media_type})")
+            return True
+        log.warning(f"⚠️ Reenvío multimedia falló {resp.status_code}: {resp.text[:200]}")
+        return False
     except Exception:
         log.exception("❌ Error reenviando multimedia al asesor")
+        return False
 
 def send_template_message(to: str, template_name: str, params: Dict | List) -> bool:
-    """Envía plantilla preaprobada.
-
-    - Si `params` es list => parámetros posicionales ({{1}}, {{2}}, ...).
-    - Si `params` es dict => parámetros nombrados ({{nombre}}, {{monto}}, ...), usando `parameter_name`.
-    """
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
         return False
-
     components: List[Dict[str, Any]] = []
-
-    # HEADER image (solo plantillas con imagen fija)
     if template_name == "seguro_auto_70":
         image_url = os.getenv("SEGURO_AUTO_70_IMAGE_URL")
         if not image_url:
@@ -241,34 +286,16 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
             return False
         components.append({
             "type": "header",
-            "parameters": [{
-                "type": "image",
-                "image": {"link": image_url}
-            }]
+            "parameters": [{"type": "image", "image": {"link": image_url}}]
         })
-
-    # BODY parameters
     if isinstance(params, dict):
-        body_params = []
-        for k, v in params.items():
-            body_params.append({
-                "type": "text",
-                "parameter_name": k,
-                "text": str(v)
-            })
+        body_params = [{"type": "text", "parameter_name": k, "text": str(v)} for k, v in params.items()]
         if body_params:
-            components.append({
-                "type": "body",
-                "parameters": body_params
-            })
+            components.append({"type": "body", "parameters": body_params})
     elif isinstance(params, list):
         body_params = [{"type": "text", "text": str(v)} for v in params]
         if body_params:
-            components.append({
-                "type": "body",
-                "parameters": body_params
-            })
-
+            components.append({"type": "body", "parameters": body_params})
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -279,19 +306,27 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
             **({"components": components} if components else {})
         }
     }
-
     for attempt in range(3):
         try:
             log.info(f"📤 Enviando plantilla '{template_name}' a {to} (intento {attempt + 1})")
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
-
             if resp.status_code == 200:
+                msg_id = ""
+                try:
+                    j = resp.json() if resp.text else {}
+                    msgs = (j or {}).get("messages") or []
+                    if msgs and isinstance(msgs, list):
+                        msg_id = (msgs[0] or {}).get("id", "")
+                except Exception:
+                    msg_id = ""
+                try:
+                    append_envio_status(to, msg_id, "sent", template_name, datetime.utcnow().isoformat())
+                except Exception:
+                    pass
                 log.info(f"✅ Plantilla '{template_name}' enviada exitosamente a {to}")
                 return True
-
             log.warning(f"⚠️ WPP send_template fallo {resp.status_code}: {resp.text[:200]}")
             if _should_retry(resp.status_code) and attempt < 2:
-                log.info(f"🔄 Reintentando plantilla en {2 ** attempt} segundos...")
                 _backoff(attempt)
                 continue
             return False
@@ -313,33 +348,22 @@ def send_template_message(to: str, template_name: str, params: Dict | List) -> b
 # Google Helpers
 # ==========================
 def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
-    """
-    Busca el teléfono (últimos 10 dígitos) en el Sheet y devuelve:
-      - row: número de fila 1-based en Google Sheets
-      - nombre
-      - estatus (si existe la columna)
-      - last_message_at (si existe la columna)
-      - raw: fila completa
-    """
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         log.warning("⚠️ Sheets no disponible; no se puede hacer matching.")
         return None
     try:
-        headers, rows = _sheet_get_rows()  # usa el sheet principal (SHEETS_TITLE_LEADS)
+        headers, rows = _sheet_get_rows()
         if not headers:
             return None
-
         i_name = _idx(headers, "Nombre")
         i_wa = _idx(headers, "WhatsApp")
         i_status = _idx(headers, "ESTATUS")
         i_last = _idx(headers, "LAST_MESSAGE_AT")
-
         if i_wa is None:
             log.warning("⚠️ No existe columna 'WhatsApp' en el Sheet.")
             return None
-
         target = str(phone_last10).strip()
-        for k, row in enumerate(rows, start=2):  # fila 2 = primer registro
+        for k, row in enumerate(rows, start=2):
             wa_cell = _cell(row, i_wa)
             wa_last10 = _normalize_phone_last10(wa_cell)
             if target and wa_last10 == target:
@@ -348,7 +372,6 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
                 last_at = _cell(row, i_last).strip() if i_last is not None else ""
                 log.info(f"✅ Cliente encontrado en Sheets: {nombre} ({target})")
                 return {"row": k, "nombre": nombre, "estatus": estatus, "last_message_at": last_at, "raw": row}
-
         log.info(f"ℹ️ Cliente no encontrado en Sheets: {target}")
         return None
     except Exception:
@@ -356,15 +379,12 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
         return None
 
 def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
-    """Registra una nota en una hoja 'Seguimiento' (append)."""
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
         log.warning("⚠️ Sheets no disponible; no se puede escribir seguimiento.")
         return
     try:
         title = "Seguimiento"
-        body = {
-            "values": [[str(row), date_iso, note]]
-        }
+        body = {"values": [[str(row), date_iso, note]]}
         sheets_svc.spreadsheets().values().append(
             spreadsheetId=SHEETS_ID_LEADS,
             range=f"{title}!A:C",
@@ -376,8 +396,55 @@ def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
     except Exception:
         log.exception("❌ Error escribiendo seguimiento en Sheets")
 
+def append_envio_status(phone: str, message_id: str, status: str, template_name: str, timestamp_iso: str) -> None:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return
+    try:
+        p10 = _normalize_phone_last10(phone)
+        body = {"values": [[p10, message_id or "", status or "", timestamp_iso or "", template_name or ""]]}
+        sheets_svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range="ENVIO_STATUS!A:E",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body
+        ).execute()
+    except Exception:
+        log.exception("❌ Error escribiendo ENVIO_STATUS")
+
+def append_respuesta_cliente(phone: str, nombre: str, mensaje: str, fecha_iso: str) -> None:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return
+    try:
+        p10 = _normalize_phone_last10(phone)
+        body = {"values": [[p10, nombre or "", mensaje or "", fecha_iso or ""]]}
+        sheets_svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range="RESPUESTAS_CLIENTE!A:D",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body
+        ).execute()
+    except Exception:
+        log.exception("❌ Error escribiendo RESPUESTAS_CLIENTE")
+
+def get_last_envio_template(phone_last10: str) -> str:
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return ""
+    try:
+        resp = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=SHEETS_ID_LEADS, range="ENVIO_STATUS!A:E").execute()
+        vals = resp.get("values") or []
+        target = (phone_last10 or "").strip()
+        for row in reversed(vals[1:]):
+            if len(row) >= 1 and _normalize_phone_last10(row[0]) == target:
+                return (row[4] if len(row) >= 5 else "").strip()
+        return ""
+    except Exception:
+        log.exception("❌ Error leyendo ENVIO_STATUS")
+        return ""
+
 def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
-    """Ubica/crea subcarpeta dentro de DRIVE_PARENT_FOLDER_ID."""
     if not (google_ready and drive_svc and DRIVE_PARENT_FOLDER_ID):
         log.warning("⚠️ Drive no disponible; no se puede crear carpeta.")
         return None
@@ -386,7 +453,6 @@ def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
         resp = drive_svc.files().list(q=q, fields="files(id, name)").execute()
         items = resp.get("files", [])
         if items:
-            log.info(f"✅ Carpeta encontrada: {folder_name}")
             return items[0]["id"]
         meta = {
             "name": folder_name,
@@ -394,15 +460,12 @@ def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
             "parents": [DRIVE_PARENT_FOLDER_ID],
         }
         created = drive_svc.files().create(body=meta, fields="id").execute()
-        folder_id = created.get("id")
-        log.info(f"✅ Carpeta creada: {folder_name} (ID: {folder_id})")
-        return folder_id
+        return created.get("id")
     except Exception:
         log.exception("❌ Error creando/buscando carpeta en Drive")
         return None
 
 def upload_to_drive(file_name: str, file_bytes: bytes, mime_type: str, folder_name: str) -> Optional[str]:
-    """Sube archivo a carpeta del cliente; retorna webViewLink (si posible) o fileId."""
     if not (google_ready and drive_svc and MediaIoBaseUpload):
         log.warning("⚠️ Drive no disponible; no se puede subir archivo.")
         return None
@@ -424,16 +487,16 @@ def upload_to_drive(file_name: str, file_bytes: bytes, mime_type: str, folder_na
 # Menú principal
 # ==========================
 MAIN_MENU = (
-    "🟦 *Vicky Bot — Inbursa*\n"
-    "Elige una opción:\n"
-    "1) Préstamo IMSS (Ley 73)\n"
-    "2) Seguro de Auto (cotización)\n"
-    "3) Seguros de Vida / Salud\n"
-    "4) Tarjeta médica VRIM\n"
-    "5) Crédito Empresarial\n"
-    "6) Financiamiento Práctico\n"
-    "7) Contactar con Christian\n"
-    "\nEscribe el número u opción (ej. 'imss', 'auto', 'empresarial', 'contactar')."
+     "Hola 👋 Soy Vicky, asistente de tu Asesor Financiero Christian López — INBURSA.\n\n"
+    "😊 ¿En qué te puedo orientar hoy?\n\n"
+    "1️⃣ Préstamo IMSS (Ley 73)\n"
+    "2️⃣ Seguro de Auto 🚗\n"
+    "3️⃣ Seguro de Vida / Salud ❤️\n"
+    "4️⃣ Tarjeta médica VRIM 🩺\n"
+    "5️⃣ Crédito Empresarial 🏢\n"
+    "6️⃣ Financiamiento Práctico 💳\n"
+    "7️⃣ Hablar con Christian 📞\n\n"
+    "✍️ Responde con el número o el nombre del servicio."
 )
 
 def send_main_menu(phone: str) -> None:
@@ -441,29 +504,27 @@ def send_main_menu(phone: str) -> None:
     send_message(phone, MAIN_MENU)
 
 # ==========================
-# Embudos (conservados del original)
+# Embudos
 # ==========================
 def _notify_advisor(text: str) -> None:
     try:
         log.info(f"👨‍💼 Notificando al asesor: {text}")
-        send_message(ADVISOR_NUMBER, text)
+        ok = send_message(ADVISOR_NUMBER, text)
+        if ok:
+            log.info(f"✅ Notificación enviada al asesor: {ADVISOR_NUMBER}")
+        else:
+            log.error(f"❌ No se pudo enviar la notificación al asesor: {ADVISOR_NUMBER}")
     except Exception:
         log.exception("❌ Error notificando al asesor")
 
-# --- TPV / Terminal bancaria (solo cuando viene de plantilla promo_tpv) ---
 TPV_TEMPLATE_NAME = "promo_tpv"
-
-# Plantillas de alianza (despachos contables)
-ALLIANCE_TEMPLATES = {
-    "despachis_contables",
-}
+ALLIANCE_TEMPLATES = {"despachis_contables"}
 
 def _parse_dt_maybe(value: str) -> Optional[datetime]:
     if not value:
         return None
     v = value.strip()
     try:
-        # Soporta "2026-01-08T18:03:24.442624545Z"
         if v.endswith("Z"):
             v = v[:-1] + "+00:00"
         return datetime.fromisoformat(v)
@@ -471,12 +532,6 @@ def _parse_dt_maybe(value: str) -> Optional[datetime]:
         return None
 
 def _tpv_is_context(match: Optional[Dict[str, Any]]) -> bool:
-    """
-    TPV se activa únicamente si:
-    - existe match en Sheets
-    - ESTATUS == ENVIADO_TPV
-    - LAST_MESSAGE_AT dentro de 24h
-    """
     if not match:
         return False
     if (match.get("estatus") or "").strip().upper() != "ENVIADO_TPV":
@@ -484,45 +539,28 @@ def _tpv_is_context(match: Optional[Dict[str, Any]]) -> bool:
     dt = _parse_dt_maybe(match.get("last_message_at") or "")
     if not dt:
         return False
-    # Si dt viene con tz, normalizamos a UTC; si no, asumimos UTC.
-    if dt.tzinfo is not None:
-        now = datetime.now(dt.tzinfo)
-    else:
-        now = datetime.utcnow()
+    now = datetime.now(dt.tzinfo) if dt.tzinfo is not None else datetime.utcnow()
     return (now - dt) <= timedelta(hours=24)
 
 def tpv_start_from_reply(phone: str, text: str, match: Optional[Dict[str, Any]]) -> bool:
-    """
-    Procesa la respuesta inmediata del prospecto al mensaje TPV (plantilla):
-      - 1 / sí => pide solo giro => horario => notifica => cierra
-      - 2 / no => pide motivo (opcional) => cierra
-    Retorna True si consumió el mensaje (no debe seguir al menú general).
-    """
     t = (text or "").strip().lower()
     intent = interpret_response(text)
-
-    # Determina elección
     if t == "1" or intent == "positive":
         user_state[phone] = "tpv_giro"
         send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
         return True
-
     if t == "2" or intent == "negative":
         user_state[phone] = "tpv_motivo"
         send_message(phone, "Entendido. ¿Cuál fue el *motivo*? (opcional). Si no deseas responder, escribe *omitir*.")
         return True
-
     return False
 
 def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     st = user_state.get(phone, "")
     data = _ensure_user(phone)
-
-    # Nombre para notificación (si existe)
     nombre = ""
     if match and match.get("nombre"):
         nombre = match["nombre"].strip()
-
     if st == "tpv_giro":
         giro = (text or "").strip()
         if not giro:
@@ -532,32 +570,25 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
         user_state[phone] = "tpv_horario"
         send_message(phone, "¿Qué *horario* te conviene para que Christian te contacte? (ej. hoy 4pm, mañana 10am)")
         return
-
     if st == "tpv_horario":
         horario = (text or "").strip()
         if not horario:
             send_message(phone, "Indícame un *horario* (ej. hoy 4pm, mañana 10am).")
             return
         data["tpv_horario"] = horario
-
         resumen = (
             "✅ Listo. En breve Christian te contactará para ofrecerte la mejor opción de terminal.\n"
             f"- Giro: {data.get('tpv_giro','')}\n"
             f"- Horario: {data.get('tpv_horario','')}"
         )
         send_message(phone, resumen)
-
-        aviso = (
+        _notify_advisor(
             "🔔 TPV — Prospecto interesado\n"
             f"WhatsApp: {phone}\n"
             f"Nombre: {nombre or '(sin nombre)'}\n"
             f"Giro: {data.get('tpv_giro','')}\n"
             f"Horario: {data.get('tpv_horario','')}"
         )
-
-        _notify_advisor(aviso)
-
-        # Opcional: marcar estatus si existe row
         try:
             if match and match.get("row"):
                 headers, _ = _sheet_get_rows()
@@ -565,16 +596,13 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
                     _update_row_cells(int(match["row"]), {"ESTATUS": "TPV_INTERESADO"}, headers)
         except Exception:
             log.exception("⚠️ No fue posible actualizar ESTATUS TPV_INTERESADO")
-
         user_state[phone] = "__greeted__"
         return
-
     if st == "tpv_motivo":
         motivo = (text or "").strip()
         if motivo.lower() == "omitir":
             motivo = ""
         data["tpv_motivo"] = motivo
-
         send_message(phone, "Gracias por tu respuesta. Si más adelante deseas una terminal, aquí estaré para ayudarte.")
         try:
             if match and match.get("row"):
@@ -583,229 +611,133 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
                     _update_row_cells(int(match["row"]), {"ESTATUS": "TPV_NO_INTERESADO"}, headers)
         except Exception:
             log.exception("⚠️ No fue posible actualizar ESTATUS TPV_NO_INTERESADO")
-
         user_state[phone] = "__greeted__"
         return
 
-# --- AUTO CONTEXT DETECTION (NEW) ---
 def _alianza_is_context(match: Optional[Dict[str, Any]]) -> bool:
-    """
-    ALIANZA (despachos contables) se activa si:
-    - existe match en Sheets
-    - ESTATUS == ENVIADO_ALIANZA
-    - LAST_MESSAGE_AT dentro de 24h
-    """
     if not match:
         return False
-
     estatus = (match.get("estatus") or "").strip().upper()
     if estatus != "ENVIADO_ALIANZA":
         return False
-
     dt = _parse_dt_maybe(match.get("last_message_at") or "")
     if not dt:
         return False
-
-    if dt.tzinfo is not None:
-        now = datetime.now(dt.tzinfo)
-    else:
-        now = datetime.utcnow()
-
+    now = datetime.now(dt.tzinfo) if dt.tzinfo is not None else datetime.utcnow()
     return (now - dt) <= timedelta(hours=24)
 
-
 def _explicit_non_alianza_intent(text: str) -> bool:
-    """Devuelve True si el usuario expresa intención clara de OTRO producto distinto a ALIANZA.
-    Se usa para permitir que el usuario cambie de tema sin que ALIANZA secuestre el mensaje.
-    """
     t = (text or "").strip().lower()
     if not t:
         return False
-
-    # Señales fuertes de ALIANZA (si aparecen, NO rompemos el flujo ALIANZA)
-    alianza_signals = (
-        "alianza", "despacho", "contable", "contables", "contador", "contadores",
-        "comision", "comisión", "referir", "referencia",
-    )
+    alianza_signals = ("alianza", "despacho", "contable", "contables", "contador", "contadores", "comision", "comisión", "referir", "referencia")
     if any(k in t for k in alianza_signals):
         return False
-
-    # Señales fuertes de otros productos
-    other_signals = (
-        "auto", "seguro", "póliza", "poliza", "placa", "tarjeta de circulación", "circulacion",
-        "tpv", "terminal", "punto de venta", "liga de pago", "link de pago",
-        "imss", "ley 73", "modalidad", "pension", "pensión",
-        "prestamo", "préstamo", "credito", "crédito", "empresarial", "pyme",
-        "vida", "salud", "gmm", "gastos medicos", "gastos médicos",
-        "vrim", "tarjeta medica", "tarjeta médica",
-    )
+    other_signals = ("auto", "seguro", "póliza", "poliza", "placa", "tarjeta de circulación", "circulacion", "tpv", "terminal", "punto de venta", "liga de pago", "link de pago", "imss", "ley 73", "modalidad", "pension", "pensión", "prestamo", "préstamo", "credito", "crédito", "empresarial", "pyme", "vida", "salud", "gmm", "gastos medicos", "gastos médicos", "vrim", "tarjeta medica", "tarjeta médica")
     return any(k in t for k in other_signals)
 
-
 def _handle_alianza_context_response(phone: str, text: str, match: Dict[str, Any]) -> bool:
-    """
-    Maneja respuestas en contexto ALIANZA post-campaña.
-    Retorna True si consumió el mensaje.
-    """
     st_now = user_state.get(phone, "")
     idle = st_now in ("", "__greeted__")
     if not idle:
         return False
-
     if not _alianza_is_context(match):
         return False
-
-    # Escape: si el cliente cambió claramente de intención (p. ej. 'seguro'), NO consumimos en ALIANZA.
     if _explicit_non_alianza_intent(text):
         log.info(f"🔀 Escape ALIANZA→Router por intención explícita: {text}")
         return False
-
     nombre = (match.get("nombre") or "").strip() or "Cliente"
-    msg_in = (text or "").strip()
-
-    _notify_advisor(
-        "🤝 ALIANZA — Interés/Respuesta detectada\n"
-        f"WhatsApp: {phone}\n"
-        f"Nombre: {nombre}\n"
-        f"Mensaje: {msg_in}"
-    )
-
-    send_message(
-        phone,
-        "✅ Gracias. Ya tengo tu interés en la *alianza para despachos contables*.\n"
-        "En breve te comparto la información y un asesor te contactará.\n"
-        "Para avanzar: ¿cómo se llama tu despacho y en qué ciudad estás?"
-    )
-
+    _notify_advisor(f"🤝 ALIANZA — Interés/Respuesta detectada\nWhatsApp: {phone}\nNombre: {nombre}\nMensaje: {(text or '').strip()}")
+    send_message(phone, "✅ Gracias. Ya tengo tu interés en la *alianza para despachos contables*.\nEn breve te comparto la información y un asesor te contactará.\nPara avanzar: ¿cómo se llama tu despacho y en qué ciudad estás?")
     user_state[phone] = "__greeted__"
     return True
 
 def _auto_is_context(match: Optional[Dict[str, Any]]) -> bool:
-    """
-    AUTO (seguro de auto) se activa si:
-    - existe match en Sheets
-    - ESTATUS en (ENVIADO_INICIAL, ENVIADO_AUTO, ENVIADO_SEGURO_AUTO)
-    - LAST_MESSAGE_AT dentro de 24h
-    """
     if not match:
         return False
-    
     estatus = (match.get("estatus") or "").strip().upper()
-    valid_status = {"ENVIADO_INICIAL", "ENVIADO_AUTO", "ENVIADO_SEGURO_AUTO"}
-    if estatus not in valid_status:
+    if estatus not in {"ENVIADO_INICIAL", "ENVIADO_AUTO", "ENVIADO_SEGURO_AUTO"}:
         return False
-    
     dt = _parse_dt_maybe(match.get("last_message_at") or "")
     if not dt:
         return False
-    
-    if dt.tzinfo is not None:
-        now = datetime.now(dt.tzinfo)
-    else:
-        now = datetime.utcnow()
-    
+    now = datetime.now(dt.tzinfo) if dt.tzinfo is not None else datetime.utcnow()
     return (now - dt) <= timedelta(hours=24)
 
-
 def _explicit_non_auto_intent(text: str) -> bool:
-    """Devuelve True si el usuario expresa intención clara de OTRO producto distinto a AUTO.
-    Se usa para evitar que el flujo post-campaña AUTO 'secuestré' mensajes como 'crédito'.
-    """
     t = (text or "").strip().lower()
     if not t:
         return False
-
-    # Señales fuertes de AUTO (si aparecen, NO rompemos el flujo AUTO)
-    auto_signals = (
-        "auto", "seguro auto", "seguro de auto", "póliza", "poliza",
-        "placa", "placas", "tarjeta de circulación", "tarjeta de circulacion",
-        "circulación", "circulacion",
-    )
+    auto_signals = ("auto", "seguro auto", "seguro de auto", "póliza", "poliza", "placa", "placas", "tarjeta de circulación", "tarjeta de circulacion", "circulación", "circulacion")
     if any(k in t for k in auto_signals):
         return False
-
-    # Señales fuertes de otros productos
-    other_signals = (
-        "credito", "crédito",
-        "prestamo", "préstamo",
-        "imss", "ley 73",
-        "empresarial", "pyme",
-        "tpv", "terminal", "punto de venta",
-        "vida", "salud",
-        "vrim", "tarjeta medica", "tarjeta médica",
-        "financiamiento", "financiamiento práctico", "financiamiento practico",
-    )
+    other_signals = ("credito", "crédito", "prestamo", "préstamo", "imss", "ley 73", "empresarial", "pyme", "tpv", "terminal", "punto de venta", "vida", "salud", "vrim", "tarjeta medica", "tarjeta médica", "financiamiento", "financiamiento práctico", "financiamiento practico")
     return any(k in t for k in other_signals)
 
-
 def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) -> bool:
-    """
-    Maneja respuestas en contexto AUTO post-campaña.
-    Retorna True si consumió el mensaje.
-    """
     t = (text or "").strip().lower()
     intent = interpret_response(text)
     st_now = user_state.get(phone, "")
     idle = st_now in ("", "__greeted__")
-    
+
     if not idle:
         return False
-    
     if not _auto_is_context(match):
         return False
-
-    # Escape: si el cliente cambió claramente de intención (p. ej. 'crédito'), NO consumimos en AUTO.
     if _explicit_non_auto_intent(text):
         log.info(f"🔀 Escape AUTO→Router por intención explícita: {text}")
         return False
-    
-    # Respuesta positiva (Sí, 1, etc.)
+
+    nombre = match.get("nombre", "").strip() or "Cliente"
+
     if t in ("1", "si", "sí", "ok", "claro") or intent == "positive":
-        user_state[phone] = "auto_intro"
-        auto_start(phone, match)
-        return True
-    
-    # Respuesta negativa (No, 2, etc.)
-    if t in ("2", "no", "nel") or intent == "negative":
-        user_state[phone] = "auto_vencimiento_fecha"
-        nombre = match.get("nombre", "").strip() or "Cliente"
-        send_message(phone, f"Entendido {nombre}. Para poder recordarte a tiempo, ¿cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)")
-        
-        # Notificar al asesor
-        aviso = (
-            "🔔 AUTO — NO INTERESADO / TIENE SEGURO\n"
+        _notify_advisor(
+            f"🚗 AUTO — CLIENTE INTERESADO\n"
             f"WhatsApp: {phone}\n"
             f"Nombre: {nombre}\n"
             f"Respuesta: {text}"
         )
-        _notify_advisor(aviso)
+        auto_start(phone, match)
         return True
-    
-    # Menú
+
+    if t in ("2", "no", "nel") or intent == "negative":
+        user_state[phone] = "auto_vencimiento_fecha"
+        send_message(
+            phone,
+            f"Entendido {nombre}. Para poder recordarte a tiempo, ¿cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)"
+        )
+        _notify_advisor(
+            f"🔔 AUTO — NO INTERESADO / TIENE SEGURO\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {nombre}\n"
+            f"Respuesta: {text}"
+        )
+        return True
+
     if t in ("menu", "menú", "inicio"):
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
         return True
-    
-    # Cualquier otra cosa: notificar asesor como DUDA
-    nombre = match.get("nombre", "").strip() or "Cliente"
-    aviso = (
-        "📩 AUTO — DUDA / INTERÉS detectada\n"
+
+    _notify_advisor(
+        f"📩 AUTO — DUDA / INTERÉS detectada\n"
         f"WhatsApp: {phone}\n"
         f"Nombre: {nombre}\n"
         f"Mensaje: {text}"
     )
-    _notify_advisor(aviso)
-    
-    # Pregunta cerrada de confirmación
     send_message(phone, "¿Deseas cotizar tu seguro de auto ahora? Responde *Sí* o *No*")
     return True
 
-# --- IMSS (opción 1) ---
 def imss_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "imss_beneficios"
     log.info(f"🏥 Iniciando embudo IMSS para {phone}")
-    send_message(phone, "🟩 *Préstamo IMSS Ley 73*\nBeneficios clave: trámite rápido, sin aval, pagos fijos y atención personalizada. ¿Te interesa conocer requisitos? (responde *sí* o *no*)")
+    data = _ensure_user(phone)
+    bonus_eligible = data.get("campaign_bonus_eligible") is True
+    msg = "🟩 *Préstamo IMSS Ley 73*\n"
+    if bonus_eligible:
+        msg += "🎯 Este trimestre hay condiciones especiales en el préstamo IMSS.\n"
+    msg += "Beneficios clave: trámite rápido, sin aval, pagos fijos y atención personalizada. ¿Te interesa conocer requisitos? (responde *sí* o *no*)"
+    send_message(phone, msg)
 
 def _imss_next(phone: str, text: str) -> None:
     st = user_state.get(phone, "")
@@ -856,10 +788,8 @@ def _imss_next(phone: str, text: str) -> None:
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
 
-# --- Crédito Empresarial (opción 5) ---
 def emp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "emp_confirma"
-    log.info(f"🏢 Iniciando embudo empresarial para {phone}")
     send_message(phone, "🟦 *Crédito Empresarial*\n¿Eres empresario(a) o representas una empresa? (sí/no)")
 
 def _emp_next(phone: str, text: str) -> None:
@@ -901,12 +831,11 @@ def _emp_next(phone: str, text: str) -> None:
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
 
-# --- Financiamiento Práctico (opción 6) ---
 FP_QUESTIONS = [f"Pregunta {i}" for i in range(1, 12)]
+
 def fp_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "fp_q1"
     _ensure_user(phone)["fp_answers"] = {}
-    log.info(f"💰 Iniciando embudo financiamiento práctico para {phone}")
     send_message(phone, "🟩 *Financiamiento Práctico*\nResponderemos 11 preguntas rápidas.\n1) " + FP_QUESTIONS[0])
 
 def _fp_next(phone: str, text: str) -> None:
@@ -923,9 +852,7 @@ def _fp_next(phone: str, text: str) -> None:
             send_message(phone, "¿Algún *comentario adicional*?")
     elif st == "fp_comentario":
         data["fp_comentario"] = text.strip()
-        resumen = "✅ Gracias. Un asesor te contactará.\n" + "\n".join(
-            f"{k.upper()}: {v}" for k, v in data.get("fp_answers", {}).items()
-        )
+        resumen = "✅ Gracias. Un asesor te contactará.\n" + "\n".join(f"{k.upper()}: {v}" for k, v in data.get("fp_answers", {}).items())
         if data.get("fp_comentario"):
             resumen += f"\nCOMENTARIO: {data['fp_comentario']}"
         send_message(phone, resumen)
@@ -933,16 +860,34 @@ def _fp_next(phone: str, text: str) -> None:
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
 
-# --- Seguros de Auto (opción 2) ---
 def auto_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
-    user_state[phone] = "auto_intro"
-    log.info(f"🚗 Iniciando embudo seguro auto para {phone}")
-    send_message(phone,
-        "🚗 *Seguro de Auto*\nEnvíame por favor:\n• INE (frente)\n• Tarjeta de circulación *o* número de placas\n\nCuando lo envíes, te confirmaré recepción y procesaré la cotización."
-    )
+    user_state[phone] = "auto_califica"
+    send_message(phone, "🚗 *Seguro de Auto — Inbursa*\n\nPara orientarte mejor, ¿cuál es tu situación actual?\n\n1) Tengo seguro y quiero comparar precios\n2) Es mi primera vez contratando\n3) Mi póliza está por vencer")
 
 def _auto_next(phone: str, text: str) -> None:
     st = user_state.get(phone, "")
+    if st == "auto_califica":
+        t = text.strip().lower()
+        if t in ("1", "comparar", "tengo seguro", "ya tengo") or any(k in t for k in ("ya tengo", "ya cuento", "ya tengo seguro", "quiero comparar")):
+            user_state[phone] = "auto_intro"
+            send_message(phone, "Perfecto. Para prepararte una comparativa necesito:\n\n• *Año y modelo* de tu vehículo\n• *Número de placas*\n• *Aseguradora actual* (si recuerdas)\n\nMándame esos datos 👇")
+        elif t in ("2", "primera vez", "primera contratación") or any(k in t for k in ("primera vez", "nunca he tenido", "no tengo seguro", "no tengo")):
+            user_state[phone] = "auto_intro"
+            send_message(phone, "Con gusto te orientamos. Para cotizarte el mejor plan necesito:\n\n• *Año y modelo* de tu vehículo\n• *Número de placas* (si ya los tienes)\n\nMándame esa información 👇")
+        elif t in ("3", "vencer", "vencimiento", "por vencer") or any(k in t for k in ("por vencer", "se vence", "vence pronto", "vencimiento")):
+            user_state[phone] = "auto_vencimiento_fecha"
+            send_message(phone, "Bien hecho que lo piensas con tiempo. ¿Cuál es la *fecha de vencimiento* de tu póliza? (formato AAAA-MM-DD)\n\nChristian te contactará antes del vencimiento para que no quedes sin cobertura.")
+        elif t in ("menu", "menú", "inicio", "salir", "cancelar"):
+            user_state[phone] = "__greeted__"
+            send_main_menu(phone)
+        elif any(k in t for k in ("caro", "precio", "cuanto", "cuánto", "cuesta", "cobran", "vale")):
+            _notify_advisor(f"💬 Objeción de precio en Auto\nWhatsApp: {phone}\nMensaje: {text}")
+            user_state[phone] = "__greeted__"
+            send_message(phone, "Entiendo tu preocupación. El precio depende del vehículo y cobertura — hay opciones desde cobertura básica hasta amplia.\n\nChristian te contactará para darte una cotización exacta sin compromiso. Escribe *menú* si necesitas otra cosa.")
+        else:
+            _notify_advisor(f"📩 Respuesta libre en flujo Auto\nWhatsApp: {phone}\nMensaje: {text}")
+            send_message(phone, "Recibido. Para continuar con el seguro de auto elige:\n\n1) Tengo seguro y quiero comparar\n2) Primera vez contratando\n3) Mi póliza está por vencer\n\nO escribe *menú* para ver otras opciones.")
+        return
     if st == "auto_intro":
         intent = interpret_response(text)
         if "vencimiento" in text.lower() or "vence" in text.lower() or "fecha" in text.lower():
@@ -954,26 +899,25 @@ def _auto_next(phone: str, text: str) -> None:
             send_message(phone, "Entendido. Para poder recordarte a tiempo, ¿cuál es la *fecha de vencimiento* de tu póliza? (AAAA-MM-DD)")
             return
         send_message(phone, "Perfecto. Puedes empezar enviando los *documentos* o una *foto* de la tarjeta/placas.")
-
     elif st == "auto_vencimiento_fecha":
         try:
             fecha = datetime.fromisoformat(text.strip()).date()
             objetivo = fecha - timedelta(days=30)
             write_followup_to_sheets("auto_recordatorio", f"Recordatorio póliza -30d para {phone}", objetivo.isoformat())
-            threading.Thread(target=_retry_after_days, args=(phone, 7), daemon=True).start()
-            send_message(phone, f"✅ Gracias. Te contactaré *un mes antes* ({objetivo.isoformat()}).")
+            send_message(phone,
+                f"✅ Gracias. Registré la fecha de vencimiento ({fecha.isoformat()}). "
+                f"Christian te contactará antes del {objetivo.isoformat()} para que no quedes sin cobertura."
+            )
+            _notify_advisor(
+                f"📅 Recordatorio de póliza registrado\nWhatsApp: {phone}\n"
+                f"Vencimiento: {fecha.isoformat()}\nContactar antes de: {objetivo.isoformat()}"
+            )
             user_state[phone] = "__greeted__"
             send_main_menu(phone)
         except Exception:
             send_message(phone, "Formato inválido. Usa AAAA-MM-DD. Ejemplo: 2025-12-31")
 
-def _retry_after_days(phone: str, days: int) -> None:
-    try:
-        time.sleep(days * 24 * 60 * 60)
-        send_message(phone, "⏰ Seguimos a tus órdenes. ¿Deseas que coticemos tu seguro de auto cuando se acerque el vencimiento?")
-        write_followup_to_sheets("auto_reintento", f"Reintento +{days}d enviado a {phone}", datetime.utcnow().isoformat())
-    except Exception:
-        log.exception("Error en reintento programado")
+
 
 # ==========================
 # Router helpers
@@ -981,45 +925,36 @@ def _retry_after_days(phone: str, days: int) -> None:
 def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     last10 = _normalize_phone_last10(phone)
     match = match_client_in_sheets(last10)
-    base = "Dime qué necesitas y con gusto te guío para ayudarte a encontrar el servicio que necesitas."
-    if match and match.get("nombre"):
-        nombre = (match["nombre"] or "").strip()
-        if nombre:
-            send_message(phone, f"Hola {nombre} 👋 {base}")
-        else:
-            send_message(phone, f"Hola 👋 {base}")
+    base = "¿En qué te puedo orientar hoy? Escribe *menú* para ver las opciones disponibles."
+    data = _ensure_user(phone)
+    hint = (data.get("vicky_hint") or "").strip()
+    nombre = (match.get("nombre") or "").strip() if match else ""
+    if hint:
+        saludo = f"Hola {nombre} 👋 Vi que te interesa {hint}. ¿En qué te puedo orientar?" if nombre else f"Hola 👋 Vi que te interesa {hint}. ¿En qué te puedo orientar?"
     else:
-        send_message(phone, f"Hola 👋 {base}")
+        saludo = f"Hola {nombre} 👋 {base}" if nombre else f"Hola 👋 {base}"
+    send_message(phone, saludo)
     return match
 
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = text.strip().lower()
     st = user_state.get(phone, "")
-
-    # TPV tiene prioridad si el prospecto viene de la plantilla promo_tpv
     if st.startswith("tpv_"):
         _tpv_next(phone, text, match)
         return
     if _tpv_is_context(match):
         if tpv_start_from_reply(phone, text, match):
             return
-
-    # Intención genérica de 'crédito' (sin especificar tipo): guiar a opciones correctas
     tlow = t.lower()
-    if ("credito" in tlow or "crédito" in tlow or "prestamo" in tlow or "préstamo" in tlow) and not any(k in tlow for k in ("auto", "seguro auto", "seguro de auto", "póliza", "poliza", "placa")):
-        send_message(
-            phone,
-            "¿Qué tipo de crédito buscas?\n"
-            "1) Préstamo IMSS (Ley 73)\n"
-            "5) Crédito Empresarial\n"
-            "6) Financiamiento Práctico\n\n"
-            "Responde *1*, *5* o *6*."
-        )
+    imss_signals = ("imss", "ley 73", "pensionado", "jubilado", "pension", "pensión", "modalidad 40")
+    if ("credito" in tlow or "crédito" in tlow or "prestamo" in tlow or "préstamo" in tlow) and not any(k in tlow for k in ("auto", "seguro auto", "seguro de auto", "póliza", "poliza", "placa")) and not any(k in tlow for k in imss_signals):
+        send_message(phone, "¿Qué tipo de crédito buscas?\n1) Préstamo IMSS (Ley 73)\n5) Crédito Empresarial\n6) Financiamiento Práctico\n\nResponde *1*, *5* o *6*.")
         return
-
-    if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión"):
+    imss_keywords = ("imss", "ley 73", "pensionado", "jubilado", "préstamo imss", "prestamo imss", "credito imss", "crédito imss")
+    auto_keywords = ("seguro de auto", "seguro auto", "cotizar auto", "póliza auto", "poliza auto")
+    if t in ("1", "imss", "ley 73", "préstamo", "prestamo", "pension", "pensión") or any(k in t for k in imss_keywords):
         imss_start(phone, match)
-    elif t in ("2", "auto", "seguros de auto", "seguro auto"):
+    elif t in ("2", "auto", "seguros de auto", "seguro auto") or any(k in t for k in auto_keywords):
         auto_start(phone, match)
     elif t in ("3", "vida", "salud", "seguro de vida", "seguro de salud"):
         send_message(phone, "🧬 *Seguros de Vida/Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.")
@@ -1071,20 +1006,14 @@ def webhook_verify():
     return "Error", 403
 
 # ==========================
-# Webhook — recepción (VERSIÓN CORREGIDA)
+# Webhook — recepción
 # ==========================
 def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
-    """Descarga bytes, mime_type y filename desde WPP Graph para media_id."""
     if not META_TOKEN:
         return None, None, None
     try:
-        meta = requests.get(
-            f"https://graph.facebook.com/v20.0/{media_id}",
-            headers={"Authorization": f"Bearer {META_TOKEN}"},
-            timeout=WPP_TIMEOUT
-        )
+        meta = requests.get(f"https://graph.facebook.com/v20.0/{media_id}", headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=WPP_TIMEOUT)
         if meta.status_code != 200:
-            log.warning(f"⚠️ Meta media meta fallo {meta.status_code}: {meta.text[:200]}")
             return None, None, None
         meta_j = meta.json()
         url = meta_j.get("url")
@@ -1094,9 +1023,7 @@ def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Opti
             return None, None, None
         binr = requests.get(url, headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=WPP_TIMEOUT)
         if binr.status_code != 200:
-            log.warning(f"⚠️ Meta media download fallo {binr.status_code}")
             return None, None, None
-        log.info(f"✅ Media descargada: {fname} ({len(binr.content)} bytes)")
         return binr.content, mime, fname
     except Exception:
         log.exception("❌ Error descargando media")
@@ -1113,30 +1040,19 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
             media_id = msg["audio"].get("id")
         elif msg.get("type") == "video" and "video" in msg:
             media_id = msg["video"].get("id")
-
         if not media_id:
             send_message(phone, "Recibí tu archivo, gracias. (No se pudo identificar el contenido).")
             return
-
-        # 🔁 Reenviar inmediatamente la multimedia al asesor
         forward_media_to_advisor(msg.get("type"), media_id)
-
         file_bytes, mime, fname = _download_media(media_id)
         if not file_bytes:
             send_message(phone, "Recibí tu archivo, pero hubo un problema procesándolo.")
             return
-
         last4 = _normalize_phone_last10(phone)[-4:]
         match = match_client_in_sheets(_normalize_phone_last10(phone))
-        if match and match.get("nombre"):
-            folder_name = f"{match['nombre'].replace(' ', '_')}_{last4}"
-        else:
-            folder_name = f"Cliente_{last4}"
-
+        folder_name = f"{match['nombre'].replace(' ', '_')}_{last4}" if match and match.get("nombre") else f"Cliente_{last4}"
         link = upload_to_drive(fname, file_bytes, mime or "application/octet-stream", folder_name)
-        link_text = link or "(sin link Drive)"
-
-        _notify_advisor(f"🔔 Multimedia recibida\nDesde: {phone}\nArchivo: {fname}\nDrive: {link_text}")
+        _notify_advisor(f"🔔 Multimedia recibida\nDesde: {phone}\nArchivo: {fname}\nDrive: {link or '(sin link Drive)'}")
         send_message(phone, "✅ *Recibido y en proceso*. En breve te doy seguimiento.")
     except Exception:
         log.exception("❌ Error manejando multimedia")
@@ -1149,156 +1065,176 @@ def webhook_receive():
         payload = request.get_json(force=True, silent=True) or {}
         log.info(f"📥 Webhook recibido: {json.dumps(payload, indent=2)[:500]}...")
         
-        entry = payload.get("entry", [{}])[0]
-        changes = entry.get("changes", [{}])[0]
-        value = changes.get("value", {})
-        messages = value.get("messages", [])
-        if not messages:
+        # Iterar todos los entries y changes del payload
+        all_messages = []
+        all_statuses = []
+        for entry in payload.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                all_messages.extend(value.get("messages", []))
+                all_statuses.extend(value.get("statuses", []))
+
+        if not all_messages:
+            for st in all_statuses:
+                try:
+                    if (st.get("status") or "").lower() == "failed":
+                        log.warning("❌ STATUS failed (detalle): %s", json.dumps(st, ensure_ascii=False))
+                except Exception:
+                    pass
             log.info("ℹ️ Webhook sin mensajes (posible status update)")
             return jsonify({"ok": True}), 200
 
-        msg = messages[0]
+        if len(all_messages) > 1:
+            log.info(f"ℹ️ Payload con {len(all_messages)} mensajes — procesando el primero (comportamiento estándar Meta)")
+
+        msg = all_messages[0]
         phone = msg.get("from")
-        
         if not phone:
             log.warning("⚠️ Mensaje sin número de teléfono")
             return jsonify({"ok": True}), 200
 
         log.info(f"📱 Mensaje de {phone}: {msg.get('type', 'unknown')}")
-
-        # Obtener match SIEMPRE (necesario para contexto de campaña)
         last10 = _normalize_phone_last10(phone)
         match = match_client_in_sheets(last10)
-        
-        # Estado actual del usuario
         st_now = user_state.get(phone, "")
         idle = st_now in ("", "__greeted__")
         
-        # Manejo de mensajes de texto
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
-            
-            # =========================================================
-            # 🔔 INTERCEPTOR POST-CAMPAÑA (AUTO) - PRIORIDAD ALTA
-            # =========================================================
+
+            # Registrar respuesta entrante en Sheets
+            try:
+                now_iso = datetime.utcnow().isoformat()
+                nombre_sheet = (match.get("nombre", "").strip() if match else "")
+                append_respuesta_cliente(phone, nombre_sheet, text, now_iso)
+            except Exception:
+                pass
+
+            # --- Decision Layer (Boardroom Engine) ---
+            try:
+                decision = call_decision_layer(
+                    telefono=phone,
+                    mensaje=text,
+                    nombre=nombre_sheet,
+                )
+                if isinstance(decision, dict):
+                    route_to = decision.get("route_to", "")
+                    existing_client = str(decision.get("existing_client", ""))
+                    interest = decision.get("interest", "")
+                    active_campaign = decision.get("active_campaign", "")
+                    hint = decision.get("vicky_context_hint", "")
+                    udata = user_data.setdefault(phone, {})
+                    # Actualizar hint y bonus — limpiar si no vienen activos
+                    udata["vicky_hint"] = hint if hint else ""
+                    udata["campaign_bonus_eligible"] = bool(decision.get("campaign_bonus_eligible"))
+                    if route_to == "VICKY_CAMPANAS" and existing_client != "true":
+                        _notify_advisor(
+                            "🧠 BOARDROOM — Lead enrutable a VICKY_CAMPANAS\n"
+                            f"Teléfono: {phone}\n"
+                            f"Interés: {interest or '-'}\n"
+                            f"Campaña activa: {active_campaign or '-'}\n"
+                            f"Hint: {hint or '-'}"
+                        )
+                        udata["boardroom_notified"] = True
+            except Exception as e:
+                logging.exception("[decision-layer] integración no bloqueante: %s", e)
+            # --- Fin Decision Layer ---
+
+            # Interceptor ultra-prioritario: respuesta "info" a plantilla
+            t_norm_info = (text or "").strip().lower()
+            if t_norm_info in ("info", "informacion", "información", "mas info", "más info"):
+                last_tpl = ""
+                st = user_state.get(phone, "")
+                if st.startswith("awaiting_info:"):
+                    last_tpl = st.split(":", 1)[1].strip()
+                if not last_tpl:
+                    last_tpl = get_last_envio_template(last10)
+                if last_tpl in ("tpv_3", "promo_tpv", TPV_TEMPLATE_NAME):
+                    user_state[phone] = "tpv_giro"
+                    try:
+                        _notify_advisor(
+                            "🧾 Respuesta a plantilla (TPV)\n"
+                            f"Template: {last_tpl}\n"
+                            f"WhatsApp: {phone}\n"
+                            f"Nombre: {(match.get('nombre', '') if match else '') or '(sin nombre)'}\n"
+                            f"Mensaje: {text}"
+                        )
+                    except Exception:
+                        pass
+                    send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+                    return jsonify({"ok": True}), 200
+
+            # Interceptores post-campaña
             if idle and match:
-                # 0. ESCAPE DE FLUJO: si el cliente expresa intención clara de OTRO producto,
-                #    NO dejamos que el contexto AUTO secuestre el mensaje.
                 if _auto_is_context(match) and _explicit_non_auto_intent(text):
                     log.info(f"🔀 Escape de flujo AUTO por intención explícita: {text}")
                 else:
-                    # 0.5. CONTEXTO ALIANZA (Despachos contables)
                     if _alianza_is_context(match):
                         if _handle_alianza_context_response(phone, text, match):
                             intent_handled = True
                     if intent_handled:
                         return jsonify({"ok": True}), 200
-
-                    # 1. CONTEXTO AUTO (Seguro de Auto)
                     if _auto_is_context(match):
                         if _handle_auto_context_response(phone, text, match):
                             intent_handled = True
                     if intent_handled:
                         return jsonify({"ok": True}), 200
-                
-                # 2. CONTEXTO TPV
                 if _tpv_is_context(match):
                     if tpv_start_from_reply(phone, text, match):
                         intent_handled = True
                 if intent_handled:
                     return jsonify({"ok": True}), 200
 
-            
-            # =========================================================
-            # ✅ HUMAN FIRST RESPONSE + SHORT-CIRCUIT DE INTENCIÓN (TPV)
-            # =========================================================
             if idle:
                 t_norm = (text or "").strip().lower()
-
-                # Saludo humano (sin menú)
-                GREET_WORDS = {
-                    "hola", "buenas", "buenos dias", "buenos días", "buen dia", "buen día",
-                    "buenas tardes", "buenas noches", "hey", "que tal", "qué tal", "holi"
-                }
+                GREET_WORDS = {"hola", "buenas", "buenos dias", "buenos días", "buen dia", "buen día", "buenas tardes", "buenas noches", "hey", "que tal", "qué tal", "holi"}
                 if t_norm in GREET_WORDS:
-                    base = "Dime qué necesitas y con gusto te guío para ayudarte a encontrar el servicio que necesitas."
-                    nombre = (match.get("nombre", "").strip() if match else "")
-                    saludo = f"Hola {nombre} 👋 {base}" if nombre else f"Hola 👋 {base}"
-                    send_message(phone, saludo)
                     user_state[phone] = "__greeted__"
+                    _greet_and_match(phone)
                     return jsonify({"ok": True}), 200
-
-                # Detección directa de TPV/Terminal (entra al embudo sin preguntar de más)
-                TPV_KEYWORDS = (
-                    "tpv", "terminal", "terminales", "punto de venta", "punto-de-venta",
-                    "cobrar con tarjeta", "cobro con tarjeta", "pagar con tarjeta",
-                    "ligas de pago", "link de pago", "link pago", "cobro a distancia"
-                )
+                TPV_KEYWORDS = ("tpv", "terminal", "terminales", "punto de venta", "punto-de-venta", "cobrar con tarjeta", "cobro con tarjeta", "pagar con tarjeta", "ligas de pago", "link de pago", "link pago", "cobro a distancia")
                 if any(k in t_norm for k in TPV_KEYWORDS):
                     user_state[phone] = "tpv_giro"
                     nombre = (match.get("nombre", "").strip() if match else "")
-                    _notify_advisor(
-                        "🧠 Interés detectado (TPV)\n"
-                        f"WhatsApp: {phone}\n"
-                        f"Nombre: {nombre or '(sin nombre)'}\n"
-                        f"Mensaje: {text}"
-                    )
+                    _notify_advisor(f"🧠 Interés detectado (TPV)\nWhatsApp: {phone}\nNombre: {nombre or '(sin nombre)'}\nMensaje: {text}")
                     send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
                     return jsonify({"ok": True}), 200
-            # =========================================================
 
-# ✅ Respuesta negativa: agradecer + menú
             if idle and interpret_response(text) == "negative":
-                send_message(
-                    phone,
-                    "Gracias por tu respuesta. Quedo a tus órdenes para cualquier duda o si más adelante deseas revisarlo."
-                )
+                send_message(phone, "Gracias por tu respuesta. Quedo a tus órdenes para cualquier duda o si más adelante deseas revisarlo.")
                 user_state[phone] = "__greeted__"
                 send_main_menu(phone)
                 return jsonify({"ok": True}), 200
 
-            # =========================================================
-            # 🔔 DETECCIÓN DE INTERÉS / DUDA POST-PLANTILLA (GLOBAL)
-            # =========================================================
             t_lower = text.lower().strip()
-            VALID_COMMANDS = {
-                "1","2","3","4","5","6","7",
-                "menu","menú","inicio","hola",
-                "imss","ley 73","prestamo","préstamo","pension","pensión",
-                "auto","seguro auto","seguros de auto",
-                "vida","salud","seguro de vida","seguro de salud",
-                "vrim","tarjeta medica","tarjeta médica",
-                "empresarial","pyme","credito","crédito","credito empresarial","crédito empresarial",
-                "financiamiento","financiamiento practico","financiamiento práctico",
-                "contactar","asesor","contactar con christian"
-            }
+            VALID_COMMANDS = {"1","2","3","4","5","6","7","menu","menú","inicio","hola","imss","ley 73","prestamo","préstamo","pension","pensión","auto","seguro auto","seguros de auto","vida","salud","seguro de vida","seguro de salud","vrim","tarjeta medica","tarjeta médica","empresarial","pyme","credito","crédito","credito empresarial","crédito empresarial","financiamiento","financiamiento practico","financiamiento práctico","contactar","asesor","contactar con christian"}
+            if not t_lower.isdigit() and t_lower not in VALID_COMMANDS and idle:
+                if not user_data.get(phone, {}).get("boardroom_notified", False):
+                    _notify_advisor(f"📩 Cliente INTERESADO / DUDA detectada\nWhatsApp: {phone}\nMensaje: {text}")
+                # No resetear boardroom_notified aquí — se limpia en el siguiente ciclo de Boardroom
 
-            if (
-                not t_lower.isdigit()
-                and t_lower not in VALID_COMMANDS
-                and idle
-            ):
-                aviso = (
-                    "📩 Cliente INTERESADO / DUDA detectada\n"
-                    f"WhatsApp: {phone}\n"
-                    f"Mensaje: {text}"
-                )
-                _notify_advisor(aviso)
-            # =========================================================
-
-            # Inicialización del estado si es nuevo usuario
             if phone not in user_state:
                 user_state[phone] = "__greeted__"
-                if not match:  # Solo saludar si no tenemos match ya
+                # Solo saludar si el mensaje no contiene intención procesable
+                _t = text.strip().lower()
+                _tiene_intencion = any(k in _t for k in (
+                    "imss", "préstamo", "prestamo", "ley 73", "pensión", "pension",
+                    "auto", "seguro", "póliza", "poliza", "placa",
+                    "vida", "salud", "vrim", "tarjeta medica",
+                    "empresarial", "pyme", "crédito", "credito",
+                    "financiamiento", "tpv", "terminal", "nómina", "nomina",
+                ))
+                if not _tiene_intencion:
                     _greet_and_match(phone)
+                    return jsonify({"ok": True}), 200
+                # Si hay intención: saludar brevemente y continuar al router
+                _greet_and_match(phone)
 
-            # Comando especial GPT
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
                 prompt = text.split("sgpt:", 1)[1].strip()
                 try:
-                    log.info(f"🧠 Procesando solicitud GPT para {phone}")
                     completion = openai.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt}],
@@ -1331,210 +1267,108 @@ def webhook_receive():
 # ==========================
 @app.get("/health")
 def health():
-    return jsonify({
-        "status": "ok", 
-        "service": "Vicky Bot Inbursa",
-        "timestamp": datetime.utcnow().isoformat()
-    }), 200
+    return jsonify({"status": "ok", "service": "Vicky Bot Inbursa", "timestamp": datetime.utcnow().isoformat()}), 200
 
 @app.get("/ext/health")
 def ext_health():
-    return jsonify({
-        "status": "ok",
-        "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID),
-        "google_ready": google_ready,
-        "openai_ready": bool(openai and OPENAI_API_KEY)
-    }), 200
+    return jsonify({"status": "ok", "whatsapp_configured": bool(META_TOKEN and WABA_PHONE_ID), "google_ready": google_ready, "openai_ready": bool(openai and OPENAI_API_KEY)}), 200
 
 @app.post("/ext/test-send")
 def ext_test_send():
-    """Endpoint para pruebas de envío individual"""
     try:
         data = request.get_json(force=True) or {}
         to = str(data.get("to", "")).strip()
         text = str(data.get("text", "")).strip()
-        
         if not to or not text:
-            return jsonify({
-                "ok": False, 
-                "error": "Faltan parámetros 'to' o 'text'"
-            }), 400
-            
-        log.info(f"🧪 Test send a {to}: {text}")
+            return jsonify({"ok": False, "error": "Faltan parámetros 'to' o 'text'"}), 400
         ok = send_message(to, text)
         return jsonify({"ok": bool(ok)}), 200
     except Exception as e:
         log.exception("❌ Error en /ext/test-send")
-        return jsonify({
-            "ok": False, 
-            "error": str(e)
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
-    """Worker mejorado para envíos masivos con logging exhaustivo"""
     successful = 0
     failed = 0
-    
     log.info(f"🚀 Iniciando envío masivo de {len(items)} mensajes")
-    
     for i, item in enumerate(items, 1):
         try:
             to = item.get("to", "").strip()
             text = item.get("text", "").strip()
             template = item.get("template", "").strip()
             params = item.get("params", [])
-            
             if not to:
-                log.warning(f"⏭️ Item {i} sin destinatario, omitiendo")
                 failed += 1
                 continue
-                
-            log.info(f"📤 [{i}/{len(items)}] Procesando: {to}")
-            
             success = False
             if template:
                 success = send_template_message(to, template, params)
-                log.info(f"   ↳ Plantilla '{template}' a {to}: {'✅' if success else '❌'}")
             elif text:
                 success = send_message(to, text)
-                log.info(f"   ↳ Mensaje a {to}: {'✅' if success else '❌'}")
             else:
-                log.warning(f"   ↳ Item {i} sin contenido válido")
                 failed += 1
                 continue
-            
             if success:
                 successful += 1
             else:
                 failed += 1
-                
             time.sleep(0.5)
-            
-        except Exception as e:
+        except Exception:
             failed += 1
-            log.exception(f"❌ Error procesando item {i} para {item.get('to', 'unknown')}")
-    
+            log.exception(f"❌ Error procesando item {i}")
     log.info(f"🎯 Envío masivo completado: {successful} ✅, {failed} ❌")
-    
     if ADVISOR_NUMBER:
-        summary_msg = f"📊 Resumen envío masivo:\n• Exitosos: {successful}\n• Fallidos: {failed}\n• Total: {len(items)}"
-        send_message(ADVISOR_NUMBER, summary_msg)
+        send_message(ADVISOR_NUMBER, f"📊 Resumen envío masivo:\n• Exitosos: {successful}\n• Fallidos: {failed}\n• Total: {len(items)}")
 
 @app.post("/ext/send-promo")
 def ext_send_promo():
-    """Endpoint CORREGIDO para envíos masivos tipo WAPI"""
     try:
         if not META_TOKEN or not WABA_PHONE_ID:
-            log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados")
-            return jsonify({
-                "queued": False, 
-                "error": "WhatsApp Business API no configurada"
-            }), 500
-
+            return jsonify({"queued": False, "error": "WhatsApp Business API no configurada"}), 500
         body = request.get_json(force=True) or {}
         items = body.get("items", [])
-        
-        log.info(f"📨 Recibida solicitud send-promo con {len(items)} items")
-        
-        if not isinstance(items, list):
-            log.warning("❌ Formato inválido: items no es una lista")
-            return jsonify({
-                "queued": False, 
-                "error": "Formato inválido: 'items' debe ser una lista"
-            }), 400
-            
-        if not items:
-            log.warning("❌ Lista de items vacía")
-            return jsonify({
-                "queued": False, 
-                "error": "Lista 'items' vacía"
-            }), 400
-
-        valid_items = []
-        for i, item in enumerate(items):
-            if not isinstance(item, dict):
-                log.warning(f"⏭️ Item {i} no es un diccionario, omitiendo")
-                continue
-                
-            to = item.get("to", "").strip()
-            text = item.get("text", "").strip()
-            template = item.get("template", "").strip()
-            
-            if not to:
-                log.warning(f"⏭️ Item {i} sin destinatario, omitiendo")
-                continue
-                
-            if not text and not template:
-                log.warning(f"⏭️ Item {i} sin contenido (text o template), omitiendo")
-                continue
-                
-            valid_items.append(item)
-
+        if not isinstance(items, list) or not items:
+            return jsonify({"queued": False, "error": "Lista 'items' inválida o vacía"}), 400
+        valid_items = [i for i in items if isinstance(i, dict) and i.get("to", "").strip() and (i.get("text", "").strip() or i.get("template", "").strip())]
         if not valid_items:
-            log.warning("❌ No hay items válidos después de la validación")
-            return jsonify({
-                "queued": False, 
-                "error": "No hay items válidos para enviar"
-            }), 400
-
-        log.info(f"✅ Validación exitosa: {len(valid_items)} items válidos de {len(items)} recibidos")
-        
-        threading.Thread(
-            target=_bulk_send_worker, 
-            args=(valid_items,), 
-            daemon=True,
-            name="BulkSendWorker"
-        ).start()
-        
-        response = {
-            "queued": True,
-            "message": f"Procesando {len(valid_items)} mensajes en background",
-            "total_received": len(items),
-            "valid_items": len(valid_items),
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
-        log.info(f"✅ Envío masivo encolado: {response}")
-        return jsonify(response), 202
-        
+            return jsonify({"queued": False, "error": "No hay items válidos para enviar"}), 400
+        threading.Thread(target=_bulk_send_worker, args=(valid_items,), daemon=True, name="BulkSendWorker").start()
+        return jsonify({"queued": True, "message": f"Procesando {len(valid_items)} mensajes en background", "total_received": len(items), "valid_items": len(valid_items), "timestamp": datetime.utcnow().isoformat()}), 202
     except Exception as e:
         log.exception("❌ Error crítico en /ext/send-promo")
-        return jsonify({
-            "queued": False, 
-            "error": f"Error interno: {str(e)}"
-        }), 500
+        return jsonify({"queued": False, "error": f"Error interno: {str(e)}"}), 500
+
+@app.get("/ext/ping-advisor")
+def ext_ping_advisor():
+    try:
+        token = (request.args.get("token") or "").strip()
+        if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        if not ADVISOR_NUMBER:
+            return jsonify({"ok": False, "error": "ADVISOR_NUMBER no configurado"}), 500
+        ok = send_message(ADVISOR_NUMBER, "🤖 Vicky SECOM activa. Este mensaje mantiene la ventana de notificaciones abierta.")
+        return jsonify({"ok": bool(ok), "to": ADVISOR_NUMBER}), 200
+    except Exception as e:
+        log.exception("❌ Error en /ext/ping-advisor")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ==========================
-# Arranque (para desarrollo local)
-# En producción usar Gunicorn: `gunicorn app:app --bind 0.0.0.0:$PORT`
-# ==========================
-if __name__ == "__main__":
-    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
-    log.info(f"📞 WhatsApp configurado: {bool(META_TOKEN and WABA_PHONE_ID)}")
-    log.info(f"📊 Google Sheets/Drive: {google_ready}")
-    log.info(f"🧠 OpenAI: {bool(openai and OPENAI_API_KEY)}")
-    
-    app.run(host="0.0.0.0", port=PORT, debug=False)
-# ==========================
-# AUTO SEND (1 prospecto por corrida) — Render Cron Job
+# AUTO SEND
 # ==========================
 AUTO_SEND_TOKEN = os.getenv("AUTO_SEND_TOKEN", "").strip()
 
 def _sheet_get_rows() -> Tuple[List[str], List[List[str]]]:
-    """Obtiene headers + rows del Sheet principal."""
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
-        raise RuntimeError("Sheets no disponible (google_ready/SHEETS_ID_LEADS/SHEETS_TITLE_LEADS).")
+        raise RuntimeError("Sheets no disponible.")
     rng = f"{SHEETS_TITLE_LEADS}!A:Z"
     values = sheets_svc.spreadsheets().values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
     rows = values.get("values", [])
     if not rows:
         return [], []
     headers = [h.strip() for h in rows[0]]
-    data_rows = rows[1:]
-    return headers, data_rows
+    return headers, rows[1:]
 
 def _idx(headers: List[str], name: str) -> Optional[int]:
-    """Encuentra índice por header exacto (case-insensitive)."""
     n = name.strip().lower()
     for i, h in enumerate(headers):
         if (h or "").strip().lower() == n:
@@ -1549,25 +1383,15 @@ def _cell(row: List[str], i: Optional[int]) -> str:
 def _normalize_to_e164_mx(phone_raw: str) -> str:
     digits = re.sub(r"\D", "", phone_raw or "")
     last10 = _normalize_phone_last10(digits)
-
-    # WhatsApp Cloud API (MX):
-    # - móviles normalmente requieren "521" + 10 dígitos
-    # - algunos datos vienen como "52" + 10 dígitos; se corrige a "521"
     if len(last10) == 10:
         return f"521{last10}"
-
-    # Si ya viene con 52 + 10 dígitos, insertar el "1"
     if digits.startswith("52") and len(digits) == 12:
         return f"521{digits[2:]}"
-
-    # Si ya viene correcto (521 + 10 dígitos)
     if digits.startswith("521") and len(digits) == 13:
         return digits
-
     return digits
 
 def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: List[str]) -> None:
-    """Actualiza celdas por header (ej. ESTATUS, LAST_MESSAGE_AT). row_number_1based incluye header como fila 1."""
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         raise RuntimeError("Sheets no disponible para update.")
     data = []
@@ -1575,7 +1399,6 @@ def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: 
         j = _idx(headers, col_name)
         if j is None:
             raise RuntimeError(f"No existe columna '{col_name}' en el Sheet.")
-        # Columna A=1 => letra:
         col_letter = chr(ord("A") + j)
         a1 = f"{SHEETS_TITLE_LEADS}!{col_letter}{row_number_1based}"
         data.append({"range": a1, "values": [[value]]})
@@ -1583,96 +1406,60 @@ def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: 
     sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
 
 def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Dict[str, Any]]:
-    """
-    Selecciona 1 prospecto pendiente:
-    - WhatsApp no vacío
-    - ESTATUS vacío o 'PENDIENTE'
-    - Reintenta automáticamente si ESTATUS = 'FALLO_ENVIO'
-      (aunque LAST_MESSAGE_AT tenga valor)
-    - Para cualquier otro ESTATUS != 'FALLO_ENVIO', requiere LAST_MESSAGE_AT vacío
-    """
     i_name = _idx(headers, "Nombre")
     i_wa = _idx(headers, "WhatsApp")
     i_status = _idx(headers, "ESTATUS")
     i_last = _idx(headers, "LAST_MESSAGE_AT")
-
     if i_name is None or i_wa is None:
         raise RuntimeError("Faltan columnas requeridas: 'Nombre' y/o 'WhatsApp'.")
-
-    for k, row in enumerate(rows, start=2):  # fila 2 = primer registro (fila 1 es header)
+    for k, row in enumerate(rows, start=2):
         nombre = _cell(row, i_name).strip()
         wa = _cell(row, i_wa).strip()
         estatus = _cell(row, i_status).strip().upper() if i_status is not None else ""
         last_at = _cell(row, i_last).strip() if i_last is not None else ""
-
         if not wa:
             continue
-        # Regla de reintento (Opción 2):
-        # - Si ya hay LAST_MESSAGE_AT, normalmente se salta
-        # - PERO si ESTATUS=FALLO_ENVIO, se permite reintento aunque haya timestamp
         if last_at and estatus != "FALLO_ENVIO":
             continue
-        # Permitimos:
-        # - vacío
-        # - PENDIENTE
-        # - FALLO_ENVIO (reintento)
         if estatus and estatus not in ("PENDIENTE", "FALLO_ENVIO"):
-            # si ya trae ENVIADO_INICIAL u otro, lo saltamos
             continue
-
         return {"row_number": k, "nombre": nombre, "whatsapp": wa}
-
     return None
 
 @app.post("/ext/auto-send-one")
 def ext_auto_send_one():
-    """
-    Endpoint para cron: envía 1 plantilla al siguiente prospecto pendiente.
-    Protegido por header: X-AUTO-TOKEN = AUTO_SEND_TOKEN
-    """
     try:
         token = (request.headers.get("X-AUTO-TOKEN") or "").strip()
         if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
             return jsonify({"ok": False, "error": "unauthorized"}), 401
-
         body = request.get_json(force=True, silent=True) or {}
         template_name = str(body.get("template", "")).strip()
         if not template_name:
             return jsonify({"ok": False, "error": "Falta 'template'"}), 400
-
         headers, rows = _sheet_get_rows()
         if not headers:
             return jsonify({"ok": False, "error": "Sheet vacío"}), 400
-
         nxt = _pick_next_pending(headers, rows)
         if not nxt:
             return jsonify({"ok": True, "sent": False, "reason": "no_pending"}), 200
-
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
-
-        ok = send_template_message(to, template_name, {"nombre": nombre})
-
+        ok = send_template_message(to, template_name, ({} if template_name == "vrim_ideal" else {"nombre": nombre}))
+        if ok:
+            user_state[to] = f"awaiting_info:{template_name}"
+        else:
+            try:
+                append_envio_status(to, "", "failed", template_name, datetime.utcnow().isoformat())
+            except Exception:
+                pass
         now_iso = datetime.utcnow().isoformat()
-        estatus_val = "FALLO_ENVIO" if not ok else (
-            "ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else
-            ("ENVIADO_ALIANZA" if template_name in ALLIANCE_TEMPLATES else "ENVIADO_INICIAL")
-        )
-        updates = {
-            "ESTATUS": estatus_val,
-            "LAST_MESSAGE_AT": now_iso
-        }
-        _update_row_cells(nxt["row_number"], updates, headers)
-
-        return jsonify({
-            "ok": True,
-            "sent": bool(ok),
-            "to": to,
-            "row": nxt["row_number"],
-            "nombre": nombre,
-            "timestamp": now_iso
-        }), 200
-
+        estatus_val = "FALLO_ENVIO" if not ok else ("ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else ("ENVIADO_ALIANZA" if template_name in ALLIANCE_TEMPLATES else "ENVIADO_INICIAL"))
+        _update_row_cells(nxt["row_number"], {"ESTATUS": estatus_val, "LAST_MESSAGE_AT": now_iso}, headers)
+        return jsonify({"ok": True, "sent": bool(ok), "to": to, "row": nxt["row_number"], "nombre": nombre, "timestamp": now_iso}), 200
     except Exception as e:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+if __name__ == "__main__":
+    log.info(f"🚀 Iniciando Vicky Bot SECOM en puerto {PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
