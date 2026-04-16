@@ -716,6 +716,7 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
 
     if t in ("menu", "menú", "inicio"):
         user_state[phone] = "__greeted__"
+        _ensure_user(phone)["force_router_once"] = True
         send_main_menu(phone)
         return True
 
@@ -936,6 +937,130 @@ def _greet_and_match(phone: str) -> Optional[Dict[str, Any]]:
     send_message(phone, saludo)
     return match
 
+
+def _consume_force_router_once(phone: str) -> bool:
+    data = _ensure_user(phone)
+    return bool(data.pop("force_router_once", False))
+
+
+def _set_force_router_once(phone: str) -> None:
+    _ensure_user(phone)["force_router_once"] = True
+
+
+def _contains_any(text: str, patterns: Tuple[str, ...]) -> bool:
+    return any(p in text for p in patterns)
+
+
+def _gpt_classify_route(text: str) -> Optional[str]:
+    if not (openai and OPENAI_API_KEY):
+        return None
+    try:
+        completion = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Clasifica el mensaje de WhatsApp en una sola etiqueta exacta: "
+                        "GREETING, MENU, IMSS, AUTO, VIDA, VRIM, EMPRESARIAL, FP, CHRISTIAN, NONE. "
+                        "No expliques nada. Devuelve solo la etiqueta."
+                    ),
+                },
+                {"role": "user", "content": text[:500]},
+            ],
+        )
+        tag = (completion.choices[0].message.content or "").strip().upper()
+        allowed = {"GREETING", "MENU", "IMSS", "AUTO", "VIDA", "VRIM", "EMPRESARIAL", "FP", "CHRISTIAN", "NONE"}
+        return tag if tag in allowed else None
+    except Exception:
+        log.exception("❌ Error clasificando intención con GPT")
+        return None
+
+
+def _apply_route_tag(phone: str, tag: str, match: Optional[Dict[str, Any]]) -> bool:
+    if tag == "GREETING":
+        user_state[phone] = "__greeted__"
+        _set_force_router_once(phone)
+        _greet_and_match(phone)
+        return True
+    if tag == "MENU":
+        user_state[phone] = "__greeted__"
+        _set_force_router_once(phone)
+        send_main_menu(phone)
+        return True
+    if tag == "IMSS":
+        imss_start(phone, match)
+        return True
+    if tag == "AUTO":
+        auto_start(phone, match)
+        return True
+    if tag == "VIDA":
+        send_message(phone, "🧬 *Seguros de Vida/Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.")
+        _notify_advisor(f"🔔 Vida/Salud — Solicitud de contacto\nWhatsApp: {phone}")
+        send_main_menu(phone)
+        return True
+    if tag == "VRIM":
+        send_message(phone, "🩺 *VRIM* — Membresía médica. Notificaré al asesor para darte detalles.")
+        _notify_advisor(f"🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}")
+        send_main_menu(phone)
+        return True
+    if tag == "EMPRESARIAL":
+        emp_start(phone, match)
+        return True
+    if tag == "FP":
+        fp_start(phone, match)
+        return True
+    if tag == "CHRISTIAN":
+        _notify_advisor(f"🔔 Contacto directo — Cliente solicita hablar\nWhatsApp: {phone}")
+        send_message(phone, "✅ Listo. Avisé a Christian para que te contacte.")
+        _set_force_router_once(phone)
+        send_main_menu(phone)
+        return True
+    return False
+
+
+def _handle_priority_command(phone: str, text: str, match: Optional[Dict[str, Any]], *, allow_route_selection: bool) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    greet_words = {
+        "hola", "buenas", "buenos dias", "buenos días", "buen dia", "buen día",
+        "buenas tardes", "buenas noches", "hey", "que tal", "qué tal", "holi"
+    }
+    if t in greet_words:
+        return _apply_route_tag(phone, "GREETING", match)
+
+    if t in {"menu", "menú", "inicio"}:
+        return _apply_route_tag(phone, "MENU", match)
+
+    christian_phrases = ("hablar con christian", "contactar con christian", "quiero hablar con christian", "asesor christian")
+    if t == "7" or t in {"contactar", "asesor"} or _contains_any(t, christian_phrases):
+        return _apply_route_tag(phone, "CHRISTIAN", match)
+
+    if not allow_route_selection:
+        return False
+
+    if t == "1" or _contains_any(t, ("imss", "ley 73", "pensionado", "jubilado", "modalidad 40", "préstamo imss", "prestamo imss", "credito imss", "crédito imss")):
+        return _apply_route_tag(phone, "IMSS", match)
+    if t == "2" or _contains_any(t, ("seguro de auto", "seguro auto", "seguros de auto", "cotizar auto", "póliza auto", "poliza auto", "auto")):
+        return _apply_route_tag(phone, "AUTO", match)
+    if t == "3" or _contains_any(t, ("seguro de vida", "seguro de salud", "vida", "salud", "gastos médicos", "gastos medicos")):
+        return _apply_route_tag(phone, "VIDA", match)
+    if t == "4" or _contains_any(t, ("vrim", "tarjeta medica", "tarjeta médica")):
+        return _apply_route_tag(phone, "VRIM", match)
+    if t == "5" or _contains_any(t, ("empresarial", "pyme", "crédito empresarial", "credito empresarial")):
+        return _apply_route_tag(phone, "EMPRESARIAL", match)
+    if t == "6" or _contains_any(t, ("financiamiento práctico", "financiamiento practico", "crédito simple", "credito simple")):
+        return _apply_route_tag(phone, "FP", match)
+
+    tag = _gpt_classify_route(text)
+    if tag and tag != "NONE":
+        return _apply_route_tag(phone, tag, match)
+
+    return False
+
 def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
     t = text.strip().lower()
     st = user_state.get(phone, "")
@@ -1061,11 +1186,9 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
 @app.post("/webhook")
 def webhook_receive():
     try:
-        intent_handled = False
         payload = request.get_json(force=True, silent=True) or {}
         log.info(f"📥 Webhook recibido: {json.dumps(payload, indent=2)[:500]}...")
-        
-        # Iterar todos los entries y changes del payload
+
         all_messages = []
         all_statuses = []
         for entry in payload.get("entry", []):
@@ -1098,21 +1221,20 @@ def webhook_receive():
         match = match_client_in_sheets(last10)
         st_now = user_state.get(phone, "")
         idle = st_now in ("", "__greeted__")
-        
+        force_router_once = _consume_force_router_once(phone)
+
         mtype = msg.get("type")
         if mtype == "text" and "text" in msg:
             text = msg["text"].get("body", "").strip()
             log.info(f"💬 Texto recibido de {phone}: {text}")
 
-            # Registrar respuesta entrante en Sheets
+            nombre_sheet = (match.get("nombre", "").strip() if match else "")
             try:
                 now_iso = datetime.utcnow().isoformat()
-                nombre_sheet = (match.get("nombre", "").strip() if match else "")
                 append_respuesta_cliente(phone, nombre_sheet, text, now_iso)
             except Exception:
                 pass
 
-            # --- Decision Layer (Boardroom Engine) ---
             try:
                 decision = call_decision_layer(
                     telefono=phone,
@@ -1126,7 +1248,6 @@ def webhook_receive():
                     active_campaign = decision.get("active_campaign", "")
                     hint = decision.get("vicky_context_hint", "")
                     udata = user_data.setdefault(phone, {})
-                    # Actualizar hint y bonus — limpiar si no vienen activos
                     udata["vicky_hint"] = hint if hint else ""
                     udata["campaign_bonus_eligible"] = bool(decision.get("campaign_bonus_eligible"))
                     if route_to == "VICKY_CAMPANAS" and existing_client != "true":
@@ -1140,9 +1261,11 @@ def webhook_receive():
                         udata["boardroom_notified"] = True
             except Exception as e:
                 logging.exception("[decision-layer] integración no bloqueante: %s", e)
-            # --- Fin Decision Layer ---
 
-            # Interceptor ultra-prioritario: respuesta "info" a plantilla
+            allow_route_selection = idle or force_router_once
+            if _handle_priority_command(phone, text, match, allow_route_selection=allow_route_selection):
+                return jsonify({"ok": True}), 200
+
             t_norm_info = (text or "").strip().lower()
             if t_norm_info in ("info", "informacion", "información", "mas info", "más info"):
                 last_tpl = ""
@@ -1166,70 +1289,46 @@ def webhook_receive():
                     send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
                     return jsonify({"ok": True}), 200
 
-            # Interceptores post-campaña
-            if idle and match:
+            if idle and match and not force_router_once:
                 if _auto_is_context(match) and _explicit_non_auto_intent(text):
                     log.info(f"🔀 Escape de flujo AUTO por intención explícita: {text}")
                 else:
-                    if _alianza_is_context(match):
-                        if _handle_alianza_context_response(phone, text, match):
-                            intent_handled = True
-                    if intent_handled:
+                    if _alianza_is_context(match) and _handle_alianza_context_response(phone, text, match):
                         return jsonify({"ok": True}), 200
-                    if _auto_is_context(match):
-                        if _handle_auto_context_response(phone, text, match):
-                            intent_handled = True
-                    if intent_handled:
+                    if _auto_is_context(match) and _handle_auto_context_response(phone, text, match):
                         return jsonify({"ok": True}), 200
-                if _tpv_is_context(match):
-                    if tpv_start_from_reply(phone, text, match):
-                        intent_handled = True
-                if intent_handled:
-                    return jsonify({"ok": True}), 200
-
-            if idle:
-                t_norm = (text or "").strip().lower()
-                GREET_WORDS = {"hola", "buenas", "buenos dias", "buenos días", "buen dia", "buen día", "buenas tardes", "buenas noches", "hey", "que tal", "qué tal", "holi"}
-                if t_norm in GREET_WORDS:
-                    user_state[phone] = "__greeted__"
-                    _greet_and_match(phone)
-                    return jsonify({"ok": True}), 200
-                TPV_KEYWORDS = ("tpv", "terminal", "terminales", "punto de venta", "punto-de-venta", "cobrar con tarjeta", "cobro con tarjeta", "pagar con tarjeta", "ligas de pago", "link de pago", "link pago", "cobro a distancia")
-                if any(k in t_norm for k in TPV_KEYWORDS):
-                    user_state[phone] = "tpv_giro"
-                    nombre = (match.get("nombre", "").strip() if match else "")
-                    _notify_advisor(f"🧠 Interés detectado (TPV)\nWhatsApp: {phone}\nNombre: {nombre or '(sin nombre)'}\nMensaje: {text}")
-                    send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+                if _tpv_is_context(match) and tpv_start_from_reply(phone, text, match):
                     return jsonify({"ok": True}), 200
 
             if idle and interpret_response(text) == "negative":
                 send_message(phone, "Gracias por tu respuesta. Quedo a tus órdenes para cualquier duda o si más adelante deseas revisarlo.")
                 user_state[phone] = "__greeted__"
+                _set_force_router_once(phone)
                 send_main_menu(phone)
                 return jsonify({"ok": True}), 200
 
             t_lower = text.lower().strip()
-            VALID_COMMANDS = {"1","2","3","4","5","6","7","menu","menú","inicio","hola","imss","ley 73","prestamo","préstamo","pension","pensión","auto","seguro auto","seguros de auto","vida","salud","seguro de vida","seguro de salud","vrim","tarjeta medica","tarjeta médica","empresarial","pyme","credito","crédito","credito empresarial","crédito empresarial","financiamiento","financiamiento practico","financiamiento práctico","contactar","asesor","contactar con christian"}
-            if not t_lower.isdigit() and t_lower not in VALID_COMMANDS and idle:
+            valid_commands = {
+                "1","2","3","4","5","6","7","menu","menú","inicio","hola","imss","ley 73","prestamo","préstamo","pension","pensión","auto","seguro auto","seguros de auto","vida","salud","seguro de vida","seguro de salud","vrim","tarjeta medica","tarjeta médica","empresarial","pyme","credito","crédito","credito empresarial","crédito empresarial","financiamiento","financiamiento practico","financiamiento práctico","contactar","asesor","contactar con christian"
+            }
+            if not t_lower.isdigit() and t_lower not in valid_commands and idle:
                 if not user_data.get(phone, {}).get("boardroom_notified", False):
                     _notify_advisor(f"📩 Cliente INTERESADO / DUDA detectada\nWhatsApp: {phone}\nMensaje: {text}")
-                # No resetear boardroom_notified aquí — se limpia en el siguiente ciclo de Boardroom
 
             if phone not in user_state:
                 user_state[phone] = "__greeted__"
-                # Solo saludar si el mensaje no contiene intención procesable
                 _t = text.strip().lower()
-                _tiene_intencion = any(k in _t for k in (
+                tiene_intencion = any(k in _t for k in (
                     "imss", "préstamo", "prestamo", "ley 73", "pensión", "pension",
                     "auto", "seguro", "póliza", "poliza", "placa",
                     "vida", "salud", "vrim", "tarjeta medica",
                     "empresarial", "pyme", "crédito", "credito",
                     "financiamiento", "tpv", "terminal", "nómina", "nomina",
                 ))
-                if not _tiene_intencion:
+                if not tiene_intencion:
+                    _set_force_router_once(phone)
                     _greet_and_match(phone)
                     return jsonify({"ok": True}), 200
-                # Si hay intención: saludar brevemente y continuar al router
                 _greet_and_match(phone)
 
             if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
