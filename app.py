@@ -509,7 +509,11 @@ def send_main_menu(phone: str) -> None:
 def _notify_advisor(text: str) -> None:
     try:
         log.info(f"👨‍💼 Notificando al asesor: {text}")
-        send_message(ADVISOR_NUMBER, text)
+        ok = send_message(ADVISOR_NUMBER, text)
+        if ok:
+            log.info(f"✅ Notificación enviada al asesor: {ADVISOR_NUMBER}")
+        else:
+            log.error(f"❌ No se pudo enviar la notificación al asesor: {ADVISOR_NUMBER}")
     except Exception:
         log.exception("❌ Error notificando al asesor")
 
