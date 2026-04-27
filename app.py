@@ -78,7 +78,7 @@ DECISION_TIMEOUT_SECONDS = int(os.getenv("DECISION_TIMEOUT_SECONDS", "5"))
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    datefmt="%Y-%m-d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger("vicky-secom")
 
@@ -124,7 +124,7 @@ user_data: Dict[str, Dict[str, Any]] = {}
 # ==========================
 # Utilidades generales
 # ==========================
-WPP_API_URL = f"https://graph.facebook.com/v20.0/{WABA_PHONE_ID}/messages" if WABA_PHONE_ID else None
+WPP_API_URL = f"https://graph.facebook.com/{os.getenv('META_API_VERSION', 'v24.0')}/{WABA_PHONE_ID}/messages" if WABA_PHONE_ID else None
 WPP_TIMEOUT = 15
 
 def _normalize_phone_last10(phone: str) -> str:
@@ -1137,7 +1137,7 @@ def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Opti
     if not META_TOKEN:
         return None, None, None
     try:
-        meta = requests.get(f"https://graph.facebook.com/v20.0/{media_id}", headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=WPP_TIMEOUT)
+        meta = requests.get(f"https://graph.facebook.com/{os.getenv('META_API_VERSION', 'v24.0')}/{media_id}", headers={"Authorization": f"Bearer {META_TOKEN}"}, timeout=WPP_TIMEOUT)
         if meta.status_code != 200:
             return None, None, None
         meta_j = meta.json()
