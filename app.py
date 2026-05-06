@@ -1384,10 +1384,38 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
     t = text.strip().lower()
     st = user_state.get(phone, "")
 
-    # TPV tiene prioridad si el prospecto viene de la plantilla promo_tpv
+    ESCAPE_COMMANDS = {"menu", "menú", "inicio", "cancelar", "salir"}
+
+    if st.startswith(("vida_", "imss_", "auto_", "tpv_", "emp_", "fp_")) and t in ESCAPE_COMMANDS:
+        user_state[phone] = "__greeted__"
+        send_main_menu(phone)
+        return
+
+    if st.startswith("vida_"):
+        _vida_next(phone, text, match)
+        return
+
+    if st.startswith("imss_"):
+        _imss_next(phone, text)
+        return
+
+    if st.startswith("auto_"):
+        _auto_next(phone, text)
+        return
+
     if st.startswith("tpv_"):
         _tpv_next(phone, text, match)
         return
+
+    if st.startswith("emp_"):
+        _emp_next(phone, text)
+        return
+
+    if st.startswith("fp_"):
+        _fp_next(phone, text)
+        return
+
+    # TPV tiene prioridad si el prospecto viene de la plantilla promo_tpv
     if _tpv_is_context(match):
         if tpv_start_from_reply(phone, text, match):
             return
@@ -1429,19 +1457,7 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
     else:
-        st = user_state.get(phone, "")
-        if st.startswith("imss_"):
-            _imss_next(phone, text)
-        elif st.startswith("emp_"):
-            _emp_next(phone, text)
-        elif st.startswith("fp_"):
-            _fp_next(phone, text)
-        elif st.startswith("vida_"):
-            _vida_next(phone, text, match)
-        elif st.startswith("auto_"):
-            _auto_next(phone, text)
-        else:
-            send_message(phone, "En breve, su asesor Christian López se pondrá en contacto con usted para brindarle asesoría personalizada y resolver todas sus dudas de manera directa y segura. Escribe *menú* para ver opciones.")
+        send_message(phone, "En breve, su asesor Christian López se pondrá en contacto con usted para brindarle asesoría personalizada y resolver todas sus dudas de manera directa y segura. Escribe *menú* para ver opciones.")
 
 # ==========================
 # Webhook — verificación
@@ -1587,6 +1603,14 @@ def webhook_receive():
                 pass
 
             _ensure_user(phone)["last_message"] = text
+
+            active_local_state = user_state.get(phone, "").startswith(
+                ("vida_", "imss_", "auto_", "tpv_", "emp_", "fp_")
+            )
+
+            if active_local_state:
+                _route_command(phone, text, match)
+                return jsonify({"ok": True}), 200
 
             if BOARDROOM_ENABLED:
                 boardroom_result = send_to_boardroom(
@@ -1833,13 +1857,15 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
 
             log.info(f"📤 [{i}/{len(items)}] Procesando: {to}")
 
+            if not template and text:
+                log.warning("⚠️ Outbound proactivo sin template rechazado para %s", to)
+                failed += 1
+                continue
+
             success = False
             if template:
                 success = send_template_message(to, template, params)
                 log.info(f"   ↳ Plantilla '{template}' a {to}: {'✅' if success else '❌'}")
-            elif text:
-                success = send_message(to, text)
-                log.info(f"   ↳ Mensaje a {to}: {'✅' if success else '❌'}")
             else:
                 log.warning(f"   ↳ Item {i} sin contenido válido")
                 failed += 1
@@ -1893,6 +1919,7 @@ def ext_send_promo():
             }), 400
 
         valid_items = []
+        rejected_items = []
         for i, item in enumerate(items):
             if not isinstance(item, dict):
                 log.warning(f"⏭️ Item {i} no es un diccionario, omitiendo")
@@ -1910,13 +1937,20 @@ def ext_send_promo():
                 log.warning(f"⏭️ Item {i} sin contenido (text o template), omitiendo")
                 continue
 
+            if text and not template:
+                log.warning("⚠️ Outbound proactivo sin template rechazado para %s", to)
+                rejected_items.append({"index": i, "to": to, "reason": "outbound_requires_template"})
+                continue
+
             valid_items.append(item)
 
         if not valid_items:
             log.warning("❌ No hay items válidos después de la validación")
             return jsonify({
                 "queued": False,
-                "error": "No hay items válidos para enviar"
+                "error": "No hay items válidos para enviar",
+                "failed": len(rejected_items),
+                "rejected": rejected_items,
             }), 400
 
         log.info(f"✅ Validación exitosa: {len(valid_items)} items válidos de {len(items)} recibidos")
@@ -1933,6 +1967,8 @@ def ext_send_promo():
             "message": f"Procesando {len(valid_items)} mensajes en background",
             "total_received": len(items),
             "valid_items": len(valid_items),
+            "failed": len(rejected_items),
+            "rejected": rejected_items,
             "timestamp": datetime.utcnow().isoformat()
         }
 
@@ -2073,7 +2109,10 @@ def ext_auto_send_one():
         body = request.get_json(force=True, silent=True) or {}
         template_name = str(body.get("template", "")).strip()
         if not template_name:
-            return jsonify({"ok": False, "error": "Falta 'template'"}), 400
+            return jsonify({
+                "ok": False,
+                "reason": "template_required_for_business_initiated_message"
+            }), 400
 
         headers, rows = _sheet_get_rows()
         if not headers:
