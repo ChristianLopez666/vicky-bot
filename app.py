@@ -57,6 +57,10 @@ WABA_PHONE_ID = os.getenv("WABA_PHONE_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BOARDROOM_DECISION_URL = os.getenv("BOARDROOM_DECISION_URL", "").strip()
+BOARDROOM_AUTH_TOKEN = os.getenv("BOARDROOM_AUTH_TOKEN", "").strip()
+BOARDROOM_ENABLED = os.getenv("BOARDROOM_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+BOARDROOM_ORCHESTRATE_PATH = "/api/boardroom/orchestrate"
 
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS")
@@ -871,6 +875,320 @@ def _handle_auto_context_response(phone: str, text: str, match: Dict[str, Any]) 
     send_message(phone, "¿Deseas cotizar tu seguro de auto ahora? Responde *Sí* o *No*")
     return True
 
+
+# --- Boardroom (motor comercial principal) + Vida Temporal ---
+VIDA_SHEET_FIELDS = {
+    "ESTATUS",
+    "PRODUCTO",
+    "ULTIMO_CONTACTO",
+    "NOTAS",
+    "BENEFICIO_OFRECIDO",
+    "LAST_MESSAGE",
+}
+
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def _normalize_boardroom_url(url: str) -> str:
+    candidate = (url or "").strip()
+    if not candidate:
+        return ""
+    for dead_path in ("/boardroom/decision/process", "/api/decision/process"):
+        if dead_path in candidate:
+            candidate = candidate.replace(dead_path, BOARDROOM_ORCHESTRATE_PATH)
+    if candidate.endswith("/"):
+        candidate = candidate[:-1]
+    if candidate.startswith("http://") or candidate.startswith("https://"):
+        if "/api/boardroom/orchestrate" in candidate:
+            return candidate
+        if re.match(r"^https?://[^/]+$", candidate):
+            return f"{candidate}{BOARDROOM_ORCHESTRATE_PATH}"
+        return candidate
+    return ""
+
+
+def _infer_product_hint(text: str) -> str:
+    t = (text or "").strip().lower()
+    if t in ("3",) or any(k in t for k in (
+        "vida", "vida temporal", "seguro de vida", "seguros de vida",
+        "protección familiar", "proteccion familiar",
+    )):
+        return "vida_temporal"
+    if any(k in t for k in ("auto", "seguro auto", "placas", "póliza", "poliza")):
+        return "auto"
+    if any(k in t for k in ("tpv", "terminal", "punto de venta")):
+        return "tpv"
+    if any(k in t for k in ("imss", "ley 73", "pensión", "pension")):
+        return "imss"
+    if any(k in t for k in ("empresarial", "pyme")):
+        return "empresarial"
+    return "unknown"
+
+
+def _safe_update_row_cells(row_number_1based: int, updates: Dict[str, str], allowed_fields: Optional[set[str]] = None) -> None:
+    """Wrapper seguro sobre _update_row_cells: filtra campos, avisa columnas faltantes y no rompe conversación."""
+    try:
+        headers, _ = _sheet_get_rows()
+        if not headers:
+            log.warning("⚠️ Sheets sin headers; no se actualizaron campos")
+            return
+        filtered: Dict[str, str] = {}
+        for key, value in (updates or {}).items():
+            if allowed_fields and key not in allowed_fields:
+                log.warning("⚠️ Campo no permitido para update Sheets: %s", key)
+                continue
+            if _idx(headers, key) is None:
+                log.warning("⚠️ Columna '%s' no existe en el Sheet; se omite", key)
+                continue
+            filtered[key] = str(value)
+        if filtered:
+            _update_row_cells(int(row_number_1based), filtered, headers)
+    except Exception:
+        log.exception("⚠️ No fue posible actualizar Sheets; continúa flujo")
+
+
+def _match_name(match: Optional[Dict[str, Any]]) -> str:
+    return ((match or {}).get("nombre") or "").strip()
+
+
+def send_to_boardroom(phone, text, match=None, message_id=None, state=None) -> dict:
+    url = _normalize_boardroom_url(BOARDROOM_DECISION_URL)
+    if not (BOARDROOM_ENABLED and url and BOARDROOM_AUTH_TOKEN):
+        log.info("⚠️ Boardroom unavailable; fallback local")
+        return {"ok": False, "handled": False, "reason": "not_configured"}
+
+    payload = {
+        "source": "vicky_secom",
+        "channel": "whatsapp",
+        "phone": phone or "",
+        "message": text or "",
+        "message_id": message_id or "",
+        "state": state or "",
+        "priority": "commercial",
+        "product_hint": _infer_product_hint(text),
+        "metadata": {
+            "match_found": bool(match),
+            "lead_name": _match_name(match),
+            "sheet_row": str((match or {}).get("row") or ""),
+            "service": "vicky-bot-secom",
+        },
+    }
+    headers = {
+        "X-Boardroom-Token": BOARDROOM_AUTH_TOKEN,
+        "Authorization": f"Bearer {BOARDROOM_AUTH_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=3)
+        log.info("🧠 Boardroom request enviado")
+        if resp.status_code >= 400:
+            log.warning("⚠️ Boardroom unavailable; fallback local")
+            return {"ok": False, "handled": False, "reason": f"http_{resp.status_code}"}
+        try:
+            data = resp.json() if resp.text else {}
+        except Exception:
+            log.warning("⚠️ Boardroom unavailable; fallback local")
+            return {"ok": False, "handled": False, "reason": "invalid_json"}
+        return data if isinstance(data, dict) else {"ok": False, "handled": False, "reason": "invalid_response"}
+    except requests.exceptions.Timeout:
+        log.warning("⚠️ Boardroom unavailable; fallback local")
+        return {"ok": False, "handled": False, "reason": "timeout"}
+    except Exception:
+        log.warning("⚠️ Boardroom unavailable; fallback local")
+        return {"ok": False, "handled": False, "reason": "exception"}
+
+
+def _extract_boardroom_decision(decision: Any) -> Dict[str, Any]:
+    if not isinstance(decision, dict):
+        return {}
+    nested = decision.get("decision")
+    if isinstance(nested, dict):
+        merged = dict(decision)
+        merged.update(nested)
+        return merged
+    return dict(decision)
+
+
+def execute_boardroom_decision(phone, decision, match=None) -> bool:
+    try:
+        data = _extract_boardroom_decision(decision)
+        if not data:
+            return False
+
+        reply_raw = data.get("reply") or data.get("response") or data.get("message")
+        reply = reply_raw.strip() if isinstance(reply_raw, str) else ""
+        action = (data.get("action") or "").strip()
+        product = (data.get("product") or "").strip()
+        advisor_message = data.get("advisor_message")
+        notify_advisor = data.get("notify_advisor")
+        sheet_update = data.get("sheet_update")
+        valid_sheet_update = isinstance(sheet_update, dict) and bool(sheet_update)
+
+        # Efecto secundario seguro: marcar producto Vida Temporal, pero nunca convertir
+        # una decisión vacía en ejecutable solo por traer product=vida_temporal.
+        if product == "vida_temporal" and match and match.get("row"):
+            _safe_update_row_cells(int(match["row"]), {"PRODUCTO": "vida_temporal"}, VIDA_SHEET_FIELDS)
+
+        if reply:
+            if valid_sheet_update and match and match.get("row"):
+                _safe_update_row_cells(int(match["row"]), sheet_update, VIDA_SHEET_FIELDS)
+            send_message(phone, reply)
+            log.info("✅ Boardroom decision handled")
+            return True
+
+        if action == "start_vida_temporal_flow":
+            vida_start(phone, match)
+            log.info("✅ Boardroom decision handled")
+            return True
+
+        if advisor_message:
+            _notify_advisor(str(advisor_message))
+            log.info("✅ Boardroom decision handled")
+            return True
+
+        if notify_advisor:
+            _notify_advisor(
+                "🔔 Boardroom — seguimiento requerido\n"
+                f"WhatsApp: {phone}\n"
+                f"Producto: {product or '(sin producto)'}\n"
+                f"Acción: {action or '(sin acción)'}"
+            )
+            log.info("✅ Boardroom decision handled")
+            return True
+
+        if valid_sheet_update and match and match.get("row"):
+            _safe_update_row_cells(int(match["row"]), sheet_update, VIDA_SHEET_FIELDS)
+            log.info("✅ Boardroom decision handled")
+            return True
+
+        return False
+    except Exception:
+        log.exception("⚠️ Error ejecutando decisión Boardroom; fallback local")
+        return False
+
+
+def vida_start(phone: str, match: Optional[Dict[str, Any]] = None) -> None:
+    user_state[phone] = "vida_edad"
+    data = _ensure_user(phone)
+    data["producto"] = "vida_temporal"
+    log.info("🧬 Vida Temporal flow started")
+    try:
+        if match and match.get("row"):
+            last_message = data.get("last_message", "")
+            _safe_update_row_cells(
+                int(match["row"]),
+                {
+                    "ESTATUS": "interesado",
+                    "PRODUCTO": "vida_temporal",
+                    "ULTIMO_CONTACTO": _utc_now_iso(),
+                    "NOTAS": "interesado en vida temporal desde WhatsApp",
+                    "BENEFICIO_OFRECIDO": "posible descuento hasta 40% sujeto a edad, perfil y condiciones",
+                    "LAST_MESSAGE": last_message,
+                },
+                VIDA_SHEET_FIELDS,
+            )
+    except Exception:
+        log.exception("⚠️ No fue posible actualizar Sheets al iniciar Vida Temporal")
+    send_message(
+        phone,
+        "Perfecto, te ayudo con Seguro de Vida Temporal.\n\n"
+        "Para revisar una opción necesito algunos datos rápidos.\n\n"
+        "¿Cuál es tu edad?",
+    )
+
+
+def _vida_next(phone: str, text: str, match: Optional[Dict[str, Any]] = None) -> None:
+    st = user_state.get(phone, "")
+    data = _ensure_user(phone)
+    data["last_message"] = text or ""
+
+    if st == "vida_edad":
+        edad = extract_number(text)
+        if edad is None or edad < 18 or edad > 75:
+            send_message(phone, "Para revisar Seguro de Vida Temporal necesito una edad entre 18 y 75. ¿Cuál es tu edad?")
+            return
+        data["edad"] = int(edad)
+        user_state[phone] = "vida_fuma"
+        send_message(phone, "¿Fumas actualmente? Responde *sí* o *no*.")
+        return
+
+    if st == "vida_fuma":
+        intent = interpret_response(text)
+        if intent == "positive":
+            data["fuma"] = "sí"
+        elif intent == "negative":
+            data["fuma"] = "no"
+        else:
+            data["fuma"] = "por confirmar"
+            send_message(phone, "¿Fumas actualmente? Responde *sí* o *no*.")
+            return
+        user_state[phone] = "vida_estado"
+        send_message(phone, "¿En qué estado de la República vives?")
+        return
+
+    if st == "vida_estado":
+        estado = (text or "").strip()
+        if not estado:
+            send_message(phone, "¿En qué estado de la República vives?")
+            return
+        data["estado"] = estado
+        user_state[phone] = "vida_suma"
+        send_message(phone, "¿Qué suma asegurada te gustaría revisar? Ejemplo: 500 mil, 1 millón o 2 millones.")
+        return
+
+    if st == "vida_suma":
+        suma = (text or "").strip()
+        if not suma:
+            send_message(phone, "¿Qué suma asegurada te gustaría revisar? Ejemplo: 500 mil, 1 millón o 2 millones.")
+            return
+        data["suma"] = suma
+        user_state[phone] = "vida_objetivo"
+        send_message(phone, "¿Qué buscas proteger principalmente?\n1) Familia\n2) Deuda\n3) Negocio\n4) Otro")
+        return
+
+    if st == "vida_objetivo":
+        raw = (text or "").strip()
+        objetivo = {"1": "Familia", "2": "Deuda", "3": "Negocio", "4": "Otro"}.get(raw, raw.capitalize() if raw else "Otro")
+        data["objetivo"] = objetivo
+        send_message(
+            phone,
+            "Gracias. Ya tengo los datos iniciales para revisar una opción de Seguro de Vida Temporal.\n\n"
+            "Christian te dará seguimiento para revisar una propuesta según tu edad, perfil, suma asegurada y condiciones de contratación.",
+        )
+        nombre = _match_name(match) or "(sin nombre)"
+        _notify_advisor(
+            "🔔 VIDA TEMPORAL — Prospecto interesado\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {nombre}\n"
+            f"Edad: {data.get('edad', '')}\n"
+            f"Fuma: {data.get('fuma', '')}\n"
+            f"Estado: {data.get('estado', '')}\n"
+            f"Suma asegurada: {data.get('suma', '')}\n"
+            f"Objetivo: {data.get('objetivo', '')}"
+        )
+        try:
+            if match and match.get("row"):
+                _safe_update_row_cells(
+                    int(match["row"]),
+                    {
+                        "ESTATUS": "perfil_inicial_capturado",
+                        "PRODUCTO": "vida_temporal",
+                        "ULTIMO_CONTACTO": _utc_now_iso(),
+                        "NOTAS": "datos iniciales capturados para vida temporal",
+                        "LAST_MESSAGE": data.get("last_message", ""),
+                    },
+                    VIDA_SHEET_FIELDS,
+                )
+        except Exception:
+            log.exception("⚠️ No fue posible actualizar Sheets al cerrar Vida Temporal")
+        user_state[phone] = "__greeted__"
+        log.info("✅ Vida Temporal perfil inicial capturado")
+        return
+
+    vida_start(phone, match)
+
 # --- IMSS (opción 1) ---
 def imss_start(phone: str, match: Optional[Dict[str, Any]]) -> None:
     user_state[phone] = "imss_beneficios"
@@ -1091,10 +1409,10 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
         imss_start(phone, match)
     elif t in ("2", "auto", "seguros de auto", "seguro auto"):
         auto_start(phone, match)
-    elif t in ("3", "vida", "salud", "seguro de vida", "seguro de salud"):
-        send_message(phone, "🧬 *Seguros de Vida/Salud* — Gracias por tu interés. Notificaré al asesor para contactarte.")
-        _notify_advisor(f"🔔 Vida/Salud — Solicitud de contacto\nWhatsApp: {phone}")
-        send_main_menu(phone)
+    elif t in ("3", "vida", "salud", "seguro de vida", "seguro de salud", "vida temporal",
+               "seguro vida", "seguros de vida", "protección familiar", "proteccion familiar",
+               "seguro de vida y salud"):
+        vida_start(phone, match)
     elif t in ("4", "vrim", "tarjeta médica", "tarjeta medica"):
         send_message(phone, "🩺 *VRIM* — Membresía médica. Notificaré al asesor para darte detalles.")
         _notify_advisor(f"🔔 VRIM — Solicitud de contacto\nWhatsApp: {phone}")
@@ -1118,6 +1436,8 @@ def _route_command(phone: str, text: str, match: Optional[Dict[str, Any]]) -> No
             _emp_next(phone, text)
         elif st.startswith("fp_"):
             _fp_next(phone, text)
+        elif st.startswith("vida_"):
+            _vida_next(phone, text, match)
         elif st.startswith("auto_"):
             _auto_next(phone, text)
         else:
@@ -1265,6 +1585,17 @@ def webhook_receive():
                 append_respuesta_cliente(phone, nombre_sheet, text, now_iso)
             except Exception:
                 pass
+
+            _ensure_user(phone)["last_message"] = text
+
+            if BOARDROOM_ENABLED:
+                boardroom_result = send_to_boardroom(
+                    phone, text, match=match,
+                    message_id=msg.get("id"),
+                    state=user_state.get(phone, "")
+                )
+                if execute_boardroom_decision(phone, boardroom_result, match=match):
+                    return jsonify({"ok": True}), 200
 
             # Interceptor ultra-prioritario: si responden "info" a una plantilla, NO caer al menú/auto
             t_norm_info = (text or "").strip().lower()
