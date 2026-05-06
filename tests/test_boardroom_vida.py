@@ -254,3 +254,139 @@ def test_product_vida_temporal_only_does_not_block_fallback(no_external_io):
 
     assert handled is False
     update.assert_called_once_with(8, {"PRODUCTO": "vida_temporal"}, vicky.VIDA_SHEET_FIELDS)
+
+
+def test_vida_objetivo_1_does_not_start_imss(no_external_io):
+    send_message, notify = no_external_io
+    match = {"row": 2, "nombre": "Ana"}
+
+    vicky.vida_start(PHONE, match)
+    vicky._vida_next(PHONE, "45", match)
+    vicky._vida_next(PHONE, "no", match)
+    vicky._vida_next(PHONE, "Sinaloa", match)
+    vicky._vida_next(PHONE, "1000000", match)
+
+    with patch.object(vicky, "imss_start") as imss_start:
+        vicky._route_command(PHONE, "1", match)
+
+    imss_start.assert_not_called()
+    assert vicky.user_state[PHONE] == "__greeted__"
+    assert not any("Préstamo IMSS" in call.args[1] for call in send_message.call_args_list)
+    assert not any("Ley 73" in call.args[1] for call in send_message.call_args_list)
+    advisor_text = notify.call_args.args[0]
+    assert "Objetivo: Familia" in advisor_text
+
+
+def test_vida_fuma_no_advances_not_global_reject(no_external_io):
+    send_message, _ = no_external_io
+
+    vicky.vida_start(PHONE, None)
+    vicky._vida_next(PHONE, "35", None)
+
+    vicky._route_command(PHONE, "no", None)
+
+    assert vicky.user_state[PHONE] == "vida_estado"
+    assert any("estado" in call.args[1].lower() for call in send_message.call_args_list)
+
+
+def test_vida_suma_number_advances_to_objetivo(no_external_io):
+    send_message, _ = no_external_io
+
+    vicky.vida_start(PHONE, None)
+    vicky._vida_next(PHONE, "40", None)
+    vicky._vida_next(PHONE, "no", None)
+    vicky._vida_next(PHONE, "Sonora", None)
+
+    vicky._route_command(PHONE, "1000000", None)
+
+    assert vicky.user_state[PHONE] == "vida_objetivo"
+    assert any("proteger principalmente" in call.args[1].lower() for call in send_message.call_args_list)
+
+
+def test_imss_active_number_does_not_restart_global(no_external_io):
+    send_message, _ = no_external_io
+
+    vicky.user_state[PHONE] = "imss_monto"
+    vicky.user_data[PHONE] = {"imss_pension": 8500}
+
+    with patch.object(vicky, "imss_start") as imss_start:
+        vicky._route_command(PHONE, "100000", None)
+
+    imss_start.assert_not_called()
+    assert vicky.user_state[PHONE] == "imss_nombre"
+    assert any("nombre completo" in call.args[1].lower() for call in send_message.call_args_list)
+
+
+def test_webhook_active_vida_state_skips_boardroom():
+    vicky.user_state[PHONE] = "vida_objetivo"
+    vicky.user_data[PHONE] = {
+        "edad": 45,
+        "fuma": "no",
+        "estado": "Sinaloa",
+        "suma": "1 millón",
+        "last_message": "",
+    }
+
+    with patch.object(vicky, "send_to_boardroom") as boardroom, \
+         patch.object(vicky, "send_message", return_value=True), \
+         patch.object(vicky, "_notify_advisor"), \
+         patch.object(vicky, "match_client_in_sheets", return_value=None), \
+         patch.object(vicky, "append_respuesta_cliente"):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("1"))
+
+    assert rv.status_code == 200
+    boardroom.assert_not_called()
+    assert vicky.user_state[PHONE] == "__greeted__"
+
+
+def test_webhook_no_active_state_calls_boardroom():
+    vicky.user_state[PHONE] = "__greeted__"
+
+    response = Mock(status_code=200, text='{}')
+    response.json.return_value = {"ok": False, "handled": False}
+
+    with patch.object(vicky, "BOARDROOM_ENABLED", True), \
+         patch.object(vicky, "BOARDROOM_DECISION_URL", "https://boardroom.example.com"), \
+         patch.object(vicky, "BOARDROOM_AUTH_TOKEN", "token"), \
+         patch.object(vicky.requests, "post", return_value=response) as post_mock, \
+         patch.object(vicky, "send_message", return_value=True), \
+         patch.object(vicky, "match_client_in_sheets", return_value=None), \
+         patch.object(vicky, "append_respuesta_cliente"):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("hola"))
+
+    assert rv.status_code == 200
+    post_mock.assert_called_once()
+
+
+def test_bulk_send_worker_rejects_text_without_template():
+    item = {
+        "to": PHONE,
+        "text": "Mensaje libre proactivo",
+        "template": "",
+        "params": [],
+    }
+
+    with patch.object(vicky, "send_message") as send_message, \
+         patch.object(vicky, "send_template_message") as send_template, \
+         patch.object(vicky, "ADVISOR_NUMBER", ""):
+        vicky._bulk_send_worker([item])
+
+    send_message.assert_not_called()
+    send_template.assert_not_called()
+
+
+def test_bulk_send_worker_template_uses_send_template_message():
+    item = {
+        "to": PHONE,
+        "text": "",
+        "template": "vida_temporal_apertura_01",
+        "params": ["Ana"],
+    }
+
+    with patch.object(vicky, "send_message") as send_message, \
+         patch.object(vicky, "send_template_message", return_value=True) as send_template, \
+         patch.object(vicky, "ADVISOR_NUMBER", ""):
+        vicky._bulk_send_worker([item])
+
+    send_message.assert_not_called()
+    send_template.assert_called_once_with(PHONE, "vida_temporal_apertura_01", ["Ana"])
