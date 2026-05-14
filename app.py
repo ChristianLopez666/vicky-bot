@@ -129,10 +129,31 @@ VIDA_SHEET_FIELDS = {
     "NOTAS",
     "BENEFICIO_OFRECIDO",
     "LAST_MESSAGE",
+    "LAST_MESSAGE_AT",
 }
 
 TPV_TEMPLATE_NAME = "promo_tpv"
 ALLIANCE_TEMPLATES = {"despachis_contables"}
+
+SECOM_VIDA_TEMPLATES = {"vida_inbursa_proveedor_v1"}
+
+TEMPLATE_INTEREST_WORDS = {
+    "si",
+    "sí",
+    "s",
+    "ok",
+    "claro",
+    "me interesa",
+    "info",
+    "informacion",
+    "información",
+    "mas info",
+    "más info",
+}
+
+AWAITING_TEMPLATE_RECOVERABLE_STATUSES = {
+    "ENVIADO_INICIAL",
+}
 
 
 # ==========================
@@ -1508,6 +1529,162 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
         send_message(phone, "Recibí tu archivo, gracias. Si algo falla, lo reviso de inmediato.")
 
 
+def _is_recent_awaiting_template_context(phone: str, match: Optional[Dict[str, Any]]) -> bool:
+    """Valida ventana 24h usando memoria si existe, o Sheets como fallback."""
+    try:
+        started_at = (_ensure_user(phone).get("awaiting_info_started_at") or "").strip()
+        if started_at and _within_24h(started_at):
+            return True
+    except Exception:
+        pass
+
+    try:
+        last_message_at = ((match or {}).get("last_message_at") or "").strip()
+        return bool(last_message_at and _within_24h(last_message_at))
+    except Exception:
+        return False
+
+
+def _resolve_awaiting_template_context(phone: str, match: Optional[Dict[str, Any]]) -> str:
+    """
+    Resuelve template pendiente desde:
+    1) user_state en memoria.
+    2) Sheets + ENVIO_STATUS cuando Render reinició y perdió memoria.
+
+    Gobernanza:
+    - Solo recupera contexto si está dentro de 24h.
+    - Solo recupera estatus outbound permitido.
+    - Solo aplica a templates explícitamente registrados.
+    """
+    st = user_state.get(phone, "")
+
+    if st.startswith("awaiting_info:"):
+        template_name = st.split(":", 1)[1].strip()
+
+        if not _is_recent_awaiting_template_context(phone, match):
+            log.info("⏳ awaiting_info expirado para %s template=%s", phone, template_name)
+            user_state[phone] = "__greeted__"
+            return ""
+
+        return template_name
+
+    if not match:
+        return ""
+
+    if not _is_recent_awaiting_template_context(phone, match):
+        return ""
+
+    estatus = ((match or {}).get("estatus") or "").strip().upper()
+    if estatus not in AWAITING_TEMPLATE_RECOVERABLE_STATUSES:
+        return ""
+
+    last_tpl = get_last_envio_template(_normalize_phone_last10(phone))
+    if last_tpl in SECOM_VIDA_TEMPLATES:
+        log.info("♻️ Recuperando contexto awaiting_info desde Sheets/ENVIO_STATUS phone=%s template=%s", phone, last_tpl)
+        return last_tpl
+
+    return ""
+
+
+def _handle_awaiting_template_response(phone: str, text: str, match: Optional[Dict[str, Any]]) -> bool:
+    template_name = _resolve_awaiting_template_context(phone, match)
+    if not template_name:
+        return False
+
+    t = (text or "").strip().lower()
+    nombre = _match_name(match) or "(sin nombre)"
+
+    if template_name in SECOM_VIDA_TEMPLATES:
+        if t in TEMPLATE_INTEREST_WORDS or interpret_response(text) == "positive":
+            _notify_advisor(
+                "🚨 SECOM / VIDA INBURSA — Prospecto interesado\n"
+                f"Template: {template_name}\n"
+                f"WhatsApp: {phone}\n"
+                f"Nombre: {nombre}\n"
+                f"Respuesta: {text}"
+            )
+
+            try:
+                if match and match.get("row"):
+                    _safe_update_row_cells(
+                        int(match["row"]),
+                        {
+                            "ESTATUS": "INTERESADO_SECOM_VIDA",
+                            "PRODUCTO": "vida_inbursa",
+                            "ULTIMO_CONTACTO": _utc_now_iso(),
+                            "LAST_MESSAGE_AT": _utc_now_iso(),
+                            "NOTAS": f"Respondió interés a plantilla {template_name}: {text}",
+                            "LAST_MESSAGE": text,
+                        },
+                        VIDA_SHEET_FIELDS,
+                    )
+            except Exception:
+                log.exception("⚠️ No fue posible actualizar Sheets para interés SECOM VIDA")
+
+            send_message(
+                phone,
+                "En breve, su asesor Christian López se pondrá en contacto con usted para "
+                "brindarle asesoría personalizada y resolver todas sus dudas de manera directa y segura. "
+                "Escribe *menú* para ver opciones."
+            )
+            user_state[phone] = "__greeted__"
+            return True
+
+        if interpret_response(text) == "negative":
+            try:
+                if match and match.get("row"):
+                    _safe_update_row_cells(
+                        int(match["row"]),
+                        {
+                            "ESTATUS": "NO_INTERESADO_SECOM_VIDA",
+                            "ULTIMO_CONTACTO": _utc_now_iso(),
+                            "LAST_MESSAGE_AT": _utc_now_iso(),
+                            "NOTAS": f"No interesado a plantilla {template_name}: {text}",
+                            "LAST_MESSAGE": text,
+                        },
+                        VIDA_SHEET_FIELDS,
+                    )
+            except Exception:
+                log.exception("⚠️ No fue posible actualizar Sheets para rechazo SECOM VIDA")
+
+            send_message(phone, "Gracias por tu respuesta. Quedo a tus órdenes si más adelante deseas revisarlo.")
+            user_state[phone] = "__greeted__"
+            return True
+
+        _notify_advisor(
+            "📩 SECOM / VIDA INBURSA — Respuesta o duda detectada\n"
+            f"Template: {template_name}\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {nombre}\n"
+            f"Mensaje: {text}"
+        )
+
+        try:
+            if match and match.get("row"):
+                _safe_update_row_cells(
+                    int(match["row"]),
+                    {
+                        "ESTATUS": "DUDA_SECOM_VIDA",
+                        "ULTIMO_CONTACTO": _utc_now_iso(),
+                        "LAST_MESSAGE_AT": _utc_now_iso(),
+                        "NOTAS": f"Respuesta neutral a plantilla {template_name}: {text}",
+                        "LAST_MESSAGE": text,
+                    },
+                    VIDA_SHEET_FIELDS,
+                )
+        except Exception:
+            log.exception("⚠️ No fue posible actualizar Sheets para duda SECOM VIDA")
+
+        send_message(
+            phone,
+            "Gracias. En breve, su asesor Christian López se pondrá en contacto con usted para darle seguimiento."
+        )
+        user_state[phone] = "__greeted__"
+        return True
+
+    return False
+
+
 @app.post("/webhook")
 def webhook_receive():
     try:
@@ -1561,6 +1738,9 @@ def webhook_receive():
 
             if active_local_state:
                 _route_command(phone, text, match)
+                return jsonify({"ok": True}), 200
+
+            if _handle_awaiting_template_response(phone, text, match):
                 return jsonify({"ok": True}), 200
 
             if BOARDROOM_ENABLED:
@@ -1922,17 +2102,20 @@ def ext_auto_send_one():
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
         params = {} if template_name == "vrim_ideal" else {"nombre": nombre}
 
+        now_iso = _utc_now_iso()
         ok = send_template_message(to, template_name, params)
 
         if ok:
             user_state[to] = f"awaiting_info:{template_name}"
+            data = _ensure_user(to)
+            data["awaiting_info_template"] = template_name
+            data["awaiting_info_started_at"] = now_iso
         else:
             try:
-                append_envio_status(to, "", "failed", template_name, _utc_now_iso())
+                append_envio_status(to, "", "failed", template_name, now_iso)
             except Exception:
                 pass
 
-        now_iso = _utc_now_iso()
         estatus_val = "FALLO_ENVIO" if not ok else (
             "ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else
             ("ENVIADO_ALIANZA" if template_name in ALLIANCE_TEMPLATES else "ENVIADO_INICIAL")
@@ -1960,4 +2143,3 @@ if __name__ == "__main__":
     log.info("📊 Google Sheets/Drive: %s", google_ready)
     log.info("🧠 OpenAI: %s", bool(openai and OPENAI_API_KEY))
     app.run(host="0.0.0.0", port=PORT, debug=False)
-
