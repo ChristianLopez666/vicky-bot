@@ -2050,7 +2050,6 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
     i_name = _idx(headers, "Nombre")
     i_wa = _idx(headers, "WhatsApp")
     i_status = _idx(headers, "ESTATUS")
-    i_last = _idx(headers, "LAST_MESSAGE_AT")
 
     if i_name is None or i_wa is None:
         raise RuntimeError("Faltan columnas requeridas: 'Nombre' y/o 'WhatsApp'.")
@@ -2058,10 +2057,6 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
     for row_number, row in enumerate(rows, start=2):
         wa = _cell(row, i_wa).strip()
         if not wa:
-            continue
-
-        last_at = _cell(row, i_last).strip() if i_last is not None else ""
-        if last_at:
             continue
 
         estatus = _cell(row, i_status).strip().upper() if i_status is not None else ""
