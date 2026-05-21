@@ -58,6 +58,12 @@ BOARDROOM_AUTH_TOKEN = os.getenv("BOARDROOM_AUTH_TOKEN", "").strip()
 BOARDROOM_ENABLED = os.getenv("BOARDROOM_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 BOARDROOM_ORCHESTRATE_PATH = "/api/boardroom/orchestrate"
 
+# COHIFIS Agentic Business Bus v1
+BUS_EVENT_URL = os.getenv(
+    "BUS_EVENT_URL",
+    "https://boardroom-engine.onrender.com/bus/event",
+).strip()
+
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS", "").strip()
 SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto").strip()
@@ -840,6 +846,40 @@ def _infer_product_hint(text: str) -> str:
     if any(k in t for k in ("empresarial", "pyme")):
         return "empresarial"
     return "unknown"
+
+
+
+def _report_to_bus(
+    phone: str,
+    text: Optional[str],
+    funnel_state: str,
+    template_name: Optional[str],
+    match: Optional[Dict[str, Any]],
+    retry_count: int = 0,
+) -> None:
+    """
+    Reporta el evento al COHIFIS Agentic Business Bus (boardroom-engine /bus/event).
+    Fire-and-forget: timeout 2s, nunca bloquea el flujo principal de SECOM.
+    """
+    if not BUS_EVENT_URL:
+        return
+    try:
+        payload = {
+            "channel":       "secom",
+            "phone":         phone or "",
+            "text":          text,
+            "funnel_state":  funnel_state or "",
+            "template_name": template_name,
+            "retry_count":   retry_count,
+            "sheets_match":  {
+                "nombre":  _match_name(match) or "",
+                "estatus": (match or {}).get("estatus", ""),
+            } if match else None,
+        }
+        resp = requests.post(BUS_EVENT_URL, json=payload, timeout=2)
+        log.info("🚌 Bus event reportado: %s → %s", phone, resp.status_code)
+    except Exception:
+        log.warning("⚠️ Bus event falló (non-blocking): phone=%s", phone)
 
 
 def send_to_boardroom(phone: str, text: str, match: Optional[Dict[str, Any]] = None, message_id: Optional[str] = None, state: Optional[str] = None) -> dict:
@@ -1743,6 +1783,15 @@ def webhook_receive():
             if _handle_awaiting_template_response(phone, text, match):
                 return jsonify({"ok": True}), 200
 
+            # COHIFIS Bus — reportar evento antes de Boardroom (fire-and-forget)
+            _report_to_bus(
+                phone         = phone,
+                text          = text,
+                funnel_state  = user_state.get(phone, ""),
+                template_name = _resolve_awaiting_template_context(phone, match),
+                match         = match,
+            )
+
             if BOARDROOM_ENABLED:
                 boardroom_result = send_to_boardroom(
                     phone,
@@ -2050,6 +2099,7 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
     i_name = _idx(headers, "Nombre")
     i_wa = _idx(headers, "WhatsApp")
     i_status = _idx(headers, "ESTATUS")
+    i_last = _idx(headers, "LAST_MESSAGE_AT")
 
     if i_name is None or i_wa is None:
         raise RuntimeError("Faltan columnas requeridas: 'Nombre' y/o 'WhatsApp'.")
@@ -2057,6 +2107,10 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
     for row_number, row in enumerate(rows, start=2):
         wa = _cell(row, i_wa).strip()
         if not wa:
+            continue
+
+        last_at = _cell(row, i_last).strip() if i_last is not None else ""
+        if last_at:
             continue
 
         estatus = _cell(row, i_status).strip().upper() if i_status is not None else ""
