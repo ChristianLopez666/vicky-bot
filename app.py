@@ -135,7 +135,12 @@ VIDA_SHEET_FIELDS = {
 TPV_TEMPLATE_NAME = "promo_tpv"
 ALLIANCE_TEMPLATES = {"despachis_contables"}
 
-SECOM_VIDA_TEMPLATES = {"vida_inbursa_proveedor_v1"}
+SECOM_VIDA_TEMPLATES = {"vida_inbursa_proveedor_v1", "vida_temporal"}
+
+TEMPLATE_IMAGE_ENV = {
+    "seguro_auto_70": "SEGURO_AUTO_70_IMAGE_URL",
+    "vida_temporal": "VIDA_TEMPORAL_IMAGE_URL",
+}
 
 TEMPLATE_INTEREST_WORDS = {
     "si",
@@ -318,10 +323,11 @@ def send_template_message(to: str, template_name: str, params: Dict[str, Any] | 
 
     components: List[Dict[str, Any]] = []
 
-    if template_name == "seguro_auto_70":
-        image_url = os.getenv("SEGURO_AUTO_70_IMAGE_URL", "").strip()
+    img_env = TEMPLATE_IMAGE_ENV.get(template_name)
+    if img_env:
+        image_url = os.getenv(img_env, "").strip()
         if not image_url:
-            log.error("❌ Falta SEGURO_AUTO_70_IMAGE_URL en entorno.")
+            log.error("❌ Falta %s en entorno para plantilla %s.", img_env, template_name)
             return False
         components.append({
             "type": "header",
