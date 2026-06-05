@@ -751,7 +751,7 @@ def _auto_is_context(match: Optional[Dict[str, Any]]) -> bool:
     if not match:
         return False
     estatus = (match.get("estatus") or "").strip().upper()
-    if estatus not in {"ENVIADO_INICIAL", "ENVIADO_AUTO", "ENVIADO_SEGURO_AUTO"}:
+    if estatus not in {"ENVIADO_AUTO", "ENVIADO_SEGURO_AUTO"}:
         return False
     return _within_24h(match.get("last_message_at") or "")
 
@@ -2123,7 +2123,7 @@ def ext_auto_send_one():
         now_iso = _utc_now_iso()
         estatus_val = "FALLO_ENVIO" if not ok else (
             "ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else
-            ("ENVIADO_ALIANZA" if template_name in ALLIANCE_TEMPLATES else "ENVIADO_INICIAL")
+            ("ENVIADO_ALIANZA" if template_name in ALLIANCE_TEMPLATES else "ENVIADO_VIDA_TEMPORAL")
         )
         _update_row_cells(nxt["row_number"], {"ESTATUS": estatus_val, "LAST_MESSAGE_AT": now_iso}, headers)
 
