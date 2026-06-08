@@ -57,6 +57,9 @@ BOARDROOM_DECISION_URL = os.getenv("BOARDROOM_DECISION_URL", "").strip()
 BOARDROOM_AUTH_TOKEN = os.getenv("BOARDROOM_AUTH_TOKEN", "").strip()
 BOARDROOM_ENABLED = os.getenv("BOARDROOM_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 BOARDROOM_ORCHESTRATE_PATH = "/api/boardroom/orchestrate"
+BUS_URL = os.getenv("BUS_URL", "").strip()
+BUS_INTERNAL_TOKEN = os.getenv("BUS_INTERNAL_TOKEN", "").strip()
+_BUS_ACTIVE = os.getenv("BUS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS", "").strip()
@@ -887,6 +890,58 @@ def send_to_boardroom(phone: str, text: str, match: Optional[Dict[str, Any]] = N
     except Exception:
         log.exception("⚠️ Boardroom unavailable; fallback local")
         return {"ok": False, "handled": False, "reason": "exception"}
+
+
+def _emit_bus_event(
+    phone: str,
+    text: str,
+    event_type: str = "inbound_message",
+    template_name: Optional[str] = None,
+    intent: Optional[str] = None,
+    metadata: Optional[dict] = None
+) -> None:
+    if not _BUS_ACTIVE:
+        return
+    if not BUS_URL or not BUS_INTERNAL_TOKEN:
+        log.warning(
+            "BUS_URL o BUS_INTERNAL_TOKEN no configurados — emit omitido"
+        )
+        return
+
+    payload: Dict[str, Any] = {
+        "source": "vicky_secom",
+        "event_type": event_type,
+        "telefono": phone,
+        "mensaje": text or "",
+        "timestamp": _utc_now_iso(),
+    }
+    if template_name:
+        payload["template_name"] = template_name
+    if intent:
+        payload["intent"] = intent
+    if metadata:
+        payload["metadata"] = metadata
+
+    def _post() -> None:
+        try:
+            requests.post(
+                BUS_URL,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {BUS_INTERNAL_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                timeout=3,
+            )
+        except Exception as exc:
+            log.warning(
+                "Bus emit fallido phone_last4=%s error=%s: %s",
+                str(phone)[-4:],
+                type(exc).__name__,
+                str(exc),
+            )
+
+    threading.Thread(target=_post, daemon=True).start()
 
 
 def _extract_boardroom_decision(decision: Any) -> Dict[str, Any]:
@@ -1748,6 +1803,8 @@ def webhook_receive():
 
             if _handle_awaiting_template_response(phone, text, match):
                 return jsonify({"ok": True}), 200
+
+            _emit_bus_event(phone=phone, text=text)
 
             if BOARDROOM_ENABLED:
                 boardroom_result = send_to_boardroom(
