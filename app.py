@@ -157,10 +157,19 @@ TEMPLATE_INTEREST_WORDS = {
     "información",
     "mas info",
     "más info",
+    "contrata hoy",
+    "contratar",
+    "quiero contratar",
+    "me interesa contratar",
+    "lo quiero",
+    "vrim10",
 }
 
 AWAITING_TEMPLATE_RECOVERABLE_STATUSES = {
     "ENVIADO_INICIAL",
+    "ENVIADO_TEMPLATE",
+    "ENVIADO_VRIM",
+    "ENVIADO_VIDA_TEMPORAL",
 }
 
 
@@ -309,11 +318,20 @@ def send_message(to: str, text: str) -> bool:
     return False
 
 
-def send_template_message(to: str, template_name: str, params: Dict[str, Any] | List[Any] | None = None) -> bool:
+def send_template_message(
+    to: str,
+    template_name: str,
+    params: Dict[str, Any] | List[Any] | None = None,
+    image_url: Optional[str] = None,
+    components: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
     """Envía plantilla Meta aprobada.
 
-    - params dict => parámetros nombrados con parameter_name.
-    - params list => parámetros posicionales.
+    Reglas:
+    - template_name siempre es obligatorio.
+    - params es opcional; si no viene, NO se mandan parámetros de body.
+    - image_url es opcional; si viene, se manda como header image.
+    - components permite enviar componentes Meta completos cuando la plantilla lo requiera.
     """
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
@@ -324,31 +342,48 @@ def send_template_message(to: str, template_name: str, params: Dict[str, Any] | 
         log.error("❌ template_name vacío")
         return False
 
-    components: List[Dict[str, Any]] = []
+    if components is not None and not isinstance(components, list):
+        log.error("❌ components inválido para plantilla %s; debe ser lista.", template_name)
+        return False
 
-    img_env = TEMPLATE_IMAGE_ENV.get(template_name)
-    if img_env:
-        image_url = os.getenv(img_env, "").strip()
-        if not image_url:
-            log.error("❌ Falta %s en entorno para plantilla %s.", img_env, template_name)
-            return False
-        components.append({
-            "type": "header",
-            "parameters": [{"type": "image", "image": {"link": image_url}}],
-        })
+    built_components: List[Dict[str, Any]] = []
 
-    params = params or {}
-    if isinstance(params, dict):
-        body_params = [
-            {"type": "text", "parameter_name": str(k), "text": str(v)}
-            for k, v in params.items()
-        ]
-        if body_params:
-            components.append({"type": "body", "parameters": body_params})
-    elif isinstance(params, list):
-        body_params = [{"type": "text", "text": str(v)} for v in params]
-        if body_params:
-            components.append({"type": "body", "parameters": body_params})
+    if components is not None:
+        built_components = components
+    else:
+        final_image_url = str(image_url or "").strip()
+
+        if not final_image_url:
+            img_env = TEMPLATE_IMAGE_ENV.get(template_name)
+            if img_env:
+                final_image_url = os.getenv(img_env, "").strip()
+                if not final_image_url:
+                    log.error("❌ Falta %s en entorno para plantilla %s.", img_env, template_name)
+                    return False
+
+        if final_image_url:
+            if not final_image_url.startswith(("https://", "http://")):
+                log.error("❌ image_url inválida para plantilla %s.", template_name)
+                return False
+            built_components.append({
+                "type": "header",
+                "parameters": [{"type": "image", "image": {"link": final_image_url}}],
+            })
+
+        if params is not None:
+            if isinstance(params, dict):
+                body_params = [
+                    {"type": "text", "parameter_name": str(k), "text": str(v)}
+                    for k, v in params.items()
+                ]
+            elif isinstance(params, list):
+                body_params = [{"type": "text", "text": str(v)} for v in params]
+            else:
+                log.error("❌ params inválido para plantilla %s; debe ser dict, list o null.", template_name)
+                return False
+
+            if body_params:
+                built_components.append({"type": "body", "parameters": body_params})
 
     payload = {
         "messaging_product": "whatsapp",
@@ -357,7 +392,7 @@ def send_template_message(to: str, template_name: str, params: Dict[str, Any] | 
         "template": {
             "name": template_name,
             "language": {"code": "es_MX"},
-            **({"components": components} if components else {}),
+            **({"components": built_components} if built_components else {}),
         },
     }
 
@@ -381,7 +416,7 @@ def send_template_message(to: str, template_name: str, params: Dict[str, Any] | 
                 log.info("✅ Plantilla '%s' enviada exitosamente a %s", template_name, to)
                 return True
 
-            log.warning("⚠️ WPP send_template falló %s: %s", resp.status_code, resp.text[:200])
+            log.warning("⚠️ WPP send_template falló %s: %s", resp.status_code, resp.text[:500])
             if _should_retry(resp.status_code) and attempt < 2:
                 _backoff(attempt)
                 continue
@@ -399,7 +434,6 @@ def send_template_message(to: str, template_name: str, params: Dict[str, Any] | 
                 continue
             return False
     return False
-
 
 def forward_media_to_advisor(media_type: str, media_id: str) -> None:
     if not (META_TOKEN and WPP_API_URL and ADVISOR_NUMBER and media_id):
@@ -1640,7 +1674,7 @@ def _resolve_awaiting_template_context(phone: str, match: Optional[Dict[str, Any
         return ""
 
     last_tpl = get_last_envio_template(_normalize_phone_last10(phone))
-    if last_tpl in SECOM_VIDA_TEMPLATES:
+    if last_tpl:
         log.info("♻️ Recuperando contexto awaiting_info desde Sheets/ENVIO_STATUS phone=%s template=%s", phone, last_tpl)
         return last_tpl
 
@@ -1743,7 +1777,90 @@ def _handle_awaiting_template_response(phone: str, text: str, match: Optional[Di
         user_state[phone] = "__greeted__"
         return True
 
-    return False
+    if t in TEMPLATE_INTEREST_WORDS or interpret_response(text) == "positive":
+        _notify_advisor(
+            "🚨 SECOM / PLANTILLA — Prospecto interesado\n"
+            f"Template: {template_name}\n"
+            f"WhatsApp: {phone}\n"
+            f"Nombre: {nombre}\n"
+            f"Respuesta: {text}"
+        )
+
+        try:
+            if match and match.get("row"):
+                _safe_update_row_cells(
+                    int(match["row"]),
+                    {
+                        "ESTATUS": "INTERESADO_TEMPLATE",
+                        "PRODUCTO": template_name,
+                        "ULTIMO_CONTACTO": _utc_now_iso(),
+                        "LAST_MESSAGE_AT": _utc_now_iso(),
+                        "NOTAS": f"Respondió interés a plantilla {template_name}: {text}",
+                        "LAST_MESSAGE": text,
+                    },
+                    VIDA_SHEET_FIELDS,
+                )
+        except Exception:
+            log.exception("⚠️ No fue posible actualizar Sheets para interés de plantilla genérica")
+
+        send_message(
+            phone,
+            "✅ Gracias. Ya registré tu interés. En breve, Christian López te contactará para darte seguimiento."
+        )
+        user_state[phone] = "__greeted__"
+        return True
+
+    if interpret_response(text) == "negative":
+        try:
+            if match and match.get("row"):
+                _safe_update_row_cells(
+                    int(match["row"]),
+                    {
+                        "ESTATUS": "NO_INTERESADO_TEMPLATE",
+                        "ULTIMO_CONTACTO": _utc_now_iso(),
+                        "LAST_MESSAGE_AT": _utc_now_iso(),
+                        "NOTAS": f"No interesado a plantilla {template_name}: {text}",
+                        "LAST_MESSAGE": text,
+                    },
+                    VIDA_SHEET_FIELDS,
+                )
+        except Exception:
+            log.exception("⚠️ No fue posible actualizar Sheets para rechazo de plantilla genérica")
+
+        send_message(phone, "Gracias por tu respuesta. Quedo a tus órdenes si más adelante deseas revisarlo.")
+        user_state[phone] = "__greeted__"
+        return True
+
+    _notify_advisor(
+        "📩 SECOM / PLANTILLA — Respuesta o duda detectada\n"
+        f"Template: {template_name}\n"
+        f"WhatsApp: {phone}\n"
+        f"Nombre: {nombre}\n"
+        f"Mensaje: {text}"
+    )
+
+    try:
+        if match and match.get("row"):
+            _safe_update_row_cells(
+                int(match["row"]),
+                {
+                    "ESTATUS": "DUDA_TEMPLATE",
+                    "ULTIMO_CONTACTO": _utc_now_iso(),
+                    "LAST_MESSAGE_AT": _utc_now_iso(),
+                    "NOTAS": f"Respuesta neutral a plantilla {template_name}: {text}",
+                    "LAST_MESSAGE": text,
+                },
+                VIDA_SHEET_FIELDS,
+            )
+    except Exception:
+        log.exception("⚠️ No fue posible actualizar Sheets para duda de plantilla genérica")
+
+    send_message(
+        phone,
+        "Gracias. En breve, Christian López se pondrá en contacto contigo para darte seguimiento."
+    )
+    user_state[phone] = "__greeted__"
+    return True
 
 
 @app.post("/webhook")
@@ -2004,7 +2121,9 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
             to = str(item.get("to", "")).strip()
             text = str(item.get("text", "")).strip()
             template = str(item.get("template", "")).strip()
-            params = item.get("params", [])
+            params = item.get("params") if "params" in item else None
+            image_url = str(item.get("image_url") or item.get("header_image_url") or "").strip() or None
+            components = item.get("components") if isinstance(item.get("components"), list) else None
 
             if not to:
                 log.warning("⏭️ Item %s sin destinatario, omitiendo", i)
@@ -2019,7 +2138,13 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
                 continue
 
             if template:
-                success = send_template_message(to, template, params)
+                success = send_template_message(
+                    to,
+                    template,
+                    params=params,
+                    image_url=image_url,
+                    components=components,
+                )
                 log.info("   ↳ Plantilla '%s' a %s: %s", template, to, "✅" if success else "❌")
             else:
                 log.warning("   ↳ Item %s sin contenido válido", i)
@@ -2109,6 +2234,19 @@ def ext_send_promo():
         return jsonify({"queued": False, "error": f"Error interno: {str(exc)}"}), 500
 
 
+
+def _status_for_template(template_name: str) -> str:
+    name = (template_name or "").strip().lower()
+    if name == TPV_TEMPLATE_NAME:
+        return "ENVIADO_TPV"
+    if name in ALLIANCE_TEMPLATES:
+        return "ENVIADO_ALIANZA"
+    if name in SECOM_VIDA_TEMPLATES:
+        return "ENVIADO_VIDA_TEMPORAL"
+    if "vrim" in name:
+        return "ENVIADO_VRIM"
+    return "ENVIADO_TEMPLATE"
+
 def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Dict[str, Any]]:
     i_name = _idx(headers, "Nombre")
     i_wa = _idx(headers, "WhatsApp")
@@ -2163,9 +2301,20 @@ def ext_auto_send_one():
 
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
-        params = {} if template_name == "vrim_ideal" else {"nombre": nombre}
+        params = body.get("params") if "params" in body else None
+        image_url = str(body.get("image_url") or body.get("header_image_url") or "").strip() or None
+        components = body.get("components") if isinstance(body.get("components"), list) else None
 
-        ok = send_template_message(to, template_name, params)
+        if body.get("components") is not None and components is None:
+            return jsonify({"ok": False, "error": "components debe ser una lista"}), 400
+
+        ok = send_template_message(
+            to,
+            template_name,
+            params=params,
+            image_url=image_url,
+            components=components,
+        )
 
         if ok:
             user_state[to] = f"awaiting_info:{template_name}"
@@ -2178,10 +2327,7 @@ def ext_auto_send_one():
                 pass
 
         now_iso = _utc_now_iso()
-        estatus_val = "FALLO_ENVIO" if not ok else (
-            "ENVIADO_TPV" if template_name == TPV_TEMPLATE_NAME else
-            ("ENVIADO_ALIANZA" if template_name in ALLIANCE_TEMPLATES else "ENVIADO_VIDA_TEMPORAL")
-        )
+        estatus_val = "FALLO_ENVIO" if not ok else _status_for_template(template_name)
         _update_row_cells(nxt["row_number"], {"ESTATUS": estatus_val, "LAST_MESSAGE_AT": now_iso}, headers)
 
         return jsonify({
