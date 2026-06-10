@@ -2063,6 +2063,19 @@ def webhook_receive():
             _handle_media(phone, msg)
             return jsonify({"ok": True}), 200
 
+        if mtype == "button":
+            button_text = (msg.get("button") or {}).get("text", "").strip()
+            if button_text:
+                log.info("🔘 Botón Quick Reply de %s: %s", phone, button_text)
+                try:
+                    append_respuesta_cliente(phone, _match_name(match), button_text, _utc_now_iso())
+                except Exception:
+                    pass
+                if _handle_awaiting_template_response(phone, button_text, match):
+                    return jsonify({"ok": True}), 200
+                _route_command(phone, button_text, match)
+            return jsonify({"ok": True}), 200
+
         log.info("ℹ️ Tipo de mensaje no manejado: %s", mtype)
         return jsonify({"ok": True}), 200
 
