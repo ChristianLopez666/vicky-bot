@@ -2064,7 +2064,8 @@ def webhook_receive():
             return jsonify({"ok": True}), 200
 
         if mtype == "button":
-            button_text = (msg.get("button") or {}).get("text", "").strip()
+            _btn = msg.get("button") or {}
+            button_text = (_btn.get("text") or _btn.get("payload") or "").strip()
             if button_text:
                 log.info("🔘 Botón Quick Reply de %s: %s", phone, button_text)
                 try:
@@ -2111,6 +2112,10 @@ def ext_health():
 @app.post("/ext/test-send")
 def ext_test_send():
     try:
+        token = (request.headers.get("X-AUTO-TOKEN") or "").strip()
+        if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
         data = request.get_json(force=True) or {}
         to = str(data.get("to", "")).strip()
         text = str(data.get("text", "")).strip()
@@ -2182,6 +2187,10 @@ def _bulk_send_worker(items: List[Dict[str, Any]]) -> None:
 def ext_send_promo():
     """Endpoint de outbound proactivo. Solo encola templates; rechaza text sin template."""
     try:
+        token = (request.headers.get("X-AUTO-TOKEN") or "").strip()
+        if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
+            return jsonify({"queued": False, "error": "unauthorized"}), 401
+
         if not META_TOKEN or not WABA_PHONE_ID:
             log.error("❌ META_TOKEN o WABA_PHONE_ID no configurados")
             return jsonify({"queued": False, "error": "WhatsApp Business API no configurada"}), 500
