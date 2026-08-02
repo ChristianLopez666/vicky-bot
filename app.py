@@ -79,6 +79,13 @@ SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto").st
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID", "").strip()
 AUTO_SEND_TOKEN = os.getenv("AUTO_SEND_TOKEN", "").strip()
 
+# CF-4: celda de control fuera del rango A:Z que lee _sheet_get_rows(), para
+# no interferir con los datos de leads. Kill switch de la campana outbound
+# (auto-send-one), persistente en Sheets para sobrevivir un reinicio del
+# servicio mientras esta pausada.
+CAMPAIGN_PAUSE_CELL = "AA1"
+CAMPAIGN_PAUSED_VALUE = "PAUSED"
+
 PORT = int(os.getenv("PORT", "5000"))
 
 logging.basicConfig(
@@ -507,6 +514,38 @@ def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: 
         return
     body = {"valueInputOption": "USER_ENTERED", "data": data}
     sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
+
+
+def _is_campaign_paused() -> bool:
+    """CF-4: lee el kill switch de la campana outbound desde Sheets."""
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+        return False
+    try:
+        rng = f"{SHEETS_TITLE_LEADS}!{CAMPAIGN_PAUSE_CELL}"
+        result = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=SHEETS_ID_LEADS, range=rng
+        ).execute()
+        values = result.get("values", [])
+        cell = (values[0][0] if values and values[0] else "").strip().upper()
+        return cell == CAMPAIGN_PAUSED_VALUE
+    except Exception:
+        log.exception("❌ Error leyendo kill switch de campana (CF-4); fail-open")
+        return False
+
+
+def _set_campaign_paused(paused: bool) -> None:
+    """CF-4: escribe el kill switch de la campana outbound en Sheets."""
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
+        raise RuntimeError("Sheets no disponible para actualizar kill switch.")
+    rng = f"{SHEETS_TITLE_LEADS}!{CAMPAIGN_PAUSE_CELL}"
+    value = CAMPAIGN_PAUSED_VALUE if paused else ""
+    body = {"values": [[value]]}
+    sheets_svc.spreadsheets().values().update(
+        spreadsheetId=SHEETS_ID_LEADS,
+        range=rng,
+        valueInputOption="USER_ENTERED",
+        body=body,
+    ).execute()
 
 
 def _safe_update_row_cells(
@@ -2550,6 +2589,9 @@ def ext_auto_send_one():
         if not AUTO_SEND_TOKEN or token != AUTO_SEND_TOKEN:
             return jsonify({"ok": False, "error": "unauthorized"}), 401
 
+        if _is_campaign_paused():
+            return jsonify({"ok": True, "sent": False, "reason": "paused_by_boardroom"}), 200
+
         body = request.get_json(force=True, silent=True) or {}
         template_name = str(body.get("template", "")).strip()
         if not template_name:
@@ -2610,6 +2652,40 @@ def ext_auto_send_one():
     except Exception as exc:
         log.exception("❌ Error en /ext/auto-send-one")
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/ext/boardroom/instruct", methods=["POST"])
+def boardroom_instruct():
+    """CF-4: recibe instrucciones de Boardroom. Alcance minimo: kill switch
+    de la campana outbound (pause_outbound/resume_outbound). Reusa
+    BUS_INTERNAL_TOKEN -- ya es el secreto compartido entre Boardroom y este
+    servicio, evita provisionar uno nuevo."""
+    token = (request.headers.get("X-Internal-Token") or "").strip()
+    if not BUS_INTERNAL_TOKEN or token != BUS_INTERNAL_TOKEN:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    instruction = str(body.get("instruction", "") or "").strip()
+
+    if instruction == "pause_outbound":
+        try:
+            _set_campaign_paused(True)
+        except Exception as exc:
+            log.exception("❌ Error aplicando pause_outbound")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        log.warning("⏸️ Campana outbound pausada por Boardroom")
+        return jsonify({"ok": True, "instruction": instruction, "paused": True}), 200
+
+    if instruction == "resume_outbound":
+        try:
+            _set_campaign_paused(False)
+        except Exception as exc:
+            log.exception("❌ Error aplicando resume_outbound")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        log.warning("▶️ Campana outbound reanudada por Boardroom")
+        return jsonify({"ok": True, "instruction": instruction, "paused": False}), 200
+
+    return jsonify({"ok": False, "error": f"instruction desconocida: {instruction}"}), 400
 
 
 if __name__ == "__main__":
