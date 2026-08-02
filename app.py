@@ -86,6 +86,14 @@ AUTO_SEND_TOKEN = os.getenv("AUTO_SEND_TOKEN", "").strip()
 CAMPAIGN_PAUSE_CELL = "AA1"
 CAMPAIGN_PAUSED_VALUE = "PAUSED"
 
+# Disparo automatico del kill switch: N envios fallidos seguidos pausan la
+# campana solos, sin esperar a que alguien llame /ext/boardroom/instruct a
+# mano. Contador en memoria (no en Sheets): si el servicio reinicia entre
+# fallos, el peor caso es tardar unos ciclos mas en detectar la racha, no
+# perder la pausa ya activa (esa si vive en Sheets, ver arriba).
+CAMPAIGN_FAILURE_THRESHOLD = int(os.getenv("CAMPAIGN_FAILURE_THRESHOLD", "3"))
+_consecutive_send_failures = 0
+
 PORT = int(os.getenv("PORT", "5000"))
 
 logging.basicConfig(
@@ -546,6 +554,49 @@ def _set_campaign_paused(paused: bool) -> None:
         valueInputOption="USER_ENTERED",
         body=body,
     ).execute()
+
+
+def _register_send_result(ok: bool) -> bool:
+    """
+    Lleva la cuenta de envios fallidos consecutivos de la campana outbound.
+
+    Un exito resetea el contador. Al llegar a CAMPAIGN_FAILURE_THRESHOLD
+    fallos seguidos, pausa la campana sola (mismo kill switch que
+    /ext/boardroom/instruct) y notifica a Boardroom por el bus para que
+    quede en el Ledger -- Boardroom gobierna, debe enterarse aunque la
+    pausa la ejecute vicky-bot localmente por velocidad/confiabilidad.
+
+    Devuelve True solo en el ciclo donde se dispara la pausa (para loguear
+    y para que el caller pueda reflejarlo en la respuesta del endpoint).
+    """
+    global _consecutive_send_failures
+
+    if ok:
+        _consecutive_send_failures = 0
+        return False
+
+    _consecutive_send_failures += 1
+    if _consecutive_send_failures < CAMPAIGN_FAILURE_THRESHOLD:
+        return False
+
+    _consecutive_send_failures = 0
+    try:
+        _set_campaign_paused(True)
+    except Exception:
+        log.exception("❌ No se pudo aplicar auto-pausa tras racha de fallos")
+        return False
+
+    log.warning(
+        "⏸️ Campana outbound auto-pausada: %s envios fallidos seguidos",
+        CAMPAIGN_FAILURE_THRESHOLD,
+    )
+    _emit_bus_event(
+        "system",
+        f"Campana outbound auto-pausada tras {CAMPAIGN_FAILURE_THRESHOLD} envios fallidos seguidos",
+        event_type="campaign_auto_paused",
+        metadata={"threshold": CAMPAIGN_FAILURE_THRESHOLD, "source": "vicky_secom"},
+    )
+    return True
 
 
 def _safe_update_row_cells(
@@ -2635,11 +2686,13 @@ def ext_auto_send_one():
             except Exception:
                 pass
 
+        auto_paused = _register_send_result(ok)
+
         now_iso = _utc_now_iso()
         estatus_val = "FALLO_ENVIO" if not ok else _status_for_template(template_name)
         _update_row_cells(nxt["row_number"], {"ESTATUS": estatus_val, "LAST_MESSAGE_AT": now_iso}, headers)
 
-        return jsonify({
+        response = {
             "ok": True,
             "sent": bool(ok),
             "to": to,
@@ -2647,7 +2700,10 @@ def ext_auto_send_one():
             "nombre": nombre,
             "template": template_name,
             "timestamp": now_iso,
-        }), 200
+        }
+        if auto_paused:
+            response["auto_paused"] = True
+        return jsonify(response), 200
 
     except Exception as exc:
         log.exception("❌ Error en /ext/auto-send-one")
