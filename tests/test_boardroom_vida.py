@@ -112,11 +112,28 @@ def test_vida_start_attempts_sheet_update_with_product(no_external_io):
 
 
 def test_boardroom_reply_handled_before_local_router():
-    response = Mock(status_code=200, text='{"ok": true}')
-    response.json.return_value = {"ok": True, "handled": True, "reply": "Respuesta Boardroom"}
-    with patch.object(vicky, "BOARDROOM_ENABLED", True), \
-         patch.object(vicky, "BOARDROOM_DECISION_URL", "https://boardroom.example.com"), \
-         patch.object(vicky, "BOARDROOM_AUTH_TOKEN", "super-secret-token"), \
+    # NOTA (SECOM-AUTH-FIX-1): esta fixture mockeaba BOARDROOM_DECISION_URL/
+    # BOARDROOM_AUTH_TOKEN, variables del mecanismo legacy send_to_boardroom,
+    # que la ruta real del authority gate (_request_boardroom_instruction)
+    # nunca lee -- lee BUS_URL/BUS_INTERNAL_TOKEN. Con la fixture original,
+    # _request_boardroom_instruction retornaba de inmediato con
+    # "bus_disabled_or_empty" sin llamar nunca a requests.post, y la
+    # aserción nunca ejercitaba el camino "Boardroom respondió con una
+    # decisión útil". Corregido para mockear las variables reales y un
+    # body con status:ok (DOC-0043 regla 4), preservando la intención
+    # original del test: una decisión útil de Boardroom se entrega al
+    # cliente y el router local NO se toca. Pasa igual con el flag en
+    # false o true -- el camino HANDLED no cambió con este fix.
+    response = Mock(status_code=200, text='{"status": "ok"}')
+    response.json.return_value = {
+        "status": "ok",
+        "instruction_id": "instr-1",
+        "event_id": "evt-1",
+        "instruction": {"type": "send_message", "message": "Respuesta Boardroom"},
+    }
+    with patch.object(vicky, "BUS_URL", "https://boardroom.example.com"), \
+         patch.object(vicky, "BUS_INTERNAL_TOKEN", "super-secret-token"), \
+         patch.object(vicky, "_BUS_ACTIVE", True), \
          patch.object(vicky.requests, "post", return_value=response), \
          patch.object(vicky, "send_message", return_value=True) as send_message, \
          patch.object(vicky, "_route_command") as route, \
@@ -131,9 +148,17 @@ def test_boardroom_reply_handled_before_local_router():
 
 @pytest.mark.parametrize("side_effect", [requests.exceptions.Timeout(), Exception("boom")])
 def test_boardroom_failure_falls_back_local_and_webhook_200(side_effect):
-    with patch.object(vicky, "BOARDROOM_ENABLED", True), \
-         patch.object(vicky, "BOARDROOM_DECISION_URL", "https://boardroom.example.com"), \
-         patch.object(vicky, "BOARDROOM_AUTH_TOKEN", "super-secret-token"), \
+    # NOTA (SECOM-AUTH-FIX-1): misma correccion de fixture que el test
+    # anterior (BUS_URL/BUS_INTERNAL_TOKEN reales en vez de las variables
+    # legacy) + SECOM_LOCAL_FALLBACK_ENABLED=true, requisito para que un
+    # fallo tecnico de Boardroom (FAILED, DOC-0043 regla 4) habilite
+    # TECHNICAL_FALLBACK local en vez del mensaje neutral generico. Con el
+    # flag en false (legacy) esto sigue enviando el mensaje neutral -- ver
+    # test_legacy_mode_unchanged_when_flag_false en test_secom_auth_fix.py.
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True), \
+         patch.object(vicky, "BUS_URL", "https://boardroom.example.com"), \
+         patch.object(vicky, "BUS_INTERNAL_TOKEN", "super-secret-token"), \
+         patch.object(vicky, "_BUS_ACTIVE", True), \
          patch.object(vicky.requests, "post", side_effect=side_effect), \
          patch.object(vicky, "send_message", return_value=True) as send_message, \
          patch.object(vicky, "match_client_in_sheets", return_value=None), \
@@ -146,6 +171,9 @@ def test_boardroom_failure_falls_back_local_and_webhook_200(side_effect):
 
 
 def test_basic_routes_imss_auto_tpv_empresarial_are_preserved(no_external_io):
+    # NOTA (SECOM-AUTH-FIX-1): el paso "tpv" via /webhook requiere
+    # SECOM_LOCAL_FALLBACK_ENABLED=true -- sin el flag, el gate legacy
+    # intercepta antes de _route_command y "tpv" nunca arranca el funnel.
     send_message, _ = no_external_io
 
     vicky._route_command(PHONE, "imss", None)
@@ -156,7 +184,8 @@ def test_basic_routes_imss_auto_tpv_empresarial_are_preserved(no_external_io):
     assert vicky.user_state[PHONE] == "auto_intro"
 
     vicky.user_state[PHONE] = "__greeted__"
-    rv = vicky.app.test_client().post("/webhook", json=_payload("tpv"))
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("tpv"))
     assert rv.status_code == 200
     assert vicky.user_state[PHONE] == "tpv_giro"
 
