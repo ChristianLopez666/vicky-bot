@@ -112,6 +112,28 @@ def test_invalid_flag_value_treated_as_false(monkeypatch, raw_value):
     importlib.reload(vicky)
 
 
+def test_flag_is_import_time_not_dynamic(monkeypatch):
+    """FEATURE_FLAG_LIFECYCLE = IMPORT_TIME (finding 2, auditoria
+    independiente de PR #4): cambiar el env var DESPUES de que el modulo
+    ya fue importado no cambia la constante ya cargada en memoria del
+    proceso -- hace falta reload (equivalente a restart/redeploy del
+    proceso real). El rollback operativo (SECOM_LOCAL_FALLBACK_ENABLED=false)
+    solo toma efecto cuando el proceso vuelve a cargar el env var."""
+    import importlib
+    monkeypatch.delenv("SECOM_LOCAL_FALLBACK_ENABLED", raising=False)
+    importlib.reload(vicky)
+    assert vicky.SECOM_LOCAL_FALLBACK_ENABLED is False
+
+    monkeypatch.setenv("SECOM_LOCAL_FALLBACK_ENABLED", "true")
+    assert vicky.SECOM_LOCAL_FALLBACK_ENABLED is False  # sin reload, sin cambio
+
+    importlib.reload(vicky)
+    assert vicky.SECOM_LOCAL_FALLBACK_ENABLED is True  # con reload, si cambia
+
+    monkeypatch.delenv("SECOM_LOCAL_FALLBACK_ENABLED", raising=False)
+    importlib.reload(vicky)  # restaurar estado de modulo para el resto de la suite
+
+
 def test_legacy_mode_status_fallback_still_executes_as_handled(no_external_io, bus_configured):
     """Documenta el bug original: en modo legacy (flag=false), un
     status:fallback se ejecuta igual que un status:ok -- exactamente lo
@@ -190,6 +212,139 @@ def test_fix_mode_status_ok_takes_precedence_over_local_routing(no_external_io, 
     assert rv.status_code == 200
     send_message.assert_called_once_with(PHONE, "Decision real de Boardroom")
     assert PHONE not in vicky.user_state  # imss_start jamas se ejecuto
+
+
+# ==========================
+# Finding 1 (auditoria independiente PR #4): status:ok NO implica HANDLED
+# por si solo -- la instruction debe ser semanticamente ejecutable.
+# ==========================
+
+def test_ok_send_message_with_valid_message_is_handled(no_external_io, bus_configured):
+    send_message, _ = no_external_io
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True), \
+         patch.object(vicky.requests, "post", return_value=_ok_response("Decision real")):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("imss"))
+
+    assert rv.status_code == 200
+    send_message.assert_called_once_with(PHONE, "Decision real")
+    assert PHONE not in vicky.user_state
+
+
+def test_ok_send_message_missing_message_is_not_handled_as_success(no_external_io, bus_configured):
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True), \
+         patch.object(vicky.requests, "post", return_value=_ok_response(message="")):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("imss"))
+
+    assert rv.status_code == 200
+    # cae a TECHNICAL_FALLBACK local (imss_start), NO se trata como HANDLED
+    assert vicky.user_state[PHONE] == "imss_beneficios"
+
+
+def test_ok_send_message_whitespace_only_is_not_handled_as_success(no_external_io, bus_configured):
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True), \
+         patch.object(vicky.requests, "post", return_value=_ok_response(message="   ")):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("imss"))
+
+    assert rv.status_code == 200
+    assert vicky.user_state[PHONE] == "imss_beneficios"
+
+
+def test_ok_ask_question_missing_content_is_not_handled_as_success(no_external_io, bus_configured):
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True), \
+         patch.object(vicky.requests, "post", return_value=_ok_response(message="", instruction_type="ask_question")):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("vida"))
+
+    assert rv.status_code == 200
+    assert vicky.user_state[PHONE] == "vida_edad"
+
+
+def test_ok_send_options_empty_options_and_message_is_not_handled_as_success(no_external_io, bus_configured):
+    resp = Mock(status_code=200, text='{"status": "ok"}')
+    resp.json.return_value = {
+        "status": "ok",
+        "instruction_id": "i-opts",
+        "instruction": {"type": "send_options", "message": "", "options": []},
+        "advisor_notification": {"required": False},
+    }
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True), \
+         patch.object(vicky.requests, "post", return_value=resp):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("imss"))
+
+    assert rv.status_code == 200
+    assert vicky.user_state[PHONE] == "imss_beneficios"
+
+
+def test_ok_send_options_with_valid_labeled_options_is_handled(no_external_io, bus_configured):
+    send_message, _ = no_external_io
+    resp = Mock(status_code=200, text='{"status": "ok"}')
+    resp.json.return_value = {
+        "status": "ok",
+        "instruction_id": "i-opts-2",
+        "instruction": {
+            "type": "send_options",
+            "message": "",
+            "options": [{"label": "Opción A"}, {"label": "Opción B"}],
+        },
+        "advisor_notification": {"required": False},
+    }
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True), \
+         patch.object(vicky.requests, "post", return_value=resp):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("imss"))
+
+    assert rv.status_code == 200
+    send_message.assert_called_once()
+    assert "Opción A" in send_message.call_args.args[1]
+    assert PHONE not in vicky.user_state
+
+
+def test_ok_notify_advisor_missing_message_is_not_handled_and_does_not_notify(no_external_io, bus_configured):
+    _, notify = no_external_io
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True), \
+         patch.object(
+             vicky.requests, "post",
+             return_value=_ok_response(message="", instruction_type="notify_advisor"),
+         ):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("imss"))
+
+    assert rv.status_code == 200
+    assert vicky.user_state[PHONE] == "imss_beneficios"
+    # instruction invalida nunca llega a ejecutarse -- el asesor no debe
+    # notificarse con una instruccion vacia.
+    notify.assert_not_called()
+
+
+def test_status_error_with_otherwise_valid_message_is_failed(no_external_io, bus_configured):
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True), \
+         patch.object(vicky.requests, "post", return_value=_error_response()):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("imss"))
+
+    assert rv.status_code == 200
+    assert vicky.user_state[PHONE] == "imss_beneficios"
+
+
+def test_semantically_invalid_ok_triggers_local_fallback_exactly_once(no_external_io, bus_configured):
+    vicky.user_state[PHONE] = "__greeted__"  # aisla del saludo a contacto nuevo
+    send_message, _ = no_external_io
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True), \
+         patch.object(vicky.requests, "post", return_value=_ok_response(message="")):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("imss"))
+
+    assert rv.status_code == 200
+    assert send_message.call_count == 1  # la pregunta de imss_start, nada mas
+
+
+def test_semantically_invalid_ok_never_executes_boardroom_instruction(no_external_io, bus_configured):
+    send_message, _ = no_external_io
+    # Si el ok invalido se ejecutara igual, send_message recibiria el
+    # NEUTRAL_FALLBACK_MESSAGE (comportamiento pre-remediacion). Debe
+    # recibir en cambio la pregunta real de imss_start.
+    with patch.object(vicky, "SECOM_LOCAL_FALLBACK_ENABLED", True), \
+         patch.object(vicky.requests, "post", return_value=_ok_response(message="")):
+        rv = vicky.app.test_client().post("/webhook", json=_payload("imss"))
+
+    assert rv.status_code == 200
+    sent_texts = [call.args[1] for call in send_message.call_args_list]
+    assert vicky.NEUTRAL_FALLBACK_MESSAGE not in sent_texts
 
 
 # ==========================

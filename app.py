@@ -1307,25 +1307,60 @@ def _handle_boardroom_authority(
     return True
 
 
+def _is_boardroom_instruction_executable(body: Dict[str, Any]) -> bool:
+    """Valida que la instruccion de un body `status: ok` sea semanticamente
+    ejecutable, no solo formalmente valida. _parse_boardroom_instruction ya
+    garantiza que `instruction` es un dict y que `instruction.type` esta en
+    _BOARDROOM_ALLOWED_INSTRUCTIONS -- eso no basta: un `send_message` sin
+    `message` es una forma valida pero una decision vacia (hallazgo de
+    auditoria independiente sobre PR #4). Evalua unicamente el campo
+    `instruction`; `advisor_notification` es un efecto secundario que
+    acompana a una decision ya valida, nunca justifica por si solo tratar
+    una instruction invalida como ejecutable (DOC-0043 no le da ese rol).
+    """
+    instruction = body.get("instruction")
+    if not isinstance(instruction, dict):
+        return False
+    instruction_type = instruction.get("type")
+
+    if instruction_type == "no_action":
+        # Ejecutable sin payload por diseno: Boardroom decide deliberadamente
+        # no actuar, eso es en si mismo una decision util (DOC-0043 regla 4).
+        return True
+
+    if instruction_type in (
+        "send_message", "ask_question", "send_options", "request_document",
+        "notify_advisor", "handoff",
+    ):
+        # _instruction_message ya combina message + labels de send_options --
+        # cubre ambos casos (mensaje vacio con opciones validas, o mensaje
+        # presente) con una sola verificacion de contenido no vacio.
+        return bool(_instruction_message(instruction).strip())
+
+    return False
+
+
 def _classify_boardroom_outcome(body: Optional[Dict[str, Any]]) -> str:
     """HANDLED / NOT_HANDLED / FAILED segun DOC-0043 (hydra-source-of-truth,
     01_GOVERNANCE/DOC-0043-secom-boardroom-authority-boundary.md, regla 4):
-    `status: ok` es la unica senal de que Boardroom tomo una decision util.
-    `status: fallback` y `status: error` nunca autorizan tratar el turno
-    como manejado, sin importar que instruction traigan -- un HTTP 200 no
-    es sinonimo de decision util. body=None cubre fallo de transporte o de
-    parseo (timeout, 4xx/5xx, JSON invalido, instruction invalida).
-    _parse_boardroom_instruction ya garantiza, cuando body no es None, que
-    status esta en {ok, fallback, error} y que instruction.type esta en
-    _BOARDROOM_ALLOWED_INSTRUCTIONS -- no se revalida aqui.
+    `status: ok` NO es por si solo sinonimo de decision util -- ademas debe
+    traer una instruccion semanticamente ejecutable
+    (_is_boardroom_instruction_executable). `status: fallback` y
+    `status: error` nunca autorizan tratar el turno como manejado, sin
+    importar que instruction traigan -- un HTTP 200 no es sinonimo de
+    decision util. Un `status: ok` con instruccion no ejecutable se
+    clasifica FAILED, no NOT_HANDLED: Boardroom si respondio con
+    autoridad, pero la respuesta fue defectuosa, no una ausencia de
+    decision. body=None cubre fallo de transporte o de parseo (timeout,
+    4xx/5xx, JSON invalido, instruction invalida en forma).
     """
     if not isinstance(body, dict):
         return "FAILED"
     status = body.get("status")
-    if status == "ok":
-        return "HANDLED"
     if status == "fallback":
         return "NOT_HANDLED"
+    if status == "ok":
+        return "HANDLED" if _is_boardroom_instruction_executable(body) else "FAILED"
     return "FAILED"
 
 
