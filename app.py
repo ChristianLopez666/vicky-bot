@@ -63,6 +63,13 @@ BUS_INTERNAL_TOKEN = os.getenv("BUS_INTERNAL_TOKEN", "").strip()
 _BUS_ACTIVE = os.getenv("BUS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 BOARDROOM_IS_AUTHORITY = True
 NEUTRAL_FALLBACK_MESSAGE = "Recibí tu mensaje. En un momento te atiendo."
+# SECOM-AUTH-FIX-1 (DOC-0043, hydra-source-of-truth): default false = modo
+# legacy sin cambios de comportamiento. true = Boardroom deja de bloquear
+# funnels deterministas ya iniciados y el resultado de Boardroom se
+# clasifica por `status` en vez de tratarse siempre como manejado.
+SECOM_LOCAL_FALLBACK_ENABLED = os.getenv("SECOM_LOCAL_FALLBACK_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 _BOARDROOM_ALLOWED_INSTRUCTIONS = {
     "send_message",
     "ask_question",
@@ -1300,6 +1307,267 @@ def _handle_boardroom_authority(
     return True
 
 
+def _is_boardroom_instruction_executable(body: Dict[str, Any]) -> bool:
+    """Valida que la instruccion de un body `status: ok` sea semanticamente
+    ejecutable, no solo formalmente valida. _parse_boardroom_instruction ya
+    garantiza que `instruction` es un dict y que `instruction.type` esta en
+    _BOARDROOM_ALLOWED_INSTRUCTIONS -- eso no basta: un `send_message` sin
+    `message` es una forma valida pero una decision vacia (hallazgo de
+    auditoria independiente sobre PR #4). Evalua unicamente el campo
+    `instruction`; `advisor_notification` es un efecto secundario que
+    acompana a una decision ya valida, nunca justifica por si solo tratar
+    una instruction invalida como ejecutable (DOC-0043 no le da ese rol).
+    """
+    instruction = body.get("instruction")
+    if not isinstance(instruction, dict):
+        return False
+    instruction_type = instruction.get("type")
+
+    if instruction_type == "no_action":
+        # Ejecutable sin payload por diseno: Boardroom decide deliberadamente
+        # no actuar, eso es en si mismo una decision util (DOC-0043 regla 4).
+        return True
+
+    if instruction_type in (
+        "send_message", "ask_question", "send_options", "request_document",
+        "notify_advisor", "handoff",
+    ):
+        # _instruction_message ya combina message + labels de send_options --
+        # cubre ambos casos (mensaje vacio con opciones validas, o mensaje
+        # presente) con una sola verificacion de contenido no vacio.
+        return bool(_instruction_message(instruction).strip())
+
+    return False
+
+
+def _classify_boardroom_outcome(body: Optional[Dict[str, Any]]) -> str:
+    """HANDLED / NOT_HANDLED / FAILED segun DOC-0043 (hydra-source-of-truth,
+    01_GOVERNANCE/DOC-0043-secom-boardroom-authority-boundary.md, regla 4):
+    `status: ok` NO es por si solo sinonimo de decision util -- ademas debe
+    traer una instruccion semanticamente ejecutable
+    (_is_boardroom_instruction_executable). `status: fallback` y
+    `status: error` nunca autorizan tratar el turno como manejado, sin
+    importar que instruction traigan -- un HTTP 200 no es sinonimo de
+    decision util. Un `status: ok` con instruccion no ejecutable se
+    clasifica FAILED, no NOT_HANDLED: Boardroom si respondio con
+    autoridad, pero la respuesta fue defectuosa, no una ausencia de
+    decision. body=None cubre fallo de transporte o de parseo (timeout,
+    4xx/5xx, JSON invalido, instruction invalida en forma).
+    """
+    if not isinstance(body, dict):
+        return "FAILED"
+    status = body.get("status")
+    if status == "fallback":
+        return "NOT_HANDLED"
+    if status == "ok":
+        return "HANDLED" if _is_boardroom_instruction_executable(body) else "FAILED"
+    return "FAILED"
+
+
+def _consult_boardroom(
+    phone: str,
+    msg: Dict[str, Any],
+    match: Optional[Dict[str, Any]],
+    mtype: str,
+    text: str,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """Consulta sincrona a Boardroom (REQUEST_FOR_DECISION) y clasifica el
+    resultado. Usada solo para turnos sin funnel activo -- DOC-0043 regla 3
+    reserva la ejecucion local sin consulta previa exclusivamente a un
+    funnel ya iniciado."""
+    payload = _build_boardroom_event(phone, text, msg, mtype, match)
+    body, error = _request_boardroom_instruction(payload)
+    outcome = _classify_boardroom_outcome(body)
+    log.info(
+        "🧭 boardroom_outcome phone_last4=%s outcome=%s error=%s",
+        phone[-4:], outcome, error,
+    )
+    return outcome, body
+
+
+def _execute_handled_boardroom_instruction(phone: str, body: Dict[str, Any]) -> None:
+    """Ejecuta una instruccion de Boardroom ya clasificada como HANDLED. Si
+    el envio falla, usa el mensaje neutral (no una decision comercial local
+    nueva) -- Boardroom ya decidio, solo fallo la entrega."""
+    executed, delivery_status, exec_error = _execute_boardroom_instruction(phone, body)
+    _confirm_boardroom_execution(body, executed, delivery_status, exec_error)
+    if not executed:
+        _send_neutral_fallback(phone)
+
+
+def _stateless_text_fallback(
+    phone: str,
+    text: str,
+    match: Optional[Dict[str, Any]],
+    idle: bool,
+    last10: str,
+) -> None:
+    """TECHNICAL_FALLBACK (DOC-0043 regla 4) para un turno de texto sin
+    funnel activo, cuando Boardroom no produjo una decision util o fallo.
+    Restaura, detras de SECOM_LOCAL_FALLBACK_ENABLED, la logica
+    deterministica preexistente que vivia en este mismo lugar de
+    webhook_receive antes de CP-08a: respuesta a plantilla ("info"),
+    contexto de alianza/auto/tpv, saludo, keywords de TPV, interpretacion
+    de "no", heuristica de interes/duda, y _route_command como catch-all
+    final. Deliberadamente NO incluye: (a) el mecanismo legacy
+    send_to_boardroom/execute_boardroom_decision -- es una integracion
+    Boardroom distinta a /bus/event, consultarla aqui violaria "un solo
+    response owner por turno"; (b) el fallback GPT "sgpt:" -- genera
+    respuesta persuasiva libre no guionada, exactamente lo que DOC-0043
+    clasifica como COMMERCIAL_DECISION, no TECHNICAL_FALLBACK.
+    """
+    t_norm_info = text.strip().lower()
+    if t_norm_info in ("info", "informacion", "información", "mas info", "más info"):
+        last_tpl = ""
+        st = user_state.get(phone, "")
+        if st.startswith("awaiting_info:"):
+            last_tpl = st.split(":", 1)[1].strip()
+        if not last_tpl:
+            last_tpl = get_last_envio_template(last10)
+        if last_tpl in ("tpv_3", "promo_tpv", TPV_TEMPLATE_NAME):
+            user_state[phone] = "tpv_giro"
+            try:
+                _notify_advisor(
+                    "🧾 Respuesta a plantilla (TPV)\n"
+                    f"Template: {last_tpl}\n"
+                    f"WhatsApp: {phone}\n"
+                    f"Nombre: {_match_name(match) or '(sin nombre)'}\n"
+                    f"Mensaje: {text}"
+                )
+            except Exception:
+                pass
+            send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+            return
+
+    if idle and match:
+        intent_handled = False
+        if _auto_is_context(match) and _explicit_non_auto_intent(text):
+            log.info("🔀 Escape de flujo AUTO por intención explícita: %s", text)
+        else:
+            if _alianza_is_context(match):
+                if _handle_alianza_context_response(phone, text, match):
+                    intent_handled = True
+            if intent_handled:
+                return
+
+            if _auto_is_context(match):
+                if _handle_auto_context_response(phone, text, match):
+                    intent_handled = True
+            if intent_handled:
+                return
+
+        if _tpv_is_context(match):
+            if tpv_start_from_reply(phone, text, match):
+                intent_handled = True
+        if intent_handled:
+            return
+
+    if idle:
+        t_norm = text.strip().lower()
+        greet_words = {
+            "hola", "buenas", "buenos dias", "buenos días", "buen dia", "buen día",
+            "buenas tardes", "buenas noches", "hey", "que tal", "qué tal", "holi",
+        }
+        if t_norm in greet_words:
+            base = "Dime qué necesitas y con gusto te guío para ayudarte a encontrar el servicio que necesitas."
+            nombre = _match_name(match)
+            send_message(phone, f"Hola {nombre} 👋 {base}" if nombre else f"Hola 👋 {base}")
+            user_state[phone] = "__greeted__"
+            return
+
+        tpv_keywords = (
+            "tpv", "terminal", "terminales", "punto de venta", "punto-de-venta",
+            "cobrar con tarjeta", "cobro con tarjeta", "pagar con tarjeta",
+            "ligas de pago", "link de pago", "link pago", "cobro a distancia",
+        )
+        if any(k in t_norm for k in tpv_keywords):
+            user_state[phone] = "tpv_giro"
+            _notify_advisor(
+                "🧠 Interés detectado (TPV)\n"
+                f"WhatsApp: {phone}\n"
+                f"Nombre: {_match_name(match) or '(sin nombre)'}\n"
+                f"Mensaje: {text}"
+            )
+            send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+            return
+
+    if idle and interpret_response(text) == "negative":
+        send_message(phone, "Gracias por tu respuesta. Quedo a tus órdenes para cualquier duda o si más adelante deseas revisarlo.")
+        user_state[phone] = "__greeted__"
+        send_main_menu(phone)
+        return
+
+    t_lower = text.lower().strip()
+    valid_commands = {
+        "1", "2", "3", "4", "5", "6", "7",
+        "menu", "menú", "inicio", "hola",
+        "imss", "ley 73", "prestamo", "préstamo", "pension", "pensión",
+        "auto", "seguro auto", "seguros de auto",
+        "vida", "salud", "seguro de vida", "seguro de salud",
+        "vrim", "tarjeta medica", "tarjeta médica",
+        "empresarial", "pyme", "credito", "crédito", "credito empresarial", "crédito empresarial",
+        "financiamiento", "financiamiento practico", "financiamiento práctico",
+        "contactar", "asesor", "contactar con christian",
+    }
+    if not t_lower.isdigit() and t_lower not in valid_commands and idle:
+        _notify_advisor(
+            "📩 Cliente INTERESADO / DUDA detectada\n"
+            f"WhatsApp: {phone}\n"
+            f"Mensaje: {text}"
+        )
+
+    if phone not in user_state:
+        user_state[phone] = "__greeted__"
+        if not match:
+            _greet_and_match(phone)
+
+    _route_command(phone, text, match)
+
+
+def _emit_boardroom_observation(
+    phone: str,
+    msg: Dict[str, Any],
+    match: Optional[Dict[str, Any]],
+    mtype: str,
+    text: str,
+) -> None:
+    """OBSERVATION_EVENT fire-and-forget hacia /bus/event para turnos que
+    Vicky ya resolvio localmente (DETERMINISTIC_EXECUTION dentro de un
+    funnel activo, DOC-0043 regla 3) -- Boardroom/Rodys siguen recibiendo
+    el evento, pero Vicky no espera ni actua sobre la respuesta. Reutiliza
+    el mismo payload canonico (_build_boardroom_event) y el mismo endpoint
+    (_bus_event_url) que _request_boardroom_instruction: mismo contrato de
+    /bus/event, sin endpoint nuevo. No reutiliza _emit_bus_event porque ese
+    helper postea a BUS_URL sin el sufijo /bus/event y con un payload de
+    forma distinta (legacy) -- evita el riesgo de apuntar a la ruta
+    equivocada dependiendo de como este configurado BUS_URL.
+    """
+    if not _BUS_ACTIVE or not BUS_URL or not BUS_INTERNAL_TOKEN:
+        return
+    payload = _build_boardroom_event(phone, text, msg, mtype, match)
+
+    def _post() -> None:
+        try:
+            requests.post(
+                _bus_event_url(),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {BUS_INTERNAL_TOKEN}",
+                    "X-Source-System": "vicky",
+                    "X-Event-Type": "inbound_message",
+                },
+                timeout=3,
+            )
+        except Exception as exc:
+            log.warning(
+                "Boardroom observation emit fallido phone_last4=%s error=%s: %s",
+                phone[-4:], type(exc).__name__, str(exc),
+            )
+
+    threading.Thread(target=_post, daemon=True).start()
+
+
 def _extract_boardroom_decision(decision: Any) -> Dict[str, Any]:
     if not isinstance(decision, dict):
         return {}
@@ -2231,8 +2499,30 @@ def webhook_receive():
                 pass
 
             _ensure_user(phone)["last_message"] = text
+
+            if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
+                # ACTIVE_DETERMINISTIC_FUNNEL_TURN (DOC-0043 regla 3): continua
+                # localmente sin bloquear en Boardroom por cada paso.
+                _emit_boardroom_observation(phone, msg, match, mtype, text)
+                _route_command(phone, text, match)
+                return jsonify({"ok": True}), 200
+
+            if SECOM_LOCAL_FALLBACK_ENABLED and st_now.startswith("awaiting_info:"):
+                _emit_boardroom_observation(phone, msg, match, mtype, text)
+                if _handle_awaiting_template_response(phone, text, match):
+                    return jsonify({"ok": True}), 200
+                _stateless_text_fallback(phone, text, match, idle, last10)
+                return jsonify({"ok": True}), 200
+
             if BOARDROOM_IS_AUTHORITY:
-                _handle_boardroom_authority(phone, msg, match, mtype, text)
+                if SECOM_LOCAL_FALLBACK_ENABLED:
+                    outcome, body = _consult_boardroom(phone, msg, match, mtype, text)
+                    if outcome == "HANDLED":
+                        _execute_handled_boardroom_instruction(phone, body)
+                    else:
+                        _stateless_text_fallback(phone, text, match, idle, last10)
+                else:
+                    _handle_boardroom_authority(phone, msg, match, mtype, text)
                 return jsonify({"ok": True}), 200
 
             # HOTFIX 2: si hay estado activo local, NO entra Boardroom ni interceptores globales.
@@ -2385,8 +2675,21 @@ def webhook_receive():
 
         if mtype in {"image", "document", "audio", "video"}:
             log.info("📎 Multimedia recibida de %s: %s", phone, mtype)
+
+            if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
+                _emit_boardroom_observation(phone, msg, match, mtype, _message_text(msg, mtype))
+                _handle_media(phone, msg)
+                return jsonify({"ok": True}), 200
+
             if BOARDROOM_IS_AUTHORITY:
-                _handle_boardroom_authority(phone, msg, match, mtype, _message_text(msg, mtype))
+                if SECOM_LOCAL_FALLBACK_ENABLED:
+                    outcome, body = _consult_boardroom(phone, msg, match, mtype, _message_text(msg, mtype))
+                    if outcome == "HANDLED":
+                        _execute_handled_boardroom_instruction(phone, body)
+                    else:
+                        _handle_media(phone, msg)
+                else:
+                    _handle_boardroom_authority(phone, msg, match, mtype, _message_text(msg, mtype))
                 return jsonify({"ok": True}), 200
             _handle_media(phone, msg)
             return jsonify({"ok": True}), 200
@@ -2400,8 +2703,21 @@ def webhook_receive():
                     append_respuesta_cliente(phone, _match_name(match), button_text, _utc_now_iso())
                 except Exception:
                     pass
+
+                if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
+                    _emit_boardroom_observation(phone, msg, match, mtype, button_text)
+                    _route_command(phone, button_text, match)
+                    return jsonify({"ok": True}), 200
+
                 if BOARDROOM_IS_AUTHORITY:
-                    _handle_boardroom_authority(phone, msg, match, mtype, button_text)
+                    if SECOM_LOCAL_FALLBACK_ENABLED:
+                        outcome, body = _consult_boardroom(phone, msg, match, mtype, button_text)
+                        if outcome == "HANDLED":
+                            _execute_handled_boardroom_instruction(phone, body)
+                        elif not _handle_awaiting_template_response(phone, button_text, match):
+                            _route_command(phone, button_text, match)
+                    else:
+                        _handle_boardroom_authority(phone, msg, match, mtype, button_text)
                     return jsonify({"ok": True}), 200
                 if _handle_awaiting_template_response(phone, button_text, match):
                     return jsonify({"ok": True}), 200
@@ -2409,7 +2725,15 @@ def webhook_receive():
             return jsonify({"ok": True}), 200
 
         if BOARDROOM_IS_AUTHORITY:
-            _handle_boardroom_authority(phone, msg, match, mtype or "unknown", "")
+            if SECOM_LOCAL_FALLBACK_ENABLED:
+                outcome, body = _consult_boardroom(phone, msg, match, mtype or "unknown", "")
+                if outcome == "HANDLED":
+                    _execute_handled_boardroom_instruction(phone, body)
+                # NOT_HANDLED/FAILED: sin accion local segura definida para
+                # tipos de mensaje desconocidos -- se responde 200 sin enviar
+                # nada, igual que el log "tipo no manejado" de mas abajo.
+            else:
+                _handle_boardroom_authority(phone, msg, match, mtype or "unknown", "")
             return jsonify({"ok": True}), 200
 
         log.info("ℹ️ Tipo de mensaje no manejado: %s", mtype)
