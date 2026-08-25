@@ -179,17 +179,27 @@ TEMPLATE_IMAGE_ENV = {
     "vida_temporal": "VIDA_TEMPORAL_IMAGE_URL",
 }
 
-# Plantillas Meta cuyo body exige parametros de texto que /ext/auto-send-one
-# no recibe hoy del cron (solo manda template + image_url). Cada entrada
-# declara, en orden, de que campo del lead se toma cada {{n}} del body.
-# Detectado via error real de Meta 132000 en seguro_auto_70 ("number of
-# localizable_params (0) does not match the expected number of params (1)").
-# Generico y extensible: agregar una plantilla nueva aqui no requiere tocar
-# el endpoint. Una plantilla sin entrada aqui sigue sin params, igual que
-# hoy (ej. promo_vrim_prestamo, que Meta aprobo sin parametros de body).
-TEMPLATE_BODY_PARAMS: Dict[str, List[str]] = {
-    "seguro_auto_70": ["nombre"],
-}
+_META_MISSING_BODY_PARAMS_RE = re.compile(
+    r"expected number of params \((\d+)\)"
+)
+
+
+def _expected_body_param_count(meta_error_response_text: str) -> Optional[int]:
+    """Si Meta rechazo un envio de plantilla por error 132000 (cantidad de
+    localizable_params del body no coincide con lo aprobado), devuelve
+    cuantos parametros espera realmente esa plantilla segun el propio
+    mensaje de error de Meta -- para poder reintentar sin tener que
+    mantener a mano una lista de que plantilla necesita cuantos params."""
+    try:
+        data = json.loads(meta_error_response_text)
+    except Exception:
+        return None
+    error = (data or {}).get("error") or {}
+    if error.get("code") != 132000:
+        return None
+    details = str((error.get("error_data") or {}).get("details", ""))
+    match = _META_MISSING_BODY_PARAMS_RE.search(details)
+    return int(match.group(1)) if match else None
 
 TEMPLATE_INTEREST_WORDS = {
     "si",
@@ -370,6 +380,7 @@ def send_template_message(
     params: Dict[str, Any] | List[Any] | None = None,
     image_url: Optional[str] = None,
     components: Optional[List[Dict[str, Any]]] = None,
+    fallback_param_text: Optional[str] = None,
 ) -> bool:
     """Envía plantilla Meta aprobada.
 
@@ -378,6 +389,12 @@ def send_template_message(
     - params es opcional; si no viene, NO se mandan parámetros de body.
     - image_url es opcional; si viene, se manda como header image.
     - components permite enviar componentes Meta completos cuando la plantilla lo requiera.
+    - fallback_param_text: si Meta rechaza el envío por error 132000 (la
+      plantilla espera N parámetros de body y se mandaron menos/más), se
+      reintenta UNA vez rellenando el body con este texto repetido N veces
+      -- N sale del propio mensaje de error de Meta, no de una lista fija
+      por plantilla, así que aplica a cualquier plantilla, no solo a la que
+      se haya visto fallar antes.
     """
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
@@ -442,6 +459,8 @@ def send_template_message(
         },
     }
 
+    healed_body_params = False
+
     for attempt in range(3):
         try:
             log.info("📤 Enviando plantilla '%s' a %s (intento %s)", template_name, to, attempt + 1)
@@ -461,6 +480,33 @@ def send_template_message(
                     pass
                 log.info("✅ Plantilla '%s' enviada exitosamente a %s", template_name, to)
                 return True
+
+            if resp.status_code == 400 and not healed_body_params and fallback_param_text:
+                expected_n = _expected_body_param_count(resp.text)
+                if expected_n is not None:
+                    healed_body_params = True
+                    template_components = [
+                        c for c in payload["template"].get("components", [])
+                        if c.get("type") != "body"
+                    ]
+                    if expected_n > 0:
+                        template_components.append({
+                            "type": "body",
+                            "parameters": [
+                                {"type": "text", "text": fallback_param_text}
+                                for _ in range(expected_n)
+                            ],
+                        })
+                    if template_components:
+                        payload["template"]["components"] = template_components
+                    else:
+                        payload["template"].pop("components", None)
+                    log.warning(
+                        "🔧 Meta espera %s parámetro(s) de body para '%s' que no se mandaron; "
+                        "reintentando con '%s'.",
+                        expected_n, template_name, fallback_param_text,
+                    )
+                    continue
 
             log.warning("⚠️ WPP send_template falló %s: %s", resp.status_code, resp.text[:500])
             if _should_retry(resp.status_code) and attempt < 2:
@@ -2997,16 +3043,7 @@ def ext_auto_send_one():
 
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
-        if "params" in body:
-            params = body.get("params")
-        else:
-            required_fields = TEMPLATE_BODY_PARAMS.get(template_name)
-            lead_field_values = {"nombre": nombre}
-            params = (
-                [lead_field_values.get(f, "") for f in required_fields]
-                if required_fields
-                else None
-            )
+        params = body.get("params") if "params" in body else None
         image_url = str(body.get("image_url") or body.get("header_image_url") or "").strip() or None
         components = body.get("components") if isinstance(body.get("components"), list) else None
 
@@ -3019,6 +3056,7 @@ def ext_auto_send_one():
             params=params,
             image_url=image_url,
             components=components,
+            fallback_param_text=nombre,
         )
 
         if ok:
