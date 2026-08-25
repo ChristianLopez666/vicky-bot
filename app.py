@@ -201,6 +201,25 @@ def _expected_body_param_count(meta_error_response_text: str) -> Optional[int]:
     match = _META_MISSING_BODY_PARAMS_RE.search(details)
     return int(match.group(1)) if match else None
 
+
+def _needs_named_body_params(meta_error_response_text: str) -> bool:
+    """Algunas plantillas Meta exigen 'parameter_name' explicito en cada
+    parametro de body (error 100, "Parameter name is missing or empty")
+    aunque la plantilla se haya escrito con variables posicionales {{n}}.
+    No hay forma de adivinar el nombre real sin consultar la plantilla
+    aprobada en Meta Business Manager, pero para plantillas posicionales
+    el propio Meta acepta el numero de posicion como texto -- de ahi el
+    reintento en send_template_message()."""
+    try:
+        data = json.loads(meta_error_response_text)
+    except Exception:
+        return False
+    error = (data or {}).get("error") or {}
+    if error.get("code") != 100:
+        return False
+    details = str((error.get("error_data") or {}).get("details", "")).lower()
+    return "parameter name" in details and ("missing" in details or "empty" in details)
+
 TEMPLATE_INTEREST_WORDS = {
     "si",
     "sí",
@@ -460,6 +479,7 @@ def send_template_message(
     }
 
     healed_body_params = False
+    healed_param_names = False
 
     for attempt in range(3):
         try:
@@ -481,30 +501,53 @@ def send_template_message(
                 log.info("✅ Plantilla '%s' enviada exitosamente a %s", template_name, to)
                 return True
 
-            if resp.status_code == 400 and not healed_body_params and fallback_param_text:
-                expected_n = _expected_body_param_count(resp.text)
-                if expected_n is not None:
-                    healed_body_params = True
-                    template_components = [
-                        c for c in payload["template"].get("components", [])
-                        if c.get("type") != "body"
-                    ]
-                    if expected_n > 0:
-                        template_components.append({
-                            "type": "body",
-                            "parameters": [
-                                {"type": "text", "text": fallback_param_text}
-                                for _ in range(expected_n)
-                            ],
-                        })
-                    if template_components:
-                        payload["template"]["components"] = template_components
-                    else:
-                        payload["template"].pop("components", None)
+            if resp.status_code == 400:
+                if not healed_body_params and fallback_param_text:
+                    expected_n = _expected_body_param_count(resp.text)
+                    if expected_n is not None:
+                        healed_body_params = True
+                        template_components = [
+                            c for c in payload["template"].get("components", [])
+                            if c.get("type") != "body"
+                        ]
+                        if expected_n > 0:
+                            template_components.append({
+                                "type": "body",
+                                "parameters": [
+                                    {"type": "text", "text": fallback_param_text}
+                                    for _ in range(expected_n)
+                                ],
+                            })
+                        if template_components:
+                            payload["template"]["components"] = template_components
+                        else:
+                            payload["template"].pop("components", None)
+                        log.warning(
+                            "🔧 Meta espera %s parámetro(s) de body para '%s' que no se mandaron; "
+                            "reintentando con '%s'.",
+                            expected_n, template_name, fallback_param_text,
+                        )
+                        continue
+
+                if not healed_param_names and _needs_named_body_params(resp.text):
+                    healed_param_names = True
+                    fixed_components = []
+                    for c in payload["template"].get("components", []):
+                        if c.get("type") == "body":
+                            c = {
+                                **c,
+                                "parameters": [
+                                    {**p, "parameter_name": p.get("parameter_name") or str(i)}
+                                    for i, p in enumerate(c.get("parameters", []), start=1)
+                                ],
+                            }
+                        fixed_components.append(c)
+                    if fixed_components:
+                        payload["template"]["components"] = fixed_components
                     log.warning(
-                        "🔧 Meta espera %s parámetro(s) de body para '%s' que no se mandaron; "
-                        "reintentando con '%s'.",
-                        expected_n, template_name, fallback_param_text,
+                        "🔧 Meta exige 'parameter_name' explícito en el body de '%s'; "
+                        "reintentando con nombres posicionales.",
+                        template_name,
                     )
                     continue
 
