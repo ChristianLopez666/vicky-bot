@@ -179,6 +179,18 @@ TEMPLATE_IMAGE_ENV = {
     "vida_temporal": "VIDA_TEMPORAL_IMAGE_URL",
 }
 
+# Plantillas Meta cuyo body exige parametros de texto que /ext/auto-send-one
+# no recibe hoy del cron (solo manda template + image_url). Cada entrada
+# declara, en orden, de que campo del lead se toma cada {{n}} del body.
+# Detectado via error real de Meta 132000 en seguro_auto_70 ("number of
+# localizable_params (0) does not match the expected number of params (1)").
+# Generico y extensible: agregar una plantilla nueva aqui no requiere tocar
+# el endpoint. Una plantilla sin entrada aqui sigue sin params, igual que
+# hoy (ej. promo_vrim_prestamo, que Meta aprobo sin parametros de body).
+TEMPLATE_BODY_PARAMS: Dict[str, List[str]] = {
+    "seguro_auto_70": ["nombre"],
+}
+
 TEMPLATE_INTEREST_WORDS = {
     "si",
     "sí",
@@ -2985,7 +2997,16 @@ def ext_auto_send_one():
 
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
-        params = body.get("params") if "params" in body else None
+        if "params" in body:
+            params = body.get("params")
+        else:
+            required_fields = TEMPLATE_BODY_PARAMS.get(template_name)
+            lead_field_values = {"nombre": nombre}
+            params = (
+                [lead_field_values.get(f, "") for f in required_fields]
+                if required_fields
+                else None
+            )
         image_url = str(body.get("image_url") or body.get("header_image_url") or "").strip() or None
         components = body.get("components") if isinstance(body.get("components"), list) else None
 
