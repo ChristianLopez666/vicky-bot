@@ -179,46 +179,17 @@ TEMPLATE_IMAGE_ENV = {
     "vida_temporal": "VIDA_TEMPORAL_IMAGE_URL",
 }
 
-_META_MISSING_BODY_PARAMS_RE = re.compile(
-    r"expected number of params \((\d+)\)"
-)
+# Idioma por defecto de las plantillas aprobadas en Meta. El cron puede
+# sobrescribirlo por campana con el campo "language"; no se mantiene un
+# idioma por plantilla dentro del codigo.
+DEFAULT_TEMPLATE_LANGUAGE = "es_MX"
 
+# Formato permitido para el codigo de idioma (es_MX, en, pt_BR, ...).
+_LANGUAGE_CODE_RE = re.compile(r"^[a-zA-Z]{2,3}(_[a-zA-Z]{2,4})?$")
 
-def _expected_body_param_count(meta_error_response_text: str) -> Optional[int]:
-    """Si Meta rechazo un envio de plantilla por error 132000 (cantidad de
-    localizable_params del body no coincide con lo aprobado), devuelve
-    cuantos parametros espera realmente esa plantilla segun el propio
-    mensaje de error de Meta -- para poder reintentar sin tener que
-    mantener a mano una lista de que plantilla necesita cuantos params."""
-    try:
-        data = json.loads(meta_error_response_text)
-    except Exception:
-        return None
-    error = (data or {}).get("error") or {}
-    if error.get("code") != 132000:
-        return None
-    details = str((error.get("error_data") or {}).get("details", ""))
-    match = _META_MISSING_BODY_PARAMS_RE.search(details)
-    return int(match.group(1)) if match else None
+# Formato permitido para success_status: solo mayusculas, digitos y "_".
+_SUCCESS_STATUS_RE = re.compile(r"^[A-Z0-9_]{1,64}$")
 
-
-def _needs_named_body_params(meta_error_response_text: str) -> bool:
-    """Algunas plantillas Meta exigen 'parameter_name' explicito en cada
-    parametro de body (error 100, "Parameter name is missing or empty")
-    aunque la plantilla se haya escrito con variables posicionales {{n}}.
-    No hay forma de adivinar el nombre real sin consultar la plantilla
-    aprobada en Meta Business Manager, pero para plantillas posicionales
-    el propio Meta acepta el numero de posicion como texto -- de ahi el
-    reintento en send_template_message()."""
-    try:
-        data = json.loads(meta_error_response_text)
-    except Exception:
-        return False
-    error = (data or {}).get("error") or {}
-    if error.get("code") != 100:
-        return False
-    details = str((error.get("error_data") or {}).get("details", "")).lower()
-    return "parameter name" in details and ("missing" in details or "empty" in details)
 
 TEMPLATE_INTEREST_WORDS = {
     "si",
@@ -399,21 +370,22 @@ def send_template_message(
     params: Dict[str, Any] | List[Any] | None = None,
     image_url: Optional[str] = None,
     components: Optional[List[Dict[str, Any]]] = None,
-    fallback_param_text: Optional[str] = None,
+    language: str = DEFAULT_TEMPLATE_LANGUAGE,
 ) -> bool:
     """Envía plantilla Meta aprobada.
 
     Reglas:
     - template_name siempre es obligatorio.
     - params es opcional; si no viene, NO se mandan parámetros de body.
+      dict => parámetros nombrados (parameter_name), para plantillas con
+      variables tipo {{nombre}}. list => parámetros posicionales.
     - image_url es opcional; si viene, se manda como header image.
     - components permite enviar componentes Meta completos cuando la plantilla lo requiera.
-    - fallback_param_text: si Meta rechaza el envío por error 132000 (la
-      plantilla espera N parámetros de body y se mandaron menos/más), se
-      reintenta UNA vez rellenando el body con este texto repetido N veces
-      -- N sale del propio mensaje de error de Meta, no de una lista fija
-      por plantilla, así que aplica a cualquier plantilla, no solo a la que
-      se haya visto fallar antes.
+    - language es el código de idioma de la plantilla aprobada en Meta.
+
+    Un rechazo de Meta NO se "auto-repara" reintentando con un payload
+    distinto: la estructura de cada plantilla la declara quien llama
+    (el cron), no se deduce de los mensajes de error.
     """
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
@@ -473,13 +445,10 @@ def send_template_message(
         "type": "template",
         "template": {
             "name": template_name,
-            "language": {"code": "es_MX"},
+            "language": {"code": language},
             **({"components": built_components} if built_components else {}),
         },
     }
-
-    healed_body_params = False
-    healed_param_names = False
 
     for attempt in range(3):
         try:
@@ -500,56 +469,6 @@ def send_template_message(
                     pass
                 log.info("✅ Plantilla '%s' enviada exitosamente a %s", template_name, to)
                 return True
-
-            if resp.status_code == 400:
-                if not healed_body_params and fallback_param_text:
-                    expected_n = _expected_body_param_count(resp.text)
-                    if expected_n is not None:
-                        healed_body_params = True
-                        template_components = [
-                            c for c in payload["template"].get("components", [])
-                            if c.get("type") != "body"
-                        ]
-                        if expected_n > 0:
-                            template_components.append({
-                                "type": "body",
-                                "parameters": [
-                                    {"type": "text", "text": fallback_param_text}
-                                    for _ in range(expected_n)
-                                ],
-                            })
-                        if template_components:
-                            payload["template"]["components"] = template_components
-                        else:
-                            payload["template"].pop("components", None)
-                        log.warning(
-                            "🔧 Meta espera %s parámetro(s) de body para '%s' que no se mandaron; "
-                            "reintentando con '%s'.",
-                            expected_n, template_name, fallback_param_text,
-                        )
-                        continue
-
-                if not healed_param_names and _needs_named_body_params(resp.text):
-                    healed_param_names = True
-                    fixed_components = []
-                    for c in payload["template"].get("components", []):
-                        if c.get("type") == "body":
-                            c = {
-                                **c,
-                                "parameters": [
-                                    {**p, "parameter_name": p.get("parameter_name") or str(i)}
-                                    for i, p in enumerate(c.get("parameters", []), start=1)
-                                ],
-                            }
-                        fixed_components.append(c)
-                    if fixed_components:
-                        payload["template"]["components"] = fixed_components
-                    log.warning(
-                        "🔧 Meta exige 'parameter_name' explícito en el body de '%s'; "
-                        "reintentando con nombres posicionales.",
-                        template_name,
-                    )
-                    continue
 
             log.warning("⚠️ WPP send_template falló %s: %s", resp.status_code, resp.text[:500])
             if _should_retry(resp.status_code) and attempt < 2:
@@ -3029,6 +2948,67 @@ def _status_for_template(template_name: str) -> str:
         return "ENVIADO_VRIM"
     return "ENVIADO_TEMPLATE"
 
+class ParamsFromRowError(ValueError):
+    """params_from_row apunta a una columna que no existe o esta vacia."""
+
+
+def _resolve_params_from_row(
+    params_from_row: Any,
+    headers: List[str],
+    row: List[str],
+) -> Dict[str, str] | List[str]:
+    """Traduce la declaracion del cron en los parametros de body reales,
+    leyendolos de la fila del lead ya seleccionada.
+
+    - dict  {"nombre": "Nombre"}  -> {"nombre": "<valor de columna Nombre>"}
+      (parametro nombrado: la clave es el nombre aprobado en Meta)
+    - list  ["Nombre", "Monto"]   -> ["<Nombre>", "<Monto>"]
+      (parametros posicionales, en el orden de la lista)
+
+    No conoce ninguna plantilla: que parametros necesita cada campana lo
+    declara el cron. Si una columna no existe o su valor esta vacio,
+    levanta ParamsFromRowError para que el caller aborte ANTES de llamar
+    a Meta y sin tocar la fila.
+    """
+    def _value_for(column_name: str, param_label: str) -> str:
+        column_name = str(column_name).strip()
+        if not column_name:
+            raise ParamsFromRowError(
+                f"params_from_row: columna vacia para el parametro '{param_label}'"
+            )
+        j = _idx(headers, column_name)
+        if j is None:
+            raise ParamsFromRowError(
+                f"params_from_row: no existe la columna '{column_name}' "
+                f"(parametro '{param_label}')"
+            )
+        value = _cell(row, j).strip()
+        if not value:
+            raise ParamsFromRowError(
+                f"params_from_row: la columna '{column_name}' esta vacia "
+                f"(parametro '{param_label}')"
+            )
+        return value
+
+    if isinstance(params_from_row, dict):
+        if not params_from_row:
+            raise ParamsFromRowError("params_from_row: objeto vacio")
+        return {
+            str(param_name): _value_for(column_name, str(param_name))
+            for param_name, column_name in params_from_row.items()
+        }
+
+    if isinstance(params_from_row, list):
+        if not params_from_row:
+            raise ParamsFromRowError("params_from_row: lista vacia")
+        return [
+            _value_for(column_name, f"posicion {i}")
+            for i, column_name in enumerate(params_from_row, start=1)
+        ]
+
+    raise ParamsFromRowError("params_from_row debe ser objeto o lista")
+
+
 def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Dict[str, Any]]:
     i_name = _idx(headers, "Nombre")
     i_wa = _idx(headers, "WhatsApp")
@@ -3052,7 +3032,10 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
             continue
 
         nombre = _cell(row, i_name).strip()
-        return {"row_number": row_number, "nombre": nombre, "whatsapp": wa}
+        # "row" se expone para poder resolver params_from_row contra las
+        # columnas de esta misma fila. Las reglas de elegibilidad de arriba
+        # no cambian.
+        return {"row_number": row_number, "nombre": nombre, "whatsapp": wa, "row": row}
 
     return None
 
@@ -3076,6 +3059,41 @@ def ext_auto_send_one():
                 "reason": "template_required_for_business_initiated_message",
             }), 400
 
+        # Configuracion de campana: la declara el cron, no el codigo. Aqui no
+        # hay ninguna lista de plantillas conocidas -- una campana nueva solo
+        # cambia el comando del cron.
+        has_params = "params" in body
+        has_params_from_row = "params_from_row" in body
+        components = body.get("components") if isinstance(body.get("components"), list) else None
+
+        if body.get("components") is not None and components is None:
+            return jsonify({"ok": False, "error": "components debe ser una lista"}), 400
+
+        if has_params and has_params_from_row:
+            return jsonify({
+                "ok": False,
+                "error": "params y params_from_row son mutuamente excluyentes",
+            }), 400
+
+        if components is not None and (has_params or has_params_from_row):
+            return jsonify({
+                "ok": False,
+                "error": "components no puede combinarse con params ni params_from_row",
+            }), 400
+
+        language = str(body.get("language") or DEFAULT_TEMPLATE_LANGUAGE).strip()
+        if not _LANGUAGE_CODE_RE.match(language):
+            return jsonify({"ok": False, "error": f"language inválido: {language}"}), 400
+
+        success_status = body.get("success_status")
+        if success_status is not None:
+            success_status = str(success_status).strip()
+            if not _SUCCESS_STATUS_RE.match(success_status):
+                return jsonify({
+                    "ok": False,
+                    "error": "success_status inválido: solo A-Z, 0-9 y guion bajo",
+                }), 400
+
         headers, rows = _sheet_get_rows()
         if not headers:
             return jsonify({"ok": False, "error": "Sheet vacío"}), 400
@@ -3086,12 +3104,26 @@ def ext_auto_send_one():
 
         to = _normalize_to_e164_mx(nxt["whatsapp"])
         nombre = (nxt["nombre"] or "").strip() or "Cliente"
-        params = body.get("params") if "params" in body else None
         image_url = str(body.get("image_url") or body.get("header_image_url") or "").strip() or None
-        components = body.get("components") if isinstance(body.get("components"), list) else None
 
-        if body.get("components") is not None and components is None:
-            return jsonify({"ok": False, "error": "components debe ser una lista"}), 400
+        params = None
+        if has_params:
+            params = body.get("params")
+        elif has_params_from_row:
+            # Un dato faltante aborta ANTES de llamar a Meta y sin tocar la fila.
+            try:
+                params = _resolve_params_from_row(
+                    body.get("params_from_row"), headers, nxt.get("row") or []
+                )
+            except ParamsFromRowError as exc:
+                log.warning("⚠️ params_from_row inválido para '%s': %s", template_name, exc)
+                return jsonify({
+                    "ok": False,
+                    "sent": False,
+                    "error": str(exc),
+                    "row": nxt["row_number"],
+                    "template": template_name,
+                }), 400
 
         ok = send_template_message(
             to,
@@ -3099,7 +3131,7 @@ def ext_auto_send_one():
             params=params,
             image_url=image_url,
             components=components,
-            fallback_param_text=nombre,
+            language=language,
         )
 
         if ok:
@@ -3115,7 +3147,10 @@ def ext_auto_send_one():
         auto_paused = _register_send_result(ok)
 
         now_iso = _utc_now_iso()
-        estatus_val = "FALLO_ENVIO" if not ok else _status_for_template(template_name)
+        if not ok:
+            estatus_val = "FALLO_ENVIO"
+        else:
+            estatus_val = success_status or _status_for_template(template_name)
         _update_row_cells(nxt["row_number"], {"ESTATUS": estatus_val, "LAST_MESSAGE_AT": now_iso}, headers)
 
         response = {
