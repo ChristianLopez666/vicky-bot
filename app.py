@@ -693,7 +693,16 @@ def _is_campaign_paused() -> bool:
         ).execute()
         values = result.get("values", [])
         cell = (values[0][0] if values and values[0] else "").strip().upper()
-        return cell == CAMPAIGN_PAUSED_VALUE
+        pausada = cell == CAMPAIGN_PAUSED_VALUE
+        # Sin esta linea el kill switch es una caja negra: devuelve False sin
+        # decir que leyo, asi que un "no se pausa" no se puede distinguir de
+        # un "leyo otra celda". Con campana viva hay que poder auditarlo en
+        # caliente, sin desplegar de nuevo.
+        log.info(
+            "kill switch CF-4: rango=%s crudo=%r normalizado=%r pausada=%s",
+            rng, values, cell, pausada,
+        )
+        return pausada
     except Exception:
         log.exception("❌ Error leyendo kill switch de campana (CF-4); fail-open")
         return False
