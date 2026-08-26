@@ -234,3 +234,22 @@ def test_set_campaign_paused_writes_to_control_tab():
     kwargs = fake_update.call_args.kwargs
     assert kwargs["range"] == "CONTROL!A2"
     assert kwargs["body"]["values"] == [["PAUSED"]]
+
+
+def test_ensure_tab_pide_una_cuadricula_explicita_y_pequena():
+    """Regresion: con el tamano por defecto (1000x26) addSheet daba HTTP 400
+    porque el libro ya roza el tope de 10 millones de celdas de Google."""
+    fake_ss = Mock()
+    fake_ss.return_value.get.return_value.execute.return_value = {"sheets": []}
+    with (
+        patch.object(vicky, "sheets_svc", Mock(spreadsheets=fake_ss)),
+        patch.object(vicky, "SHEETS_ID_LEADS", "sheet-id"),
+    ):
+        vicky._ensure_tab("CONTROL", ["A", "B"], filas=10)
+
+    props = (fake_ss.return_value.batchUpdate.call_args.kwargs["body"]
+             ["requests"][0]["addSheet"]["properties"])
+    grid = props["gridProperties"]
+    assert grid["rowCount"] == 10
+    assert grid["columnCount"] == 2
+    assert grid["rowCount"] * grid["columnCount"] < 26000

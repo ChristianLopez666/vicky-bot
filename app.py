@@ -578,11 +578,17 @@ def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: 
     sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
 
 
-def _ensure_tab(title: str, header: list) -> None:
+def _ensure_tab(title: str, header: list, filas: int = 500) -> None:
     """Crea la pestana `title` si falta y escribe su encabezado.
 
     Mismo criterio que _sheets_ensure_tab() del bot de Redes: la hoja se
     prepara sola en vez de depender de que alguien la haya armado a mano.
+
+    La cuadricula se pide EXPLICITA y pequena. Por defecto Sheets crea cada
+    pestana con 1000x26 = 26.000 celdas, y este libro ya esta rozando el
+    tope de 10.000.000 de celdas por libro que impone Google: con el tamano
+    por defecto, addSheet respondia HTTP 400 ("would increase the number of
+    cells in the workbook above the limit") y la pestana no se creaba nunca.
     """
     meta = sheets_svc.spreadsheets().get(
         spreadsheetId=SHEETS_ID_LEADS, fields="sheets.properties.title"
@@ -596,7 +602,13 @@ def _ensure_tab(title: str, header: list) -> None:
 
     sheets_svc.spreadsheets().batchUpdate(
         spreadsheetId=SHEETS_ID_LEADS,
-        body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
+        body={"requests": [{"addSheet": {"properties": {
+            "title": title,
+            "gridProperties": {
+                "rowCount": max(int(filas), 2),
+                "columnCount": max(len(header), 1),
+            },
+        }}}]},
     ).execute()
     if header:
         ultima = chr(ord("A") + len(header) - 1)
@@ -619,7 +631,8 @@ def _ensure_control_tab() -> None:
     global _control_tab_ready
     if _control_tab_ready:
         return
-    _ensure_tab(CAMPAIGN_CONTROL_TAB, _CAMPAIGN_CONTROL_HEADER)
+    # 10x2 = 20 celdas: el interruptor no crece nunca.
+    _ensure_tab(CAMPAIGN_CONTROL_TAB, _CAMPAIGN_CONTROL_HEADER, filas=10)
     _control_tab_ready = True
 
 
@@ -628,7 +641,8 @@ def _ensure_conversaciones_tab() -> None:
     global _conversaciones_tab_ready
     if _conversaciones_tab_ready:
         return
-    _ensure_tab(CONVERSACIONES_TAB, _CONVERSACIONES_HEADER)
+    # Bitacora que si crece; Sheets la extiende sola al hacer append.
+    _ensure_tab(CONVERSACIONES_TAB, _CONVERSACIONES_HEADER, filas=500)
     _conversaciones_tab_ready = True
 
 
