@@ -110,6 +110,16 @@ _CAMPAIGN_CONTROL_HEADER = [
 # pero no hace falta pagar una lectura de metadatos cada 5 minutos.
 _control_tab_ready = False
 
+# Bitacora de avisos al asesor. El monitor de correos (Apps Script) no puede
+# ver WhatsApp: solo sabe leer hojas de calculo. Sin esta pestana un aviso
+# llega al telefono del asesor y a ningun otro lado -- ese es el motivo real
+# de que Redes mande correos de prospecto y SECOM no. El encabezado replica
+# el de la pestana CONVERSACIONES de Redes para que el monitor pueda leer
+# ambas fuentes con la misma logica.
+CONVERSACIONES_TAB = os.getenv("SHEETS_TITLE_CONVERSACIONES", "CONVERSACIONES").strip()
+_CONVERSACIONES_HEADER = ["Phone", "Nombre", "Mensaje", "Fecha", "Tipo", "Origen"]
+_conversaciones_tab_ready = False
+
 # Disparo automatico del kill switch: N envios fallidos seguidos pausan la
 # campana solos, sin esperar a que alguien llame /ext/boardroom/instruct a
 # mano. Contador en memoria (no en Sheets): si el servicio reinicia entre
@@ -568,6 +578,37 @@ def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: 
     sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
 
 
+def _ensure_tab(title: str, header: list) -> None:
+    """Crea la pestana `title` si falta y escribe su encabezado.
+
+    Mismo criterio que _sheets_ensure_tab() del bot de Redes: la hoja se
+    prepara sola en vez de depender de que alguien la haya armado a mano.
+    """
+    meta = sheets_svc.spreadsheets().get(
+        spreadsheetId=SHEETS_ID_LEADS, fields="sheets.properties.title"
+    ).execute()
+    existentes = {
+        (hoja.get("properties") or {}).get("title")
+        for hoja in (meta.get("sheets") or [])
+    }
+    if title in existentes:
+        return
+
+    sheets_svc.spreadsheets().batchUpdate(
+        spreadsheetId=SHEETS_ID_LEADS,
+        body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
+    ).execute()
+    if header:
+        ultima = chr(ord("A") + len(header) - 1)
+        sheets_svc.spreadsheets().values().update(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range=f"{title}!A1:{ultima}1",
+            valueInputOption="RAW",
+            body={"values": [header]},
+        ).execute()
+    log.info("✅ Pestana '%s' creada en la hoja de leads", title)
+
+
 def _ensure_control_tab() -> None:
     """Crea la pestana de control del kill switch si no existe.
 
@@ -578,31 +619,52 @@ def _ensure_control_tab() -> None:
     global _control_tab_ready
     if _control_tab_ready:
         return
-
-    meta = sheets_svc.spreadsheets().get(
-        spreadsheetId=SHEETS_ID_LEADS, fields="sheets.properties.title"
-    ).execute()
-    existentes = {
-        (hoja.get("properties") or {}).get("title")
-        for hoja in (meta.get("sheets") or [])
-    }
-
-    if CAMPAIGN_CONTROL_TAB not in existentes:
-        sheets_svc.spreadsheets().batchUpdate(
-            spreadsheetId=SHEETS_ID_LEADS,
-            body={"requests": [
-                {"addSheet": {"properties": {"title": CAMPAIGN_CONTROL_TAB}}}
-            ]},
-        ).execute()
-        sheets_svc.spreadsheets().values().update(
-            spreadsheetId=SHEETS_ID_LEADS,
-            range=f"{CAMPAIGN_CONTROL_TAB}!A1:B1",
-            valueInputOption="RAW",
-            body={"values": [_CAMPAIGN_CONTROL_HEADER]},
-        ).execute()
-        log.info("✅ Pestana de control '%s' creada", CAMPAIGN_CONTROL_TAB)
-
+    _ensure_tab(CAMPAIGN_CONTROL_TAB, _CAMPAIGN_CONTROL_HEADER)
     _control_tab_ready = True
+
+
+def _ensure_conversaciones_tab() -> None:
+    """Crea la bitacora de avisos al asesor si no existe."""
+    global _conversaciones_tab_ready
+    if _conversaciones_tab_ready:
+        return
+    _ensure_tab(CONVERSACIONES_TAB, _CONVERSACIONES_HEADER)
+    _conversaciones_tab_ready = True
+
+
+def _log_conversacion(mensaje: str) -> None:
+    """Registra en Sheets cada aviso enviado al asesor.
+
+    Es el eslabon que le faltaba a SECOM: el monitor de correos solo lee
+    hojas, asi que un aviso que unicamente viaja por WhatsApp le resulta
+    invisible.
+
+    Sincrono a proposito. sheets_svc (httplib2) no es seguro entre hilos y
+    todo el resto del archivo lo usa desde el hilo de la peticion; se sigue
+    el patron ya probado en produccion (append_respuesta_cliente) en vez de
+    estrenar el primer acceso concurrente al cliente de Sheets. Nunca
+    propaga: un fallo de bitacora no puede tumbar un aviso.
+    """
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return
+    try:
+        _ensure_conversaciones_tab()
+        sheets_svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range=f"{CONVERSACIONES_TAB}!A:F",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[
+                re.sub("[^0-9]", "", str(ADVISOR_NUMBER or "")),
+                "Asesor",
+                str(mensaje or "")[:500],
+                _utc_now_iso(),
+                "saliente",
+                "asesor",
+            ]]},
+        ).execute()
+    except Exception:
+        log.exception("⚠️ No se pudo registrar el aviso al asesor en Sheets")
 
 
 def _is_campaign_paused() -> bool:
@@ -871,6 +933,10 @@ def _notify_advisor(text: str) -> None:
             send_message(ADVISOR_NUMBER, text)
     except Exception:
         log.exception("❌ Error notificando al asesor")
+    finally:
+        # En `finally` a proposito: si el envio por WhatsApp fallo, dejar
+        # rastro del aviso importa mas, no menos.
+        _log_conversacion(text)
 
 
 def _match_name(match: Optional[Dict[str, Any]]) -> str:
