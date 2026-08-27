@@ -175,11 +175,12 @@ def _webhook(text: str):
     return vicky.app.test_client().post("/webhook", json=payload)
 
 
-def test_si_el_cliente_agradece_el_recordatorio_ya_no_existe():
-    """Recorrido real: cierre -> "gracias" por /webhook -> cortesia. Despues de
-    eso NO puede quedar recordatorio armado: el cliente respondio, asi que "si
-    no responde en una hora" dejo de aplicar. La prueba anterior cancelaba el
-    recordatorio a mano y por eso no veia que la cortesia lo rearmaba."""
+def test_la_oferta_del_menu_tambien_lleva_recordatorio_a_la_hora():
+    """Recorrido real: cierre -> "gracias" por /webhook -> cortesia. Esa
+    cortesia termina con "escriba menu si requiere algun otro servicio": la
+    oferta queda abierta, asi que le corresponde la misma hora de espera. El
+    webhook cancela el recordatorio al entrar el mensaje; lo que se comprueba
+    es que la respuesta de Vicky lo vuelve a dejar armado."""
     with patch.object(vicky, "send_message", return_value=True) as send, \
          patch.object(vicky, "_notify_advisor"), \
          patch.object(vicky, "send_main_menu"), \
@@ -193,11 +194,34 @@ def test_si_el_cliente_agradece_el_recordatorio_ya_no_existe():
 
         assert rv.status_code == 200
         assert [c.args[1] for c in send.call_args_list] == [cc.cortesia_final("imss")]
-        assert vicky._cierre_ctx[PHONE]["nudge_due"] is None
+        assert vicky._cierre_ctx[PHONE]["nudge_due"] - time.time() > vicky.CIERRE_NUDGE_SECONDS - 60
+
+        # Y al vencer, se entrega.
+        send.reset_mock()
+        vicky._cierre_ctx[PHONE]["nudge_due"] = time.time() - 1
+        assert vicky.nudge_sweep_once() == 1
+        assert [c.args[1] for c in send.call_args_list] == [cc.NUDGE]
+
+
+def test_el_recordatorio_no_se_entrega_dos_veces_en_el_mismo_ciclo():
+    """Si el cliente se quedo callado, ya recibio "Quedo atenta..." y despues
+    escribe "gracias", la cortesia NO le vuelve a programar la misma frase."""
+    with patch.object(vicky, "send_message", return_value=True) as send, \
+         patch.object(vicky, "_notify_advisor"), \
+         patch.object(vicky, "send_main_menu"), \
+         patch.object(vicky, "match_client_in_sheets", return_value=None), \
+         patch.object(vicky, "append_respuesta_cliente"), \
+         patch.object(vicky, "CIERRE_NUDGE_SWEEPER", False):
+        _cerrar_imss(send)
+        vicky._cierre_ctx[PHONE]["nudge_due"] = time.time() - 1
+        assert vicky.nudge_sweep_once() == 1
 
         send.reset_mock()
+        _webhook("gracias")
+
+        assert [c.args[1] for c in send.call_args_list] == [cc.cortesia_final("imss")]
+        assert vicky._cierre_ctx[PHONE]["nudge_due"] is None
         assert vicky.nudge_sweep_once() == 0
-        send.assert_not_called()
 
 
 def test_si_el_cliente_responde_que_no_el_recordatorio_ya_no_existe():
@@ -305,7 +329,8 @@ def test_gracias_tras_el_cuestionario_vida_no_ofrece_tarifa_de_pensionado():
     enviados = [c.args[1] for c in send.call_args_list]
     assert enviados == [cc.cortesia_final("vida")]
     assert "por ser pensionado" not in enviados[0]
-    assert vicky._cierre_ctx[PHONE]["nudge_due"] is None
+    # La oferta del menu queda abierta: el recordatorio se reprograma.
+    assert vicky._cierre_ctx[PHONE]["nudge_due"] is not None
 
 
 # ── 5. Textos y clasificadores ────────────────────────────────────────────────

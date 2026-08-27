@@ -2205,11 +2205,15 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
 # con la invitacion al menu, un "no gracias" cierra agradeciendo el tiempo, y
 # si el cliente no responde en una hora se le manda una ultima linea.
 #
-# INVARIANTE: el recordatorio se arma en UN solo lugar por conversacion --
-# _cierre_registrar(), el cierre automatico del embudo -- y cualquier mensaje
-# entrante lo cancela (ver webhook_receive). Ninguna respuesta de Vicky a un
-# mensaje del cliente lo vuelve a armar: si el cliente contesto, ya respondio,
-# y "si no responde en una hora" dejo de aplicar.
+# REGLA: el recordatorio acompana a un mensaje de Vicky que deja algo ABIERTO
+# y sin contestar. Hoy son dos: el cierre del embudo y la cortesia, que
+# termina con la oferta "escriba menu si requiere algun otro servicio". La
+# despedida NO lo arma: ahi ya no queda nada pendiente.
+#
+# Cualquier mensaje entrante lo cancela (ver webhook_receive), y dentro de un
+# mismo ciclo se entrega UNA sola vez: si el cliente se quedo callado, recibio
+# la linea de cierre y despues escribio, la cortesia no le vuelve a programar
+# la misma frase. El ciclo lo abre _cierre_registrar().
 #
 # El recordatorio vive en memoria del proceso, igual que user_state: SECOM no
 # tiene Valkey, asi que un reinicio de Render lo pierde. Se pierde en silencio
@@ -2247,6 +2251,7 @@ def _cierre_registrar(phone: str, producto: str = "", acuse: bool = True) -> Non
             "cortesia_enviada": False,
             "despedido": False,
             "nudge_due": ahora + CIERRE_NUDGE_SECONDS,
+            "nudge_entregado": False,
         }
     _nudge_ensure_sweeper()
 
@@ -2257,6 +2262,20 @@ def _cierre_cancelar_nudge(phone: str) -> None:
         ctx = _cierre_ctx.get(phone)
         if ctx:
             ctx["nudge_due"] = None
+
+
+def _cierre_rearmar_nudge(phone: str) -> None:
+    """Vuelve a programar el recordatorio porque Vicky acaba de dejar otra
+    cosa abierta (la oferta del menu). No hace nada si el recordatorio de
+    este ciclo ya se entrego: la misma frase no se manda dos veces."""
+    ahora = time.time()
+    with _cierre_lock:
+        ctx = _cierre_ctx.get(phone)
+        if not ctx or ctx.get("nudge_entregado"):
+            return
+        ctx["ts"] = ahora
+        ctx["nudge_due"] = ahora + CIERRE_NUDGE_SECONDS
+    _nudge_ensure_sweeper()
 
 
 def _cierre_activo(phone: str) -> Optional[Dict[str, Any]]:
@@ -2292,6 +2311,10 @@ def _cierre_manejar_cortesia(phone: str, text: str) -> bool:
         if not ctx["cortesia_enviada"]:
             send_message(phone, cc.cortesia_final(ctx.get("producto")))
             ctx["cortesia_enviada"] = True
+            # La cortesia termina con "escriba menu si requiere algun otro
+            # servicio": esa oferta queda abierta, asi que le corresponde la
+            # misma hora de espera que al cierre del embudo.
+            _cierre_rearmar_nudge(phone)
         return True
 
     # Mensaje con contenido: el cliente retomo la conversacion y el contexto de
@@ -2330,6 +2353,12 @@ def nudge_sweep_once() -> int:
                 continue
             if send_message(phone, cc.NUDGE):
                 entregados += 1
+                # Marca de ciclo: una respuesta posterior de Vicky ya no
+                # reprograma esta misma frase.
+                with _cierre_lock:
+                    ctx = _cierre_ctx.get(phone)
+                    if ctx:
+                        ctx["nudge_entregado"] = True
         except Exception:
             log.exception("cierre_nudge_error phone=%s", phone)
     return entregados
