@@ -11,7 +11,6 @@ permissions:
 
 jobs:
   patch-and-verify:
-    if: github.event.head_commit.message == 'chore: apply SECOM webhook isolation hotfix'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,16 +34,15 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
-
           path = Path("app.py")
           src = path.read_text(encoding="utf-8")
           old = '''        entry = (payload.get("entry") or [{}])[0]\n        changes = (entry.get("changes") or [{}])[0]\n        value = changes.get("value", {})\n        messages = value.get("messages", [])\n        statuses = value.get("statuses", [])\n'''
-          new = '''        # Aislamiento por numero de WhatsApp: Meta entrega eventos a nivel WABA,\n        # por lo que este servicio puede recibir cambios de otros numeros de la\n        # misma cuenta. Solo SECOM debe producir efectos comerciales aqui.\n        local_values = []\n        for entry in payload.get("entry") or []:\n            for change in entry.get("changes") or []:\n                value = change.get("value") or {}\n                metadata = value.get("metadata") or {}\n                incoming_phone_id = str(metadata.get("phone_number_id") or "").strip()\n\n                if WABA_PHONE_ID:\n                    if incoming_phone_id and incoming_phone_id != WABA_PHONE_ID:\n                        log.info(\n                            "🧱 Webhook descartado por phone_number_id ajeno: recibido=%s esperado=%s",\n                            incoming_phone_id, WABA_PHONE_ID,\n                        )\n                        continue\n                else:\n                    # Fallback legacy: no se deja mudo el bot, pero produccion\n                    # queda explicitamente en ERROR hasta corregir el entorno.\n                    log.error(\n                        "❌ WABA_PHONE_ID no configurado: aislamiento webhook degradado; "\n                        "procesando evento en modo legacy"\n                    )\n\n                if not incoming_phone_id:\n                    log.warning(\n                        "⚠️ Webhook sin metadata.phone_number_id; procesando por compatibilidad"\n                    )\n\n                local_values.append(value)\n\n        if not local_values:\n            log.info(\n                "🧱 Webhook sin eventos propios de SECOM; HTTP 200 sin procesamiento comercial"\n            )\n            return jsonify({"ok": True}), 200\n\n        # Agrega todos los cambios propios del lote. El dispatcher historico\n        # procesa un mensaje por request; esta agregacion evita que un cambio\n        # ajeno en la primera posicion oculte el cambio propio.\n        messages = [\n            msg\n            for value in local_values\n            for msg in (value.get("messages") or [])\n        ]\n        statuses = [\n            st\n            for value in local_values\n            for st in (value.get("statuses") or [])\n        ]\n'''
-          if old not in src:
-              raise SystemExit("BLOQUE_OBJETIVO_NO_ENCONTRADO: abortando sin modificar app.py")
-          if "Webhook descartado por phone_number_id ajeno" in src:
-              raise SystemExit("GUARDIA_YA_EXISTE: abortando para no duplicar")
-          path.write_text(src.replace(old, new, 1), encoding="utf-8")
+          new = '''        # Aislamiento por numero de WhatsApp: Meta entrega eventos a nivel WABA,\n        # por lo que este servicio puede recibir cambios de otros numeros de la\n        # misma cuenta. Solo SECOM debe producir efectos comerciales aqui.\n        local_values = []\n        for entry in payload.get("entry") or []:\n            for change in entry.get("changes") or []:\n                value = change.get("value") or {}\n                metadata = value.get("metadata") or {}\n                incoming_phone_id = str(metadata.get("phone_number_id") or "").strip()\n\n                if WABA_PHONE_ID:\n                    if incoming_phone_id and incoming_phone_id != WABA_PHONE_ID:\n                        log.info(\n                            "🧱 Webhook descartado por phone_number_id ajeno: recibido=%s esperado=%s",\n                            incoming_phone_id, WABA_PHONE_ID,\n                        )\n                        continue\n                else:\n                    log.error(\n                        "❌ WABA_PHONE_ID no configurado: aislamiento webhook degradado; "\n                        "procesando evento en modo legacy"\n                    )\n\n                if not incoming_phone_id:\n                    log.warning(\n                        "⚠️ Webhook sin metadata.phone_number_id; procesando por compatibilidad"\n                    )\n\n                local_values.append(value)\n\n        if not local_values:\n            log.info(\n                "🧱 Webhook sin eventos propios de SECOM; HTTP 200 sin procesamiento comercial"\n            )\n            return jsonify({"ok": True}), 200\n\n        messages = [\n            msg\n            for value in local_values\n            for msg in (value.get("messages") or [])\n        ]\n        statuses = [\n            st\n            for value in local_values\n            for st in (value.get("statuses") or [])\n        ]\n'''
+          if "Webhook descartado por phone_number_id ajeno" not in src:
+              if old not in src:
+                  raise SystemExit("BLOQUE_OBJETIVO_NO_ENCONTRADO")
+              src = src.replace(old, new, 1)
+              path.write_text(src, encoding="utf-8")
           PY
 
       - name: Verificar sintaxis
@@ -58,53 +56,31 @@ jobs:
         run: |
           python - <<'PY'
           import app
-
           app.match_client_in_sheets = lambda *_: None
           app.BOARDROOM_IS_AUTHORITY = True
           handled = []
           app._handle_boardroom_authority = lambda *args, **kwargs: handled.append(args) or True
           client = app.app.test_client()
 
-          def payload(phone_id):
-              return {
-                  "entry": [{"changes": [{"value": {
-                      "metadata": {"phone_number_id": phone_id},
-                      "messages": [{
-                          "from": "5216681620521",
-                          "id": "wamid.test",
-                          "type": "text",
-                          "text": {"body": "vida"},
-                      }],
-                  }}]}]
-              }
+          def payload(phone_id, mid="wamid.test"):
+              return {"entry": [{"changes": [{"value": {
+                  "metadata": {"phone_number_id": phone_id},
+                  "messages": [{"from": "5216681620521", "id": mid, "type": "text", "text": {"body": "vida"}}],
+              }}]}]}
 
-          r = client.post("/webhook", json=payload("702222712983984"))
-          assert r.status_code == 200
-          assert handled == [], "Un mensaje de Redes fue procesado por SECOM"
+          assert client.post("/webhook", json=payload("702222712983984", "redes")).status_code == 200
+          assert handled == []
+          assert client.post("/webhook", json=payload("876953768824165", "rodys")).status_code == 200
+          assert handled == []
+          assert client.post("/webhook", json=payload("1045543821971905", "secom")).status_code == 200
+          assert len(handled) == 1
 
-          r = client.post("/webhook", json=payload("876953768824165"))
-          assert r.status_code == 200
-          assert handled == [], "Un mensaje de Rodys fue procesado por SECOM"
-
-          r = client.post("/webhook", json=payload("1045543821971905"))
-          assert r.status_code == 200
-          assert len(handled) == 1, "Un mensaje propio de SECOM no fue procesado exactamente una vez"
-
-          mixed = {
-              "entry": [{"changes": [
-                  {"value": {
-                      "metadata": {"phone_number_id": "702222712983984"},
-                      "messages": [{"from": "5211111111111", "id": "foreign", "type": "text", "text": {"body": "hola"}}],
-                  }},
-                  {"value": {
-                      "metadata": {"phone_number_id": "1045543821971905"},
-                      "messages": [{"from": "5216681620521", "id": "own", "type": "text", "text": {"body": "vida"}}],
-                  }},
-              ]}]
-          }
-          r = client.post("/webhook", json=mixed)
-          assert r.status_code == 200
-          assert len(handled) == 2, "El cambio propio se perdio cuando un cambio ajeno venia primero"
+          mixed = {"entry": [{"changes": [
+              {"value": {"metadata": {"phone_number_id": "702222712983984"}, "messages": [{"from": "5211111111111", "id": "foreign", "type": "text", "text": {"body": "hola"}}]}},
+              {"value": {"metadata": {"phone_number_id": "1045543821971905"}, "messages": [{"from": "5216681620521", "id": "own", "type": "text", "text": {"body": "vida"}}]}},
+          ]}]}
+          assert client.post("/webhook", json=mixed).status_code == 200
+          assert len(handled) == 2
           print("SECOM isolation tests: OK")
           PY
 
