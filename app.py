@@ -26,6 +26,8 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
+import cierre_cortesia as cc
+
 # Google
 try:
     from google.oauth2 import service_account
@@ -1984,6 +1986,7 @@ def _imss_next(phone: str, text: str) -> None:
         )
         send_message(phone, msg)
         _notify_advisor(f"🔔 IMSS — Prospecto preautorizado\nWhatsApp: {phone}\n{msg}")
+        _cierre_registrar(phone, "imss")
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
         return
@@ -2037,6 +2040,7 @@ def _emp_next(phone: str, text: str) -> None:
         )
         send_message(phone, resumen)
         _notify_advisor(f"🔔 Empresarial — Nueva solicitud\nWhatsApp: {phone}\n{resumen}")
+        _cierre_registrar(phone, "empresarial")
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
         return
@@ -2076,6 +2080,7 @@ def _fp_next(phone: str, text: str) -> None:
             resumen += f"\nCOMENTARIO: {data['fp_comentario']}"
         send_message(phone, resumen)
         _notify_advisor(f"🔔 Financiamiento Práctico — Resumen\nWhatsApp: {phone}\n{resumen}")
+        _cierre_registrar(phone, "financiamiento")
         user_state[phone] = "__greeted__"
         send_main_menu(phone)
         return
@@ -2115,6 +2120,7 @@ def _auto_next(phone: str, text: str) -> None:
             write_followup_to_sheets("auto_recordatorio", f"Recordatorio póliza -30d para {phone}", objetivo.isoformat())
             threading.Thread(target=_retry_after_days, args=(phone, 7), daemon=True).start()
             send_message(phone, f"✅ Gracias. Te contactaré *un mes antes* ({objetivo.isoformat()}).")
+            _cierre_registrar(phone, "auto", acuse=False)
             user_state[phone] = "__greeted__"
             send_main_menu(phone)
         except Exception:
@@ -2165,6 +2171,7 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
                     _update_row_cells(int(match["row"]), {"ESTATUS": "TPV_INTERESADO"}, headers)
         except Exception:
             log.exception("⚠️ No fue posible actualizar ESTATUS TPV_INTERESADO")
+        _cierre_registrar(phone, "tpv")
         user_state[phone] = "__greeted__"
         return
 
@@ -2186,6 +2193,173 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
 
     user_state[phone] = "tpv_giro"
     send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+
+
+# ==========================
+# Cierre de cortesia post-cuestionario
+# ==========================
+# Cuando el cliente termina un embudo, Vicky agradece y avisa que Christian lo
+# contactara sin esperar otro mensaje suyo. A partir de ahi absorbe el tramo
+# final de la conversacion: un "gracias" recibe cortesia (sin marca de genero)
+# con la invitacion al menu, un "no gracias" cierra agradeciendo el tiempo, y
+# si el cliente no responde en una hora se le manda una ultima linea.
+#
+# El recordatorio vive en memoria del proceso, igual que user_state: SECOM no
+# tiene Valkey, asi que un reinicio de Render lo pierde. Se pierde en silencio
+# a proposito -- perder un mensaje de cortesia es aceptable; duplicarlo o
+# mandarlo fuera de tiempo, no.
+CIERRE_NUDGE_SECONDS = int(os.getenv("CIERRE_NUDGE_SECONDS", "3600") or 3600)
+# Si el barrido se atrasa (proceso ocupado, hilo detenido), un recordatorio muy
+# vencido ya no se entrega: llegar horas tarde es peor que no llegar.
+CIERRE_NUDGE_MAX_ATRASO = int(os.getenv("CIERRE_NUDGE_MAX_ATRASO", str(6 * 3600)) or 6 * 3600)
+CIERRE_NUDGE_TICK = int(os.getenv("CIERRE_NUDGE_TICK", "60") or 60)
+CIERRE_NUDGE_SWEEPER = (os.getenv("CIERRE_NUDGE_SWEEPER", "true").strip().lower()
+                        in ("1", "true", "yes", "on"))
+# Cuanto dura el contexto de cierre. Pasado ese plazo, un "gracias" suelto ya
+# no es la cola de esta conversacion y se rutea normalmente.
+CIERRE_VENTANA_SECONDS = int(os.getenv("CIERRE_VENTANA_SECONDS", str(6 * 3600)) or 6 * 3600)
+
+_cierre_ctx: Dict[str, Dict[str, Any]] = {}
+_cierre_lock = threading.Lock()
+# Clase capturada al importar: el barrido es un bucle infinito y las pruebas
+# sustituyen threading.Thread por un doble que ejecuta el target en linea.
+_NUDGE_THREAD_CLS = threading.Thread
+_nudge_sweeper_started = False
+
+
+def _cierre_registrar(phone: str, producto: str = "", acuse: bool = True) -> None:
+    """Cierra el embudo: manda el acuse automatico (salvo que el mensaje de
+    cierre ya lo diga) y deja armado el recordatorio de una hora."""
+    if acuse:
+        send_message(phone, cc.ACUSE)
+    ahora = time.time()
+    with _cierre_lock:
+        _cierre_ctx[phone] = {
+            "producto": producto,
+            "ts": ahora,
+            "cortesia_enviada": False,
+            "despedido": False,
+            "nudge_due": ahora + CIERRE_NUDGE_SECONDS,
+        }
+    _nudge_ensure_sweeper()
+
+
+def _cierre_cancelar_nudge(phone: str) -> None:
+    """El cliente escribio: el recordatorio de "no respondio" ya no aplica."""
+    with _cierre_lock:
+        ctx = _cierre_ctx.get(phone)
+        if ctx:
+            ctx["nudge_due"] = None
+
+
+def _cierre_rearmar_nudge(phone: str) -> None:
+    ahora = time.time()
+    with _cierre_lock:
+        ctx = _cierre_ctx.get(phone)
+        if ctx:
+            ctx["ts"] = ahora
+            ctx["nudge_due"] = ahora + CIERRE_NUDGE_SECONDS
+    _nudge_ensure_sweeper()
+
+
+def _cierre_activo(phone: str) -> Optional[Dict[str, Any]]:
+    with _cierre_lock:
+        ctx = _cierre_ctx.get(phone)
+        if not ctx:
+            return None
+        if time.time() - ctx["ts"] > CIERRE_VENTANA_SECONDS:
+            _cierre_ctx.pop(phone, None)
+            return None
+        return ctx
+
+
+def _cierre_manejar_cortesia(phone: str, text: str) -> bool:
+    """Atiende el tramo final tras un cierre reciente. Devuelve True si ya
+    resolvio el mensaje (respondiendo o callando a proposito) y no hay que
+    rutearlo; False si el cliente retomo la conversacion con algo sustantivo."""
+    ctx = _cierre_activo(phone)
+    if ctx is None:
+        return False
+
+    if cc.es_respuesta_negativa(text):
+        if not ctx["despedido"]:
+            send_message(phone, cc.DESPEDIDA_NEGATIVA)
+            ctx["despedido"] = True
+        _cierre_cancelar_nudge(phone)
+        return True
+
+    if cc.es_cortesia_pura(text):
+        if ctx["despedido"]:
+            # Ya hubo despedida: no se vuelve a ofrecer nada.
+            return True
+        if not ctx["cortesia_enviada"]:
+            send_message(phone, cc.cortesia_final(ctx.get("producto")))
+            ctx["cortesia_enviada"] = True
+            _cierre_rearmar_nudge(phone)
+        return True
+
+    # Mensaje con contenido: el cliente retomo la conversacion y el contexto de
+    # cierre deja de aplicar.
+    with _cierre_lock:
+        _cierre_ctx.pop(phone, None)
+    return False
+
+
+def _nudge_reclamar_vencidos(ahora: float) -> List[Tuple[str, float]]:
+    """Devuelve [(phone, vencimiento)] y los marca como reclamados en el mismo
+    paso, para que dos barridos concurrentes no manden el mensaje dos veces.
+    Aprovecha para tirar los contextos ya expirados."""
+    listos: List[Tuple[str, float]] = []
+    with _cierre_lock:
+        for phone, ctx in list(_cierre_ctx.items()):
+            if ahora - ctx["ts"] > CIERRE_VENTANA_SECONDS:
+                _cierre_ctx.pop(phone, None)
+                continue
+            due = ctx.get("nudge_due")
+            if due is None or due > ahora:
+                continue
+            ctx["nudge_due"] = None
+            listos.append((phone, due))
+    return listos
+
+
+def nudge_sweep_once() -> int:
+    ahora = time.time()
+    entregados = 0
+    for phone, due in _nudge_reclamar_vencidos(ahora):
+        try:
+            if ahora - due > CIERRE_NUDGE_MAX_ATRASO:
+                log.warning("cierre_nudge_descartado_por_atraso phone=%s horas=%.1f",
+                            phone, (ahora - due) / 3600)
+                continue
+            if send_message(phone, cc.NUDGE):
+                entregados += 1
+        except Exception:
+            log.exception("cierre_nudge_error phone=%s", phone)
+    return entregados
+
+
+def _nudge_loop() -> None:
+    while True:
+        time.sleep(max(CIERRE_NUDGE_TICK, 5))
+        try:
+            nudge_sweep_once()
+        except Exception:
+            log.exception("cierre_nudge_barrido_fallido")
+
+
+def _nudge_ensure_sweeper() -> None:
+    """Arranca el barrido una sola vez por proceso, de forma perezosa: mientras
+    nadie cierre un embudo no hace falta ningun hilo."""
+    global _nudge_sweeper_started
+    if not CIERRE_NUDGE_SWEEPER or _nudge_sweeper_started:
+        return
+    with _cierre_lock:
+        if _nudge_sweeper_started:
+            return
+        _NUDGE_THREAD_CLS(target=_nudge_loop, daemon=True,
+                          name="CierreNudgeSweeper").start()
+        _nudge_sweeper_started = True
 
 
 def _retry_after_days(phone: str, days: int) -> None:
@@ -2477,6 +2651,7 @@ def _handle_awaiting_template_response(phone: str, text: str, match: Optional[Di
                 "brindarle asesoría personalizada y resolver todas sus dudas de manera directa y segura. "
                 "Escribe *menú* para ver opciones."
             )
+            _cierre_registrar(phone, "vida", acuse=False)
             user_state[phone] = "__greeted__"
             return True
 
@@ -2562,6 +2737,7 @@ def _handle_awaiting_template_response(phone: str, text: str, match: Optional[Di
             phone,
             "✅ Gracias. Ya registré tu interés. En breve, Christian López te contactará para darte seguimiento."
         )
+        _cierre_registrar(phone, "", acuse=False)
         user_state[phone] = "__greeted__"
         return True
 
@@ -2648,6 +2824,11 @@ def webhook_receive():
             log.warning("⚠️ Mensaje sin número de teléfono")
             return jsonify({"ok": True}), 200
 
+        # El cliente respondio: el recordatorio de "no respondio en una hora"
+        # ya no aplica. Va antes de cualquier ruteo, para que valga con
+        # cualquier tipo de mensaje (texto, boton, archivo).
+        _cierre_cancelar_nudge(phone)
+
         last10 = _normalize_phone_last10(phone)
         match = match_client_in_sheets(last10)
         st_now = user_state.get(phone, "")
@@ -2664,6 +2845,14 @@ def webhook_receive():
                 pass
 
             _ensure_user(phone)["last_message"] = text
+
+            # Tramo final tras un cierre reciente ("gracias" / "no gracias").
+            # Va antes del ruteo y es independiente de user_state y de
+            # Boardroom: sin esto, un simple "gracias" caia en el fallback
+            # generico ("En breve, su asesor Christian Lopez...") como si
+            # fuera una consulta nueva.
+            if not _is_active_funnel_state(st_now) and _cierre_manejar_cortesia(phone, text):
+                return jsonify({"ok": True}), 200
 
             if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
                 # ACTIVE_DETERMINISTIC_FUNNEL_TURN (DOC-0043 regla 3): continua
