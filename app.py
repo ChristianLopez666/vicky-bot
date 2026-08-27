@@ -2625,11 +2625,52 @@ def webhook_receive():
         payload = request.get_json(force=True, silent=True) or {}
         log.info("📥 Webhook recibido: %s...", json.dumps(payload, ensure_ascii=False)[:500])
 
-        entry = (payload.get("entry") or [{}])[0]
-        changes = (entry.get("changes") or [{}])[0]
-        value = changes.get("value", {})
-        messages = value.get("messages", [])
-        statuses = value.get("statuses", [])
+        # Aislamiento por numero de WhatsApp: Meta entrega eventos a nivel WABA,
+        # por lo que este servicio puede recibir cambios de otros numeros de la
+        # misma cuenta. Solo SECOM debe producir efectos comerciales aqui.
+        local_values = []
+        for entry in payload.get("entry") or []:
+            for change in entry.get("changes") or []:
+                value = change.get("value") or {}
+                metadata = value.get("metadata") or {}
+                incoming_phone_id = str(metadata.get("phone_number_id") or "").strip()
+
+                if WABA_PHONE_ID:
+                    if incoming_phone_id and incoming_phone_id != WABA_PHONE_ID:
+                        log.info(
+                            "🧱 Webhook descartado por phone_number_id ajeno: recibido=%s esperado=%s",
+                            incoming_phone_id, WABA_PHONE_ID,
+                        )
+                        continue
+                else:
+                    log.error(
+                        "❌ WABA_PHONE_ID no configurado: aislamiento webhook degradado; "
+                        "procesando evento en modo legacy"
+                    )
+
+                if not incoming_phone_id:
+                    log.warning(
+                        "⚠️ Webhook sin metadata.phone_number_id; procesando por compatibilidad"
+                    )
+
+                local_values.append(value)
+
+        if not local_values:
+            log.info(
+                "🧱 Webhook sin eventos propios de SECOM; HTTP 200 sin procesamiento comercial"
+            )
+            return jsonify({"ok": True}), 200
+
+        messages = [
+            msg
+            for value in local_values
+            for msg in (value.get("messages") or [])
+        ]
+        statuses = [
+            st
+            for value in local_values
+            for st in (value.get("statuses") or [])
+        ]
 
         if not messages:
             if statuses:
