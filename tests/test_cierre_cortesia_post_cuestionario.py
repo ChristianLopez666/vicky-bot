@@ -166,18 +166,73 @@ def test_el_recordatorio_se_entrega_una_sola_vez_cuando_vence():
         send.assert_not_called()
 
 
-def test_cualquier_mensaje_del_cliente_cancela_el_recordatorio():
-    with patch.object(vicky, "send_message") as send, \
+def _webhook(text: str):
+    """Entra por la misma puerta que produccion: /webhook. Es lo que hace la
+    diferencia entre probar la funcion y probar el requisito."""
+    payload = {"entry": [{"changes": [{"value": {"messages": [
+        {"from": PHONE, "id": "wamid.cierre", "type": "text", "text": {"body": text}}
+    ]}}]}]}
+    return vicky.app.test_client().post("/webhook", json=payload)
+
+
+def test_si_el_cliente_agradece_el_recordatorio_ya_no_existe():
+    """Recorrido real: cierre -> "gracias" por /webhook -> cortesia. Despues de
+    eso NO puede quedar recordatorio armado: el cliente respondio, asi que "si
+    no responde en una hora" dejo de aplicar. La prueba anterior cancelaba el
+    recordatorio a mano y por eso no veia que la cortesia lo rearmaba."""
+    with patch.object(vicky, "send_message", return_value=True) as send, \
          patch.object(vicky, "_notify_advisor"), \
          patch.object(vicky, "send_main_menu"), \
+         patch.object(vicky, "match_client_in_sheets", return_value=None), \
+         patch.object(vicky, "append_respuesta_cliente"), \
          patch.object(vicky, "CIERRE_NUDGE_SWEEPER", False):
         _cerrar_imss(send)
-        vicky._cierre_cancelar_nudge(PHONE)
-        vicky._cierre_ctx[PHONE]["ts"] = time.time() - 1
         send.reset_mock()
 
+        rv = _webhook("muchas gracias")
+
+        assert rv.status_code == 200
+        assert [c.args[1] for c in send.call_args_list] == [cc.cortesia_final("imss")]
+        assert vicky._cierre_ctx[PHONE]["nudge_due"] is None
+
+        send.reset_mock()
         assert vicky.nudge_sweep_once() == 0
         send.assert_not_called()
+
+
+def test_si_el_cliente_responde_que_no_el_recordatorio_ya_no_existe():
+    with patch.object(vicky, "send_message", return_value=True) as send, \
+         patch.object(vicky, "_notify_advisor"), \
+         patch.object(vicky, "send_main_menu"), \
+         patch.object(vicky, "match_client_in_sheets", return_value=None), \
+         patch.object(vicky, "append_respuesta_cliente"), \
+         patch.object(vicky, "CIERRE_NUDGE_SWEEPER", False):
+        _cerrar_imss(send)
+        send.reset_mock()
+
+        rv = _webhook("no gracias")
+
+        assert rv.status_code == 200
+        assert [c.args[1] for c in send.call_args_list] == [cc.DESPEDIDA_NEGATIVA]
+        assert vicky._cierre_ctx[PHONE]["nudge_due"] is None
+        assert vicky.nudge_sweep_once() == 0
+
+
+def test_tras_la_cortesia_una_segunda_negativa_tampoco_arma_nada():
+    """La cortesia deja una oferta abierta ("escriba menu..."). Ni esa oferta
+    ni la despedida posterior vuelven a armar el recordatorio."""
+    with patch.object(vicky, "send_message", return_value=True) as send, \
+         patch.object(vicky, "_notify_advisor"), \
+         patch.object(vicky, "send_main_menu"), \
+         patch.object(vicky, "match_client_in_sheets", return_value=None), \
+         patch.object(vicky, "append_respuesta_cliente"), \
+         patch.object(vicky, "CIERRE_NUDGE_SWEEPER", False):
+        _cerrar_imss(send)
+        _webhook("gracias")
+        _webhook("no, gracias")
+
+        assert vicky._cierre_ctx[PHONE]["nudge_due"] is None
+        assert vicky.nudge_sweep_once() == 0
 
 
 def test_un_recordatorio_muy_atrasado_ya_no_se_entrega():
@@ -205,6 +260,52 @@ def test_un_contexto_expirado_ya_no_atiende_la_cortesia():
 
     assert manejado is False
     send.assert_not_called()
+
+
+# ── 4b. Cuestionario Vida Temporal ────────────────────────────────────────────
+# Era el unico cuestionario sin cierre de cortesia: la ruta de interes a la
+# plantilla Vida si estaba cubierta, pero esa es otra puerta (respuesta a
+# campana), no el cuestionario completo. Es ademas el embudo que SECOM esta
+# operando hoy.
+
+def _cerrar_vida(send):
+    _limpiar()
+    vicky.user_state[PHONE] = "vida_objetivo"
+    vicky.user_data[PHONE] = {"edad": 45, "fuma": "no", "estado": "Sinaloa",
+                              "suma": "1 millón"}
+    vicky._vida_next(PHONE, "1")
+    return [c.args[1] for c in send.call_args_list]
+
+
+def test_el_cierre_del_cuestionario_vida_abre_el_contexto_de_cortesia():
+    with patch.object(vicky, "send_message", return_value=True) as send, \
+         patch.object(vicky, "_notify_advisor"), \
+         patch.object(vicky, "CIERRE_NUDGE_SWEEPER", False):
+        textos = _cerrar_vida(send)
+
+    ctx = vicky._cierre_ctx[PHONE]
+    assert ctx["producto"] == "vida"
+    assert ctx["nudge_due"] - time.time() > vicky.CIERRE_NUDGE_SECONDS - 60
+    # Su mensaje de cierre ya agradece y ya anuncia el seguimiento de
+    # Christian: no se le encima el acuse.
+    assert cc.ACUSE not in textos
+    assert any("Seguro de Vida Temporal" in t for t in textos), textos
+
+
+def test_gracias_tras_el_cuestionario_vida_no_ofrece_tarifa_de_pensionado():
+    with patch.object(vicky, "send_message", return_value=True) as send, \
+         patch.object(vicky, "_notify_advisor"), \
+         patch.object(vicky, "match_client_in_sheets", return_value=None), \
+         patch.object(vicky, "append_respuesta_cliente"), \
+         patch.object(vicky, "CIERRE_NUDGE_SWEEPER", False):
+        _cerrar_vida(send)
+        send.reset_mock()
+        _webhook("gracias")
+
+    enviados = [c.args[1] for c in send.call_args_list]
+    assert enviados == [cc.cortesia_final("vida")]
+    assert "por ser pensionado" not in enviados[0]
+    assert vicky._cierre_ctx[PHONE]["nudge_due"] is None
 
 
 # ── 5. Textos y clasificadores ────────────────────────────────────────────────

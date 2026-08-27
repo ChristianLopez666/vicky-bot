@@ -1917,6 +1917,7 @@ def _vida_next(phone: str, text: str, match: Optional[Dict[str, Any]] = None) ->
                 )
         except Exception:
             log.exception("⚠️ No fue posible actualizar Sheets al cerrar Vida Temporal")
+        _cierre_registrar(phone, "vida", acuse=False)
         user_state[phone] = "__greeted__"
         log.info("✅ Vida Temporal perfil inicial capturado")
         return
@@ -2204,6 +2205,12 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
 # con la invitacion al menu, un "no gracias" cierra agradeciendo el tiempo, y
 # si el cliente no responde en una hora se le manda una ultima linea.
 #
+# INVARIANTE: el recordatorio se arma en UN solo lugar por conversacion --
+# _cierre_registrar(), el cierre automatico del embudo -- y cualquier mensaje
+# entrante lo cancela (ver webhook_receive). Ninguna respuesta de Vicky a un
+# mensaje del cliente lo vuelve a armar: si el cliente contesto, ya respondio,
+# y "si no responde en una hora" dejo de aplicar.
+#
 # El recordatorio vive en memoria del proceso, igual que user_state: SECOM no
 # tiene Valkey, asi que un reinicio de Render lo pierde. Se pierde en silencio
 # a proposito -- perder un mensaje de cortesia es aceptable; duplicarlo o
@@ -2252,16 +2259,6 @@ def _cierre_cancelar_nudge(phone: str) -> None:
             ctx["nudge_due"] = None
 
 
-def _cierre_rearmar_nudge(phone: str) -> None:
-    ahora = time.time()
-    with _cierre_lock:
-        ctx = _cierre_ctx.get(phone)
-        if ctx:
-            ctx["ts"] = ahora
-            ctx["nudge_due"] = ahora + CIERRE_NUDGE_SECONDS
-    _nudge_ensure_sweeper()
-
-
 def _cierre_activo(phone: str) -> Optional[Dict[str, Any]]:
     with _cierre_lock:
         ctx = _cierre_ctx.get(phone)
@@ -2295,7 +2292,6 @@ def _cierre_manejar_cortesia(phone: str, text: str) -> bool:
         if not ctx["cortesia_enviada"]:
             send_message(phone, cc.cortesia_final(ctx.get("producto")))
             ctx["cortesia_enviada"] = True
-            _cierre_rearmar_nudge(phone)
         return True
 
     # Mensaje con contenido: el cliente retomo la conversacion y el contexto de
