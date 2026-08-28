@@ -109,7 +109,14 @@ def test_auto_send_one_proceeds_when_not_paused(client, auto_send_token):
     assert resp.get_json()["error"] == "Sheet vacío"
 
 
-def test_is_campaign_paused_reads_pause_cell():
+# --- Regresion 2026-08-28: default invertido tras la auditoria forense de
+# notificaciones SECOM. Antes, celda vacia = campana activa (fail-open); una
+# importacion de prospectos nuevos disparaba envios reales sin que nadie
+# hubiera "encendido" nada. Ahora solo "ACTIVE" habilita el envio; vacio,
+# cualquier otro valor, o un error de lectura = pausada (fail-closed). ---
+
+
+def test_is_campaign_paused_true_when_cell_not_active():
     fake_values_get = Mock()
     fake_values_get.return_value.execute.return_value = {"values": [["PAUSED"]]}
     fake_spreadsheets = Mock()
@@ -122,7 +129,20 @@ def test_is_campaign_paused_reads_pause_cell():
         assert vicky._is_campaign_paused() is True
 
 
-def test_is_campaign_paused_false_when_cell_empty():
+def test_is_campaign_paused_false_when_cell_is_active():
+    fake_values_get = Mock()
+    fake_values_get.return_value.execute.return_value = {"values": [["ACTIVE"]]}
+    fake_spreadsheets = Mock()
+    fake_spreadsheets.return_value.values.return_value.get = fake_values_get
+    with patch.object(vicky, "google_ready", True), \
+         patch.object(vicky, "sheets_svc", Mock(spreadsheets=fake_spreadsheets)), \
+         patch.object(vicky, "SHEETS_ID_LEADS", "sheet-id"), \
+         patch.object(vicky, "_ensure_control_tab"), \
+         patch.object(vicky, "SHEETS_TITLE_LEADS", "Prospectos SECOM Auto"):
+        assert vicky._is_campaign_paused() is False
+
+
+def test_is_campaign_paused_true_when_cell_empty():
     fake_values_get = Mock()
     fake_values_get.return_value.execute.return_value = {"values": []}
     fake_spreadsheets = Mock()
@@ -132,10 +152,10 @@ def test_is_campaign_paused_false_when_cell_empty():
          patch.object(vicky, "SHEETS_ID_LEADS", "sheet-id"), \
          patch.object(vicky, "_ensure_control_tab"), \
          patch.object(vicky, "SHEETS_TITLE_LEADS", "Prospectos SECOM Auto"):
-        assert vicky._is_campaign_paused() is False
+        assert vicky._is_campaign_paused() is True
 
 
-def test_is_campaign_paused_fails_open_on_sheets_error():
+def test_is_campaign_paused_fails_closed_on_sheets_error():
     fake_values_get = Mock()
     fake_values_get.return_value.execute.side_effect = RuntimeError("api down")
     fake_spreadsheets = Mock()
@@ -145,12 +165,12 @@ def test_is_campaign_paused_fails_open_on_sheets_error():
          patch.object(vicky, "SHEETS_ID_LEADS", "sheet-id"), \
          patch.object(vicky, "_ensure_control_tab"), \
          patch.object(vicky, "SHEETS_TITLE_LEADS", "Prospectos SECOM Auto"):
-        assert vicky._is_campaign_paused() is False
+        assert vicky._is_campaign_paused() is True
 
 
-def test_is_campaign_paused_false_when_sheets_not_configured():
+def test_is_campaign_paused_true_when_sheets_not_configured():
     with patch.object(vicky, "google_ready", False):
-        assert vicky._is_campaign_paused() is False
+        assert vicky._is_campaign_paused() is True
 
 # --- Regresion: el kill switch vivia en "<hoja de leads>!AA1"; esa celda no
 # existe en una hoja de 16 columnas, asi que cada lectura daba HTTP 400
@@ -166,7 +186,7 @@ def test_pause_cell_is_not_outside_the_data_grid():
 
 def test_is_campaign_paused_reads_from_control_tab_not_leads_sheet():
     fake_values_get = Mock()
-    fake_values_get.return_value.execute.return_value = {"values": [["PAUSED"]]}
+    fake_values_get.return_value.execute.return_value = {"values": [["algo-que-no-es-active"]]}
     fake_spreadsheets = Mock()
     fake_spreadsheets.return_value.values.return_value.get = fake_values_get
     with (
@@ -218,7 +238,7 @@ def test_ensure_control_tab_does_not_recreate_existing_tab():
     fake_ss.return_value.batchUpdate.assert_not_called()
 
 
-def test_set_campaign_paused_writes_to_control_tab():
+def test_set_campaign_paused_true_clears_the_cell():
     fake_update = Mock()
     fake_ss = Mock()
     fake_ss.return_value.values.return_value.update = fake_update
@@ -233,7 +253,25 @@ def test_set_campaign_paused_writes_to_control_tab():
 
     kwargs = fake_update.call_args.kwargs
     assert kwargs["range"] == "CONTROL!A2"
-    assert kwargs["body"]["values"] == [["PAUSED"]]
+    assert kwargs["body"]["values"] == [[""]]
+
+
+def test_set_campaign_paused_false_writes_active():
+    fake_update = Mock()
+    fake_ss = Mock()
+    fake_ss.return_value.values.return_value.update = fake_update
+    with (
+        patch.object(vicky, "google_ready", True),
+        patch.object(vicky, "sheets_svc", Mock(spreadsheets=fake_ss)),
+        patch.object(vicky, "SHEETS_ID_LEADS", "sheet-id"),
+        patch.object(vicky, "_ensure_control_tab"),
+        patch.object(vicky, "CAMPAIGN_CONTROL_TAB", "CONTROL"),
+    ):
+        vicky._set_campaign_paused(False)
+
+    kwargs = fake_update.call_args.kwargs
+    assert kwargs["range"] == "CONTROL!A2"
+    assert kwargs["body"]["values"] == [["ACTIVE"]]
 
 
 def test_ensure_tab_pide_una_cuadricula_explicita_y_pequena():

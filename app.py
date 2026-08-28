@@ -98,13 +98,23 @@ AUTO_SEND_TOKEN = os.getenv("AUTO_SEND_TOKEN", "").strip()
 # _set_campaign_paused() no podia escribir, dejando muertos a la vez el
 # freno manual y la auto-pausa por racha de fallos. Una pestana propia no
 # depende del ancho de la hoja de datos ni se rompe al editar columnas.
+#
+# Default invertido (auditoria forense SECOM, 2026-08-28): antes, celda
+# vacia = campana activa, y hacia falta escribir "PAUSED" a mano para
+# detenerla -- eso dejaba la campana mandando plantillas reales de forma
+# indefinida en cuanto se importaba un prospecto nuevo, sin que nadie la
+# hubiera "encendido" a proposito. Ahora la celda vacia (o cualquier valor
+# que no sea exactamente "ACTIVE") significa PAUSADA; solo un "ACTIVE"
+# explicito en A2 habilita el envio saliente. Esto no afecta la deteccion
+# de respuestas entrantes de prospectos, que no pasa por este kill switch.
 CAMPAIGN_CONTROL_TAB = os.getenv("SHEETS_TITLE_CONTROL", "CONTROL").strip()
 CAMPAIGN_PAUSE_CELL = "A2"
-CAMPAIGN_PAUSED_VALUE = "PAUSED"
+CAMPAIGN_ACTIVE_VALUE = "ACTIVE"
 _CAMPAIGN_CONTROL_HEADER = [
     "ESTADO_CAMPANA",
-    "Escribe PAUSED en A2 para detener la campana saliente; "
-    "borra la celda para reanudarla.",
+    "Escribe ACTIVE en A2 para habilitar el envio saliente; "
+    "borra la celda (o escribe cualquier otra cosa) para pausarla. "
+    "Vacio = pausada por default.",
 ]
 # La pestana se verifica una sola vez por proceso: crearla es idempotente,
 # pero no hace falta pagar una lectura de metadatos cada 5 minutos.
@@ -682,9 +692,16 @@ def _log_conversacion(mensaje: str) -> None:
 
 
 def _is_campaign_paused() -> bool:
-    """CF-4: lee el kill switch de la campana outbound desde Sheets."""
+    """CF-4: lee el kill switch de la campana outbound desde Sheets.
+
+    Default invertido: solo "ACTIVE" habilita el envio; celda vacia o
+    cualquier otro valor = pausada (incluido el error de lectura, que sigue
+    siendo fail-*closed* ahora -- antes un error dejaba la campana enviando
+    sin que nadie lo supiera; ahora un error la deja pausada, que es el
+    default seguro).
+    """
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
-        return False
+        return True
     try:
         _ensure_control_tab()
         rng = f"{CAMPAIGN_CONTROL_TAB}!{CAMPAIGN_PAUSE_CELL}"
@@ -693,19 +710,20 @@ def _is_campaign_paused() -> bool:
         ).execute()
         values = result.get("values", [])
         cell = (values[0][0] if values and values[0] else "").strip().upper()
-        pausada = cell == CAMPAIGN_PAUSED_VALUE
-        # Sin esta linea el kill switch es una caja negra: devuelve False sin
-        # decir que leyo, asi que un "no se pausa" no se puede distinguir de
-        # un "leyo otra celda". Con campana viva hay que poder auditarlo en
-        # caliente, sin desplegar de nuevo.
+        activa = cell == CAMPAIGN_ACTIVE_VALUE
+        pausada = not activa
+        # Sin esta linea el kill switch es una caja negra: devuelve un bool
+        # sin decir que leyo, asi que un "no se envia" no se puede distinguir
+        # de un "leyo otra celda". Con campana viva hay que poder auditarlo
+        # en caliente, sin desplegar de nuevo.
         log.info(
             "kill switch CF-4: rango=%s crudo=%r normalizado=%r pausada=%s",
             rng, values, cell, pausada,
         )
         return pausada
     except Exception:
-        log.exception("❌ Error leyendo kill switch de campana (CF-4); fail-open")
-        return False
+        log.exception("❌ Error leyendo kill switch de campana (CF-4); fail-closed (pausada)")
+        return True
 
 
 def _set_campaign_paused(paused: bool) -> None:
@@ -714,7 +732,7 @@ def _set_campaign_paused(paused: bool) -> None:
         raise RuntimeError("Sheets no disponible para actualizar kill switch.")
     _ensure_control_tab()
     rng = f"{CAMPAIGN_CONTROL_TAB}!{CAMPAIGN_PAUSE_CELL}"
-    value = CAMPAIGN_PAUSED_VALUE if paused else ""
+    value = "" if paused else CAMPAIGN_ACTIVE_VALUE
     body = {"values": [[value]]}
     sheets_svc.spreadsheets().values().update(
         spreadsheetId=SHEETS_ID_LEADS,
@@ -1816,6 +1834,7 @@ def vida_start(phone: str, match: Optional[Dict[str, Any]] = None) -> None:
                     "ESTATUS": "interesado",
                     "PRODUCTO": "vida_temporal",
                     "ULTIMO_CONTACTO": _utc_now_iso(),
+                    "LAST_MESSAGE_AT": _utc_now_iso(),
                     "NOTAS": "interesado en vida temporal desde WhatsApp",
                     "BENEFICIO_OFRECIDO": "posible descuento hasta 40% sujeto a edad, perfil y condiciones",
                     "LAST_MESSAGE": data.get("last_message", ""),
@@ -1908,6 +1927,7 @@ def _vida_next(phone: str, text: str, match: Optional[Dict[str, Any]] = None) ->
                         "ESTATUS": "perfil_inicial_capturado",
                         "PRODUCTO": "vida_temporal",
                         "ULTIMO_CONTACTO": _utc_now_iso(),
+                        "LAST_MESSAGE_AT": _utc_now_iso(),
                         "NOTAS": "datos iniciales capturados para vida temporal",
                         "LAST_MESSAGE": data.get("last_message", ""),
                     },
@@ -2162,7 +2182,11 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
             if match and match.get("row"):
                 headers, _ = _sheet_get_rows()
                 if headers and _idx(headers, "ESTATUS") is not None:
-                    _update_row_cells(int(match["row"]), {"ESTATUS": "TPV_INTERESADO"}, headers)
+                    _update_row_cells(
+                        int(match["row"]),
+                        {"ESTATUS": "TPV_INTERESADO", "LAST_MESSAGE_AT": _utc_now_iso()},
+                        headers,
+                    )
         except Exception:
             log.exception("⚠️ No fue posible actualizar ESTATUS TPV_INTERESADO")
         user_state[phone] = "__greeted__"
@@ -2178,7 +2202,11 @@ def _tpv_next(phone: str, text: str, match: Optional[Dict[str, Any]]) -> None:
             if match and match.get("row"):
                 headers, _ = _sheet_get_rows()
                 if headers and _idx(headers, "ESTATUS") is not None:
-                    _update_row_cells(int(match["row"]), {"ESTATUS": "TPV_NO_INTERESADO"}, headers)
+                    _update_row_cells(
+                        int(match["row"]),
+                        {"ESTATUS": "TPV_NO_INTERESADO", "LAST_MESSAGE_AT": _utc_now_iso()},
+                        headers,
+                    )
         except Exception:
             log.exception("⚠️ No fue posible actualizar ESTATUS TPV_NO_INTERESADO")
         user_state[phone] = "__greeted__"
