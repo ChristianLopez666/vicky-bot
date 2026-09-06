@@ -6,6 +6,12 @@
 # La unica copia esta en el JSON extraido de los logs de Render el 2026-09-05,
 # antes de que la retencion de 30 dias los borrara.
 #
+# Los ~140 envios son distintos: su fuente es la HOJA, no los logs. El
+# contrato lo fija asi (message_sent historico se llavea con
+# lead_id:occurred_at y puede carecer de wamid), y menos mal, porque los logs
+# de este servicio solo conservan desde el 2026-08-30 20:01 UTC: los envios
+# del 28 y 29 de agosto -- 104 de los 140 -- ya no estan ahi.
+#
 # Este modulo NO carga nada. Solo construye los sobres y se niega a construir
 # los que no puede sustentar con el dato real. La carga es un paso aparte,
 # manual y posterior a la prueba de aceptacion del contrato.
@@ -18,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Mapping
 
 import radar_events
@@ -105,3 +112,82 @@ def construir_fallos_de_prospecto(
     if len(set(ids)) != len(ids):
         raise BackfillIncompleto("dos eventos historicos comparten event_id")
     return eventos
+
+
+# Estatus de la hoja que representan un envio de plantilla ya realizado. Se
+# listan explicitamente en vez de aceptar "cualquier ESTATUS que empiece por
+# ENVIADO": un estatus nuevo no debe colarse al historico por parecerse.
+ESTATUS_DE_ENVIO = {"ENVIADO_VIDA_TEMPORAL"}
+
+
+def construir_envios_de_hoja(
+    filas: List[Mapping[str, str]],
+    *,
+    phone_number_id: str,
+) -> List[Dict[str, Any]]:
+    """Convierte las filas enviadas de la hoja en message_sent de backfill.
+
+    La fuente es la hoja, no los logs de Render, y asi lo fija el contrato:
+    un message_sent historico se llavea con lead_id:occurred_at y puede
+    carecer de wamid y de request_id. Esto importa porque los logs de este
+    servicio solo conservan desde el 2026-08-30 20:01 UTC -- los envios del 28
+    y 29 de agosto ya no estan ahi, y aun asi son reconstruibles.
+
+    Cada fila debe traer LEAD_ID, ESTATUS y LAST_MESSAGE_AT. La fecha se
+    normaliza con canonical_backfill_ts: la hoja la guarda en UTC sin Z, y
+    Radar rechaza cualquier backfill que no termine en .000Z.
+
+    Se excluye toda fila cuyo ESTATUS no este en ESTATUS_DE_ENVIO. No es un
+    tecnicismo: cuando un prospecto respondio, el bot reescribio su ESTATUS y
+    su LAST_MESSAGE_AT en la misma llamada, asi que esa fecha ya no es la del
+    envio sino la de la respuesta. Emitir un message_sent con ella lo fecharia
+    mal, y la fecha real de esos casos no esta en ningun lado.
+    """
+    eventos: List[Dict[str, Any]] = []
+    vistos: Dict[str, str] = {}
+
+    for fila in filas:
+        estatus = str(fila.get("ESTATUS") or "").strip().upper()
+        if estatus not in ESTATUS_DE_ENVIO:
+            continue
+
+        lead_id = str(fila.get("LEAD_ID") or "").strip()
+        if not lead_id:
+            raise BackfillIncompleto(
+                f"fila con ESTATUS {estatus} sin LEAD_ID; no se genera uno nuevo"
+            )
+
+        try:
+            occurred_at = radar_events.canonical_backfill_ts(fila.get("LAST_MESSAGE_AT", ""))
+        except ValueError as exc:
+            raise BackfillIncompleto(f"{lead_id}: {exc}") from exc
+
+        clave = f"{lead_id}:{occurred_at}"
+        if clave in vistos:
+            raise BackfillIncompleto(f"clave repetida en el historico: {clave}")
+        vistos[clave] = lead_id
+
+        last10 = re.sub(r"\D", "", str(fila.get("WhatsApp") or ""))[-10:]
+        eventos.append(radar_events.build_event(
+            "message_sent",
+            lead_id=lead_id,
+            phone_e164=f"521{last10}" if len(last10) == 10 else "",
+            phone_last10=last10,
+            phone_number_id=phone_number_id,
+            occurred_at=occurred_at,
+            direction="outbound",
+            delivery_status="sent",
+            backfill=True,
+            trace={"service": "vicky-bot-secom", "origen": "backfill_hoja", "estatus": estatus},
+        ))
+
+    if not eventos:
+        raise BackfillIncompleto("ninguna fila califica como envio historico")
+    return eventos
+
+
+def en_lotes(eventos: List[Dict[str, Any]], tamano: int = 50) -> List[Dict[str, Any]]:
+    """Parte los eventos en cuerpos para /events/batch (maximo 50 por peticion)."""
+    if tamano < 1 or tamano > 50:
+        raise ValueError("el contrato admite entre 1 y 50 eventos por lote")
+    return [{"events": eventos[i:i + tamano]} for i in range(0, len(eventos), tamano)]

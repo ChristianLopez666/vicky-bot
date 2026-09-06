@@ -192,3 +192,97 @@ class TestExtraccionReal:
         assert codigos == [130472, 131026, 131026, 131026, 131049, 131049]
         assert all(e["backfill"] is True for e in eventos)
         assert len({e["event_id"] for e in eventos}) == 6
+
+
+# ==========================================================================
+# Historico de envios: la fuente es la hoja, no los logs
+# ==========================================================================
+FILAS = [
+    {"LEAD_ID": "SC-a", "ESTATUS": "ENVIADO_VIDA_TEMPORAL",
+     "LAST_MESSAGE_AT": "2026-08-28 23:10:28", "WhatsApp": "6611107889"},
+    {"LEAD_ID": "SC-b", "ESTATUS": "ENVIADO_VIDA_TEMPORAL",
+     "LAST_MESSAGE_AT": "2026-08-29 18:15:17", "WhatsApp": "6683224169"},
+    {"LEAD_ID": "SC-c", "ESTATUS": "DUDA_TEMPLATE",
+     "LAST_MESSAGE_AT": "2026-08-29 18:03:35", "WhatsApp": "6681032235"},
+    {"LEAD_ID": "SC-d", "ESTATUS": "NO_INTERESADO_TEMPLATE",
+     "LAST_MESSAGE_AT": "2026-08-29 19:39:56", "WhatsApp": "6681255067"},
+    {"LEAD_ID": "SC-e", "ESTATUS": "", "LAST_MESSAGE_AT": "", "WhatsApp": ""},
+]
+
+
+def _envios(filas=None):
+    return bf.construir_envios_de_hoja(
+        filas if filas is not None else FILAS, phone_number_id=PHONE_ID
+    )
+
+
+class TestEnviosHistoricos:
+    def test_solo_las_filas_realmente_enviadas_producen_evento(self):
+        eventos = _envios()
+        assert [e["lead"]["lead_id"] for e in eventos] == ["SC-a", "SC-b"]
+
+    def test_una_fila_cuya_fecha_se_sobrescribio_al_responder_se_excluye(self):
+        """DUDA_TEMPLATE y NO_INTERESADO_TEMPLATE llevan la fecha de la
+        respuesta, no la del envio. Fecharlas mal seria peor que omitirlas."""
+        eventos = _envios()
+        ids = {e["lead"]["lead_id"] for e in eventos}
+        assert "SC-c" not in ids and "SC-d" not in ids
+
+    def test_el_sobre_es_un_message_sent_de_backfill_sin_wamid(self):
+        uno = _envios()[0]
+        assert uno["event_type"] == "message_sent"
+        assert uno["backfill"] is True
+        assert uno["delivery"]["status"] == "sent"
+        assert uno["message"]["wamid"] is None
+        assert uno["message"]["request_id"] is None
+        assert uno["message"]["template"] is None
+
+    def test_la_fecha_de_la_hoja_se_normaliza_a_000Z(self):
+        eventos = _envios()
+        assert eventos[0]["occurred_at"] == "2026-08-28T23:10:28.000Z"
+        assert all(e["occurred_at"].endswith(".000Z") for e in eventos)
+
+    def test_la_llave_es_lead_id_mas_fecha(self):
+        uno = _envios()[0]
+        esperado = radar_events.event_id_for(
+            "message_sent", "SC-a:2026-08-28T23:10:28.000Z"
+        )
+        assert uno["event_id"] == esperado
+
+    def test_recargar_el_historico_produce_los_mismos_event_id(self):
+        assert [e["event_id"] for e in _envios()] == [e["event_id"] for e in _envios()]
+
+    def test_una_fila_enviada_sin_lead_id_aborta(self):
+        with pytest.raises(bf.BackfillIncompleto, match="LEAD_ID"):
+            _envios([{"LEAD_ID": "", "ESTATUS": "ENVIADO_VIDA_TEMPORAL",
+                      "LAST_MESSAGE_AT": "2026-08-28 23:10:28", "WhatsApp": "6611107889"}])
+
+    def test_una_fecha_ilegible_aborta_en_vez_de_inventarse(self):
+        with pytest.raises(bf.BackfillIncompleto):
+            _envios([{"LEAD_ID": "SC-a", "ESTATUS": "ENVIADO_VIDA_TEMPORAL",
+                      "LAST_MESSAGE_AT": "el jueves", "WhatsApp": "6611107889"}])
+
+    def test_dos_filas_con_la_misma_llave_abortan(self):
+        repetida = dict(FILAS[0])
+        with pytest.raises(bf.BackfillIncompleto, match="repetida"):
+            _envios([FILAS[0], repetida])
+
+    def test_sin_filas_enviadas_aborta(self):
+        with pytest.raises(bf.BackfillIncompleto, match="ninguna fila"):
+            _envios([FILAS[2], FILAS[4]])
+
+
+class TestLotes:
+    def test_parte_en_lotes_de_como_mucho_cincuenta(self):
+        eventos = [{"event_id": str(i)} for i in range(140)]
+        lotes = bf.en_lotes(eventos)
+        assert [len(l["events"]) for l in lotes] == [50, 50, 40]
+
+    def test_no_pierde_ni_repite_ningun_evento(self):
+        eventos = [{"event_id": str(i)} for i in range(140)]
+        planos = [e for l in bf.en_lotes(eventos) for e in l["events"]]
+        assert planos == eventos
+
+    def test_rechaza_un_tamano_fuera_del_contrato(self):
+        with pytest.raises(ValueError):
+            bf.en_lotes([{"event_id": "1"}], tamano=51)
