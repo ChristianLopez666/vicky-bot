@@ -47,6 +47,7 @@ except Exception:  # pragma: no cover - dependencia opcional
 # Enchufe hacia Radar (contrato 1.1, commit f78ea40). Solo define el sobre,
 # la identidad de los eventos y la bitacora; no envia nada por si mismo.
 import radar_events
+import radar_acceptance
 
 
 # ==========================
@@ -814,6 +815,23 @@ _radar_client = radar_events.RadarClient(
     dispatch_token=os.getenv("RADAR_SITE_DISPATCH_TOKEN", "").strip(),
     enabled=os.getenv("RADAR_EMIT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"),
 )
+
+# Secreto propio de /ext/radar/acceptance-test, distinto de cualquier otro
+# token de este servicio (regla de la auditoria forense: nunca reutilizar un
+# secreto compartido para una superficie nueva).
+RADAR_ACCEPTANCE_TOKEN = os.getenv("RADAR_ACCEPTANCE_TOKEN", "").strip()
+
+# LEAD_ID real usado por esa prueba para el check "valido". No es secreto: ya
+# es visible en la columna LEAD_ID de la hoja de leads. Configurable por si
+# Work prefiere apuntar a otro de los 139 enlaces precargados.
+RADAR_ACCEPTANCE_KNOWN_LEAD_ID = os.getenv(
+    "RADAR_ACCEPTANCE_KNOWN_LEAD_ID", "SC-11eb5e0d-cc84-4e41-852a-9b681d452a0b"
+).strip()
+
+# phone_number_id de Vicky Redes. Tampoco es secreto -- Meta lo entrega en
+# metadata.phone_number_id de cada webhook -- solo se usa aqui para el check
+# opcional de aislamiento por numero.
+RADAR_REDES_PHONE_NUMBER_ID = os.getenv("RADAR_REDES_PHONE_NUMBER_ID", "876953768824165").strip()
 
 
 def record_radar_event(**kwargs) -> Optional[Dict[str, Any]]:
@@ -3347,6 +3365,58 @@ def ext_health():
         "openai_ready": bool(openai and OPENAI_API_KEY),
         "boardroom_enabled": BOARDROOM_ENABLED,
     }), 200
+
+
+@app.post("/ext/radar/acceptance-test")
+def radar_acceptance_test():
+    """Ejecucion unica de aceptacion contra Radar (contrato 1.1).
+
+    Pedido puntual del 2026-09-09: con las credenciales de SECOM ya guardadas
+    en Radar y en Render, falta correr firma/valido/duplicado/lead
+    desconocido/aislamiento una sola vez, mientras Work abre Radar
+    (accepting:true) y lo vuelve a cerrar.
+
+    NO activa el emisor general. radar_acceptance.run() construye su propio
+    RadarClient desechable con enabled=True solo dentro de esa llamada; este
+    endpoint nunca toca _radar_client ni RADAR_EMIT_ENABLED, y ambos quedan
+    exactamente como estaban antes y despues de correr esto. Las credenciales
+    que usa son las MISMAS que ya carga _radar_client desde el entorno -- se
+    leen de ahi, no se piden de nuevo -- para que la prueba refleje
+    exactamente lo que el emisor real usaria el dia que se encienda.
+
+    Protegido por un secreto propio (RADAR_ACCEPTANCE_TOKEN), no reutiliza
+    ningun otro token de este servicio.
+    """
+    token = (request.headers.get("X-Radar-Acceptance-Token") or "").strip()
+    if not RADAR_ACCEPTANCE_TOKEN or not hmac.compare_digest(token, RADAR_ACCEPTANCE_TOKEN):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    if not (_radar_client.url and _radar_client.token and _radar_client.hmac_secret):
+        return jsonify({
+            "ok": False,
+            "error": "faltan credenciales de Radar en el entorno "
+                     "(RADAR_EVENTS_URL/RADAR_VICKY_TOKEN/RADAR_VICKY_HMAC_SECRET)",
+        }), 400
+
+    try:
+        reporte = radar_acceptance.run(
+            url=_radar_client.url,
+            token=_radar_client.token,
+            hmac_secret=_radar_client.hmac_secret,
+            dispatch_token=_radar_client.dispatch_token,
+            phone_number_id=WABA_PHONE_ID,
+            known_lead_id=RADAR_ACCEPTANCE_KNOWN_LEAD_ID,
+            other_phone_number_id=RADAR_REDES_PHONE_NUMBER_ID,
+        )
+    except Exception as exc:
+        log.exception("❌ Error ejecutando la prueba de aceptacion de Radar")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    log.info(
+        "🧪 Prueba de aceptacion de Radar: %s/%s checks con criterio duro aprobados",
+        reporte.get("aprobados"), reporte.get("checks_con_criterio_duro"),
+    )
+    return jsonify({"ok": True, **reporte}), 200
 
 
 @app.post("/ext/test-send")
