@@ -27,10 +27,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 import radar_events
 
-# Fuente ajena usada solo para el intento de suplantacion del check de
-# aislamiento. bot-vicky (Redes) aun no tiene credenciales propias en Radar;
-# la prueba que SI se puede correr desde este lado es la inversa: demostrar
-# que el token de SECOM no basta para declararse Redes.
+# Fuente ajena usada solo en el check de consistencia cabecera/cuerpo
+# (aislamiento_fuente): el cuerpo declara esta fuente mientras la cabecera
+# sigue declarando la real (vicky_secom, la que prueban el token y el HMAC).
+# No es una prueba de aislamiento de credenciales entre SECOM y Redes -- eso
+# exige que Redes tenga su propio token real en Radar, y todavia no lo tiene
+# (correccion de Work, 2026-09-09).
 OTRA_FUENTE = "vicky_redes"
 
 # Identidad reservada para estas pruebas. Es un UUID valido pero jamas
@@ -165,15 +167,21 @@ def run(
     })
 
     # 2. VALIDO -----------------------------------------------------------
+    # known_lead_id debe ser un LEAD_ID confirmado por Work como ya presente
+    # en vicky_lead_links (no cualquier LEAD_ID real de la hoja sirve: el
+    # criterio exige lead_matched:true, no solo que Radar acepte el evento).
     evento_valido = _evento(known_lead_id, "valido")
     r2 = _post(cliente, evento_valido, poster=poster)
     cuerpo2 = r2.get("body") or {}
     resultados.append({
         "check": "valido",
-        "esperado": "200, duplicate:false",
+        "esperado": "200, duplicate:false, lead_matched:true",
         "obtenido": r2,
-        "paso": r2.get("status_code") == 200 and cuerpo2.get("duplicate") is False,
-        "lead_matched_informativo": cuerpo2.get("lead_matched"),
+        "paso": (
+            r2.get("status_code") == 200
+            and cuerpo2.get("duplicate") is False
+            and cuerpo2.get("lead_matched") is True
+        ),
     })
 
     # 3. DUPLICADO ----------------------------------------------------------
@@ -203,30 +211,37 @@ def run(
         "paso": r4.get("status_code") == 200 and cuerpo4.get("lead_matched") is False,
     })
 
-    # 5. AISLAMIENTO POR FUENTE -----------------------------------------------
-    # Credenciales REALES de SECOM (token + HMAC), pero el sobre y la
-    # cabecera declaran ser Redes. El token es lo que prueba la identidad
-    # del emisor -- declarar otra fuente con el mismo token debe rechazarse,
-    # o Redes podria mas adelante suplantar a SECOM con solo cambiar un
-    # campo del cuerpo.
-    evento_suplantado = _evento(known_lead_id, "aislamiento_fuente")
-    evento_suplantado["source"] = OTRA_FUENTE
-    r5 = _post(cliente, evento_suplantado, source_override=OTRA_FUENTE, poster=poster)
+    # 5. AISLAMIENTO POR FUENTE (inconsistencia cabecera/cuerpo) ---------------
+    # Correccion de Work (2026-09-09): la version anterior de este check
+    # declaraba vicky_redes tanto en la cabecera como en el cuerpo, usando el
+    # token real de SECOM -- eso no demuestra aislamiento entre fuentes,
+    # porque Redes todavia no tiene credenciales propias configuradas en
+    # Radar; el resultado no se podia interpretar con certeza. Lo que SI es
+    # verificable hoy, sin depender de Redes, es la regla de consistencia
+    # interna del contrato (seccion 3): "la fuente de la cabecera debe
+    # coincidir con la del cuerpo". Aqui la cabecera declara la fuente real
+    # (vicky_secom, la que prueban el token y el HMAC) y el cuerpo declara
+    # vicky_redes -- una inconsistencia dentro de la MISMA peticion, que
+    # Radar ya rechaza con 400 segun confirmo Work.
+    evento_inconsistente = _evento(known_lead_id, "aislamiento_fuente")
+    evento_inconsistente["source"] = OTRA_FUENTE
+    r5 = _post(cliente, evento_inconsistente, poster=poster)  # sin source_override: la cabecera sigue siendo vicky_secom
     resultados.append({
         "check": "aislamiento_fuente",
-        "esperado": "401 o 403 (el token de SECOM no autoriza declararse vicky_redes)",
+        "esperado": (
+            "400 (inconsistencia cabecera/cuerpo). No demuestra aislamiento "
+            "de credenciales entre SECOM y Redes -- eso requiere que Redes "
+            "tenga su propio token real configurado en Radar."
+        ),
         "obtenido": r5,
-        "paso": r5.get("status_code") in (401, 403),
+        "paso": r5.get("status_code") == 400,
     })
 
-    # 6. AISLAMIENTO POR NUMERO (opcional) -------------------------------------
+    # 6. AISLAMIENTO POR NUMERO -------------------------------------------------
     # channel.phone_number_id declarado es el de OTRO servicio (Redes), con
     # credenciales y fuente correctas de SECOM. No es un dato secreto -- Meta
-    # lo entrega en cada webhook -- pero el contrato lo fija como
-    # "restriccion obligatoria no secreta" (seccion 4): un token deberia
-    # estar amarrado a su propio numero. Sin aserto duro: que tan estricto
-    # se hizo cumplir esto es una decision de Work, no algo que este modulo
-    # pueda dar por sentado.
+    # lo entrega en cada webhook. Work confirmo que Radar ya lo rechaza de
+    # forma explicita con 403.
     if other_phone_number_id:
         # El evento de este check reemplaza su propio phone_number_id, no el
         # de SECOM usado en los demas.
@@ -235,12 +250,9 @@ def run(
         r6 = _post(cliente, evento6, poster=poster)
         resultados.append({
             "check": "aislamiento_numero",
-            "esperado": (
-                "rechazado, o aceptado pero marcado como numero no autorizado "
-                "para este token -- confirmar con Work que politica implemento"
-            ),
+            "esperado": "403 (phone_number_id no autorizado para este token)",
             "obtenido": r6,
-            "paso": None,
+            "paso": r6.get("status_code") == 403,
         })
 
     aprobados = sum(1 for r in resultados if r["paso"] is True)

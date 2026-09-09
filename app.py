@@ -822,10 +822,13 @@ _radar_client = radar_events.RadarClient(
 RADAR_ACCEPTANCE_TOKEN = os.getenv("RADAR_ACCEPTANCE_TOKEN", "").strip()
 
 # LEAD_ID real usado por esa prueba para el check "valido". No es secreto: ya
-# es visible en la columna LEAD_ID de la hoja de leads. Configurable por si
-# Work prefiere apuntar a otro de los 139 enlaces precargados.
+# es visible en la columna LEAD_ID de la hoja de leads. Confirmado por Work
+# (2026-09-09) como uno de los 139 enlaces precargados en vicky_lead_links de
+# produccion -- verificado ademas de este lado contra la hoja (ANTONIO COTA
+# LUGO, fila con ese mismo LEAD_ID exacto). Configurable si Work confirma
+# despues otro.
 RADAR_ACCEPTANCE_KNOWN_LEAD_ID = os.getenv(
-    "RADAR_ACCEPTANCE_KNOWN_LEAD_ID", "SC-11eb5e0d-cc84-4e41-852a-9b681d452a0b"
+    "RADAR_ACCEPTANCE_KNOWN_LEAD_ID", "SC-0088db7a-385f-4f48-bbae-2aa79ae92c5d"
 ).strip()
 
 # phone_number_id de Vicky Redes. Tampoco es secreto -- Meta lo entrega en
@@ -3386,6 +3389,11 @@ def radar_acceptance_test():
 
     Protegido por un secreto propio (RADAR_ACCEPTANCE_TOKEN), no reutiliza
     ningun otro token de este servicio.
+
+    Uso de un solo tiro por diseno (Work, 2026-09-09): despues de correr la
+    prueba, quitar RADAR_ACCEPTANCE_TOKEN de Render deja el endpoint inerte
+    de nuevo (responde 401) sin requerir un redeploy. No borra ni desactiva
+    nada del emisor real.
     """
     token = (request.headers.get("X-Radar-Acceptance-Token") or "").strip()
     if not RADAR_ACCEPTANCE_TOKEN or not hmac.compare_digest(token, RADAR_ACCEPTANCE_TOKEN):

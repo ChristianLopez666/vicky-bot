@@ -20,6 +20,9 @@ import radar_events
 
 PHONE_ID = "1045543821971905"
 OTRO_PHONE_ID = "876953768824165"
+# Mismo formato que el LEAD_ID real confirmado por Work el 2026-09-09
+# (SC-0088db7a-385f-4f48-bbae-2aa79ae92c5d, Antonio Cota Lugo) -- aqui se usa
+# un valor de prueba propio para no acoplar la suite a un dato de produccion.
 LEAD_ID = "SC-real-precargado"
 
 
@@ -34,31 +37,38 @@ class FakeResp:
 
 
 class PosterFalso:
-    """Responde segun lo que el propio evento del cuerpo declara, para poder
-    simular servidor sin necesitar un servidor real."""
+    """Simula el comportamiento de Radar confirmado por Work el 2026-09-09,
+    en el mismo orden de validacion: firma, consistencia cabecera/cuerpo,
+    numero autorizado, y solo entonces duplicado/lead_matched."""
 
     def __init__(self):
         self.llamadas = []
         self._vistos = set()
 
     def __call__(self, url, data=None, headers=None, timeout=None):
-        self.llamadas.append({"url": url, "data": data, "headers": dict(headers or {})})
+        headers = dict(headers or {})
+        self.llamadas.append({"url": url, "data": data, "headers": headers})
         evento = json.loads(data)
 
-        firma = (headers or {}).get("X-Vicky-Signature", "")
+        firma = headers.get("X-Vicky-Signature", "")
         if firma == ra.FIRMA_INVALIDA:
             return FakeResp(401, {"ok": False, "error": "invalid_signature"})
 
-        source_hdr = (headers or {}).get("X-Vicky-Source", "")
-        if source_hdr != "vicky_secom":
-            return FakeResp(403, {"ok": False, "error": "source_not_authorized_for_token"})
+        fuente_cabecera = headers.get("X-Vicky-Source", "")
+        fuente_cuerpo = evento.get("source", "")
+        if fuente_cabecera != fuente_cuerpo:
+            return FakeResp(400, {"ok": False, "error": "source_header_body_mismatch"})
+
+        numero = (evento.get("channel") or {}).get("phone_number_id", "")
+        if numero != PHONE_ID:
+            return FakeResp(403, {"ok": False, "error": "phone_number_id_not_authorized"})
 
         event_id = evento["event_id"]
         if event_id in self._vistos:
             return FakeResp(200, {"ok": True, "event_id": event_id, "duplicate": True})
         self._vistos.add(event_id)
 
-        lead_matched = evento["lead"]["lead_id"] != ra.LEAD_ID_DESCONOCIDO
+        lead_matched = evento["lead"]["lead_id"] == LEAD_ID
         return FakeResp(200, {
             "ok": True, "event_id": event_id, "duplicate": False,
             "lead_matched": lead_matched,
@@ -96,11 +106,13 @@ class TestSeisChecks:
         assert "aislamiento_numero" not in nombres
         assert len(nombres) == 5
 
-    def test_los_cinco_con_criterio_duro_pasan_contra_un_servidor_correcto(self, poster):
+    def test_los_seis_checks_pasan_contra_un_servidor_correcto(self, poster):
+        """Desde la correccion de Work (2026-09-09) los seis checks tienen
+        criterio duro: ninguno queda en None."""
         reporte = _run(poster)
-        con_criterio = [r for r in reporte["resultados"] if r["paso"] is not None]
-        assert len(con_criterio) == 5
-        assert all(r["paso"] for r in con_criterio), con_criterio
+        assert all(r["paso"] is not None for r in reporte["resultados"])
+        assert all(r["paso"] for r in reporte["resultados"]), reporte["resultados"]
+        assert reporte["aprobados"] == 6
 
 
 class TestFirmaInvalida:
@@ -127,12 +139,22 @@ class TestValidoYDuplicado:
         # posiciones: 0 firma_invalida, 1 valido, 2 duplicado
         assert cuerpos[1]["event_id"] == cuerpos[2]["event_id"]
 
-    def test_informa_lead_matched_sin_exigirlo(self, poster):
+    def test_valido_exige_lead_matched_true(self, poster):
+        """Correccion de Work (2026-09-09): known_lead_id ahora es un LEAD_ID
+        confirmado como ya enlazado, asi que el check exige lead_matched:true,
+        no solo duplicate:false."""
         reporte = _run(poster)
         valido = next(r for r in reporte["resultados"] if r["check"] == "valido")
-        assert valido["lead_matched_informativo"] is True
-        # el pase no depende de lead_matched, solo de duplicate:false
+        assert valido["obtenido"]["body"]["lead_matched"] is True
         assert valido["paso"] is True
+
+    def test_valido_falla_si_el_lead_id_no_esta_enlazado(self, poster):
+        """Si known_lead_id no coincide con lo que Radar reconoce, el check
+        debe fallar -- ya no basta con que el evento se acepte."""
+        reporte = _run(poster, known_lead_id="SC-no-enlazado-todavia")
+        valido = next(r for r in reporte["resultados"] if r["check"] == "valido")
+        assert valido["obtenido"]["body"]["lead_matched"] is False
+        assert valido["paso"] is False
 
 
 class TestLeadDesconocido:
@@ -148,14 +170,39 @@ class TestLeadDesconocido:
 
 
 class TestAislamiento:
-    def test_aislamiento_por_fuente_usa_credenciales_de_secom_pero_declara_redes(self, poster):
+    """Rediseño del 2026-09-09 (correccion de Work): la version anterior de
+    'aislamiento_fuente' declaraba vicky_redes tanto en cabecera como en
+    cuerpo usando el token real de SECOM -- eso no demuestra aislamiento de
+    credenciales entre fuentes, porque Redes todavia no tiene su propio
+    token configurado en Radar. Lo que SI es verificable hoy es la regla de
+    consistencia interna del contrato: la cabecera debe declarar lo mismo
+    que el cuerpo. Aqui la cabecera queda en vicky_secom (la real, la que
+    prueban el token y el HMAC) y solo el cuerpo declara vicky_redes."""
+
+    def test_aislamiento_por_fuente_deja_la_cabecera_en_secom_y_el_cuerpo_en_redes(self, poster):
         _run(poster)
         llamada = poster.llamadas[4]
         cuerpo = json.loads(llamada["data"])
-        assert llamada["headers"]["X-Vicky-Source"] == "vicky_redes"
+        assert llamada["headers"]["X-Vicky-Source"] == "vicky_secom"
         assert cuerpo["source"] == "vicky_redes"
-        # la firma SI se calcula con el HMAC real de SECOM, no uno inventado
+
+    def test_aislamiento_por_fuente_usa_la_firma_real_no_una_invalida(self, poster):
+        _run(poster)
+        llamada = poster.llamadas[4]
         assert llamada["headers"]["X-Vicky-Signature"] != ra.FIRMA_INVALIDA
+
+    def test_aislamiento_por_fuente_exige_400_por_inconsistencia(self, poster):
+        reporte = _run(poster)
+        fuente = next(r for r in reporte["resultados"] if r["check"] == "aislamiento_fuente")
+        assert fuente["obtenido"]["status_code"] == 400
+        assert fuente["paso"] is True
+
+    def test_aislamiento_por_fuente_no_afirma_probar_isolamiento_de_redes(self, poster):
+        """La aclaracion de Work debe quedar escrita en el reporte, no solo
+        en un comentario del codigo."""
+        reporte = _run(poster)
+        fuente = next(r for r in reporte["resultados"] if r["check"] == "aislamiento_fuente")
+        assert "no demuestra aislamiento" in fuente["esperado"].lower()
 
     def test_aislamiento_por_numero_usa_el_phone_number_id_de_redes(self, poster):
         _run(poster)
@@ -164,10 +211,22 @@ class TestAislamiento:
         # pero la fuente sigue siendo secom -- solo cambia el numero
         assert cuerpo6["source"] == "vicky_secom"
 
-    def test_aislamiento_por_numero_no_exige_un_resultado_concreto(self, poster):
+    def test_aislamiento_por_numero_exige_403_exacto(self, poster):
+        """Correccion de Work: Radar ya implementa esto de forma explicita,
+        asi que el check pasa a exigir 403 exacto, no solo reportar."""
         reporte = _run(poster)
         numero = next(r for r in reporte["resultados"] if r["check"] == "aislamiento_numero")
-        assert numero["paso"] is None
+        assert numero["obtenido"]["status_code"] == 403
+        assert numero["paso"] is True
+
+    def test_aislamiento_por_numero_falla_si_no_es_403(self, poster):
+        def poster_permisivo(url, data=None, headers=None, timeout=None):
+            return FakeResp(200, {"ok": True, "event_id": json.loads(data)["event_id"],
+                                   "duplicate": False, "lead_matched": True})
+
+        reporte = _run(poster_permisivo)
+        numero = next(r for r in reporte["resultados"] if r["check"] == "aislamiento_numero")
+        assert numero["paso"] is False
 
 
 class TestValidaciones:
