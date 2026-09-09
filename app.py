@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -42,6 +44,10 @@ try:
 except Exception:  # pragma: no cover - dependencia opcional
     openai = None
 
+# Enchufe hacia Radar (contrato 1.1, commit f78ea40). Solo define el sobre,
+# la identidad de los eventos y la bitacora; no envia nada por si mismo.
+import radar_events
+
 
 # ==========================
 # Carga entorno + logging
@@ -51,6 +57,19 @@ load_dotenv()
 META_TOKEN = os.getenv("META_TOKEN", "").strip()
 WABA_PHONE_ID = os.getenv("WABA_PHONE_ID", "").strip()
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "").strip()
+# Firma X-Hub-Signature-256 de Meta. Redes la verifica desde el hotfix del
+# 27-ago; SECOM se quedo fuera y su POST /webhook aceptaba cualquier cuerpo,
+# de modo que un tercero podia fabricar un mensaje entrante y disparar avisos
+# al asesor, respuestas reales al prospecto y escrituras en Sheets
+# (hallazgo F-01 de la auditoria forense 2026-09-04).
+#
+# El comportamiento se autoconfigura, igual que el aislamiento por
+# WABA_PHONE_ID de mas abajo: con el secreto presente la verificacion es
+# estricta y un cuerpo sin firma valida recibe 403; sin el secreto se procesa
+# el evento y se registra un ERROR visible. Desplegar esto no puede dejar mudo
+# al bot, y poner META_APP_SECRET en Render es lo unico que hace falta para
+# cerrar el agujero: no hay una segunda bandera que recordar.
+META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
 ADVISOR_NUMBER = os.getenv("ADVISOR_NUMBER", "5216682478005").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
@@ -130,6 +149,14 @@ CONVERSACIONES_TAB = os.getenv("SHEETS_TITLE_CONVERSACIONES", "CONVERSACIONES").
 _CONVERSACIONES_HEADER = ["Phone", "Nombre", "Mensaje", "Fecha", "Tipo", "Origen"]
 _conversaciones_tab_ready = False
 
+# Bitacora de eventos del contrato con Radar. Se crea sola como las anteriores.
+_eventos_radar_tab_ready = False
+
+# Nombre de campana con el que se estampan los eventos salientes. Hoy la
+# campana solo existe como texto dentro del comando del cron; esta variable es
+# el unico lugar del sistema donde queda escrita.
+RADAR_CAMPAIGN = os.getenv("RADAR_CAMPAIGN", "").strip()
+
 # Disparo automatico del kill switch: N envios fallidos seguidos pausan la
 # campana solos, sin esperar a que alguien llame /ext/boardroom/instruct a
 # mano. Contador en memoria (no en Sheets): si el servicio reinicia entre
@@ -196,6 +223,12 @@ ACTIVE_FUNNEL_PREFIXES = ("vida_", "imss_", "auto_", "tpv_", "emp_", "fp_")
 ESCAPE_COMMANDS = {"menu", "menú", "inicio", "cancelar", "salir"}
 
 # Campos que Boardroom/Vida puede actualizar sin abrir superficie de escritura arbitraria.
+# Columna de la hoja que guarda la identidad del contrato con Radar. Ya existe
+# y esta poblada en las 145 filas operativas con formato SC-<uuid4>, pero
+# ninguna linea del codigo la leia ni la escribia: la identidad efectiva era el
+# numero de fila, que cambia al insertar, borrar u ordenar (hallazgo F-09).
+LEAD_ID_COLUMN = "LEAD_ID"
+
 VIDA_SHEET_FIELDS = {
     "ESTATUS",
     "PRODUCTO",
@@ -408,7 +441,9 @@ def send_template_message(
     image_url: Optional[str] = None,
     components: Optional[List[Dict[str, Any]]] = None,
     language: str = DEFAULT_TEMPLATE_LANGUAGE,
-) -> bool:
+    retry_on_timeout: bool = True,
+    return_detail: bool = False,
+) -> bool | Dict[str, Any]:
     """Envía plantilla Meta aprobada.
 
     Reglas:
@@ -423,19 +458,36 @@ def send_template_message(
     Un rechazo de Meta NO se "auto-repara" reintentando con un payload
     distinto: la estructura de cada plantilla la declara quien llama
     (el cron), no se deduce de los mensajes de error.
+
+    retry_on_timeout=False desactiva el reintento cuando la peticion expira.
+    La Cloud API de Meta no admite clave de idempotencia, asi que un timeout
+    es ambiguo por naturaleza: Meta pudo haber aceptado el mensaje y el
+    reintento se lo entrega al prospecto por segunda vez (hallazgo F-04). El
+    camino de campana lo pasa en False y prefiere declarar el envio incierto.
+    Los timeouts siguen reintentandose en los demas llamadores, donde el
+    destinatario es el asesor y el riesgo es distinto.
+
+    return_detail=True devuelve un dict con ok, wamid y motivo del fallo, en
+    vez del bool historico. Sin el wamid no se puede correlacionar nada rio
+    abajo, y hasta ahora se extraia solo para escribirlo en una pestana que
+    no recibia las filas.
     """
+    def _resultado(ok: bool, wamid: str = "", motivo: str = "") -> bool | Dict[str, Any]:
+        if not return_detail:
+            return ok
+        return {"ok": ok, "wamid": wamid, "motivo": motivo}
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado para plantillas.")
-        return False
+        return _resultado(False, motivo="whatsapp_no_configurado")
 
     template_name = str(template_name or "").strip()
     if not template_name:
         log.error("❌ template_name vacío")
-        return False
+        return _resultado(False, motivo="template_vacio")
 
     if components is not None and not isinstance(components, list):
         log.error("❌ components inválido para plantilla %s; debe ser lista.", template_name)
-        return False
+        return _resultado(False, motivo="components_invalido")
 
     built_components: List[Dict[str, Any]] = []
 
@@ -450,12 +502,12 @@ def send_template_message(
                 final_image_url = os.getenv(img_env, "").strip()
                 if not final_image_url:
                     log.error("❌ Falta %s en entorno para plantilla %s.", img_env, template_name)
-                    return False
+                    return _resultado(False, motivo="falta_image_url_env")
 
         if final_image_url:
             if not final_image_url.startswith(("https://", "http://")):
                 log.error("❌ image_url inválida para plantilla %s.", template_name)
-                return False
+                return _resultado(False, motivo="image_url_invalida")
             built_components.append({
                 "type": "header",
                 "parameters": [{"type": "image", "image": {"link": final_image_url}}],
@@ -471,7 +523,7 @@ def send_template_message(
                 body_params = [{"type": "text", "text": str(v)} for v in params]
             else:
                 log.error("❌ params inválido para plantilla %s; debe ser dict, list o null.", template_name)
-                return False
+                return _resultado(False, motivo="params_invalido")
 
             if body_params:
                 built_components.append({"type": "body", "parameters": body_params})
@@ -505,26 +557,29 @@ def send_template_message(
                 except Exception:
                     pass
                 log.info("✅ Plantilla '%s' enviada exitosamente a %s", template_name, to)
-                return True
+                return _resultado(True, wamid=message_id)
 
             log.warning("⚠️ WPP send_template falló %s: %s", resp.status_code, resp.text[:500])
             if _should_retry(resp.status_code) and attempt < 2:
                 _backoff(attempt)
                 continue
-            return False
+            return _resultado(False, motivo=f"http_{resp.status_code}")
         except requests.exceptions.Timeout:
             log.error("⏰ Timeout enviando plantilla a %s (intento %s)", to, attempt + 1)
-            if attempt < 2:
+            # Un timeout no dice si Meta acepto el mensaje. Reintentarlo sin
+            # clave de idempotencia -- que la Cloud API no ofrece -- puede
+            # entregarle al prospecto el mismo mensaje comercial dos veces.
+            if retry_on_timeout and attempt < 2:
                 _backoff(attempt)
                 continue
-            return False
+            return _resultado(False, motivo="timeout")
         except Exception:
             log.exception("❌ Error en send_template_message a %s", to)
             if attempt < 2:
                 _backoff(attempt)
                 continue
-            return False
-    return False
+            return _resultado(False, motivo="excepcion")
+    return _resultado(False, motivo="agotado")
 
 def forward_media_to_advisor(media_type: str, media_id: str) -> None:
     if not (META_TOKEN and WPP_API_URL and ADVISOR_NUMBER and media_id):
@@ -691,6 +746,146 @@ def _log_conversacion(mensaje: str) -> None:
         log.exception("⚠️ No se pudo registrar el aviso al asesor en Sheets")
 
 
+def _ensure_eventos_radar_tab() -> None:
+    """Crea la bitacora de eventos del contrato con Radar si no existe."""
+    global _eventos_radar_tab_ready
+    if _eventos_radar_tab_ready:
+        return
+    _ensure_tab(radar_events.EVENTS_TAB, radar_events.EVENTS_HEADER, filas=1000)
+    _eventos_radar_tab_ready = True
+
+
+def _append_event_row(tab: str, fila: List[Any]) -> Optional[int]:
+    """Escribe una fila en la bitacora y devuelve su numero.
+
+    El numero sale de `updates.updatedRange` que responde Sheets, no de un
+    conteo propio: asi se puede marcar despues el resultado de la entrega a
+    Radar sin releer la pestana ni arriesgar apuntar a la fila equivocada.
+
+    Propaga las excepciones: quien decide si un fallo de bitacora importa es
+    EventLog, no esta funcion.
+    """
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        raise RuntimeError("Sheets no disponible para la bitacora de eventos.")
+    _ensure_eventos_radar_tab()
+    ultima = chr(ord("A") + len(radar_events.EVENTS_HEADER) - 1)
+    resp = sheets_svc.spreadsheets().values().append(
+        spreadsheetId=SHEETS_ID_LEADS,
+        range=f"{tab}!A:{ultima}",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [[("" if v is None else str(v)) for v in fila]]},
+    ).execute()
+    rango = ((resp or {}).get("updates") or {}).get("updatedRange") or ""
+    match = re.search(r"!\D+(\d+)", rango)
+    return int(match.group(1)) if match else None
+
+
+def _mark_event_delivery(row_number: Optional[int], estado: str) -> None:
+    """Anota en la bitacora como termino el intento de entrega a Radar."""
+    if not row_number or not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        return
+    try:
+        i_state = radar_events.EVENTS_HEADER.index("radar_state")
+        i_try = radar_events.EVENTS_HEADER.index("radar_last_try")
+        col_state = chr(ord("A") + i_state)
+        col_try = chr(ord("A") + i_try)
+        sheets_svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=SHEETS_ID_LEADS,
+            body={"valueInputOption": "RAW", "data": [
+                {"range": f"{radar_events.EVENTS_TAB}!{col_state}{row_number}",
+                 "values": [[estado]]},
+                {"range": f"{radar_events.EVENTS_TAB}!{col_try}{row_number}",
+                 "values": [[radar_events.canonical_ts()]]},
+            ]},
+        ).execute()
+    except Exception:
+        log.exception("⚠️ No se pudo marcar la entrega del evento en la fila %s", row_number)
+
+
+_event_log = radar_events.EventLog(_append_event_row)
+
+# Emisor hacia Radar. Apagado salvo que RADAR_EMIT_ENABLED lo encienda: este
+# interruptor es de Vicky y no depende de que Radar acepte o rechace.
+_radar_client = radar_events.RadarClient(
+    url=os.getenv("RADAR_EVENTS_URL", "").strip(),
+    token=os.getenv("RADAR_VICKY_TOKEN", "").strip(),
+    hmac_secret=os.getenv("RADAR_VICKY_HMAC_SECRET", "").strip(),
+    dispatch_token=os.getenv("RADAR_SITE_DISPATCH_TOKEN", "").strip(),
+    enabled=os.getenv("RADAR_EMIT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"),
+)
+
+
+def record_radar_event(**kwargs) -> Optional[Dict[str, Any]]:
+    """Arma el sobre del contrato y lo anota en la bitacora durable.
+
+    Nunca propaga: anotar un hecho no puede tumbar la respuesta al prospecto
+    ni un envio. Devuelve el evento cuando pudo construirse, para que quien
+    llama lo use en pruebas o en el emisor.
+    """
+    if not str(kwargs.get("lead_id") or "").strip():
+        # Condicion esperada, no excepcional: una hoja sin columna LEAD_ID, o
+        # una fila que aun no ha sido sellada. Se registra sin traza.
+        log.warning(
+            "⚠️ Evento %s sin LEAD_ID; no se anota", kwargs.get("event_type")
+        )
+        return None
+    try:
+        event = radar_events.build_event(**kwargs)
+    except Exception:
+        log.exception("⚠️ No se pudo construir el evento para Radar (%s)", kwargs.get("event_type"))
+        return None
+    fila = None
+    try:
+        fila = _event_log.record(event)
+    except Exception:
+        log.exception("⚠️ No se pudo anotar el evento %s", event.get("event_id"))
+
+    # La entrega va en un hilo aparte para no meter a Radar en la ruta critica
+    # del webhook, que ya tarda segundos con Sheets, Meta y Boardroom. Si falla,
+    # el evento se queda PENDIENTE en la bitacora y un barrido posterior lo
+    # reintenta con el mismo event_id: Radar lo descartara como duplicado si en
+    # realidad si habia llegado.
+    if _radar_client.configured():
+        def _entregar() -> None:
+            estado = _radar_client.send(event)
+            if estado != radar_events.PENDIENTE:
+                _mark_event_delivery(fila, estado)
+        threading.Thread(target=_entregar, daemon=True, name="RadarEmit").start()
+
+    return event
+
+
+# ==========================
+# Firma de Meta (F-01)
+# ==========================
+_WARNED_NO_APP_SECRET = False
+
+
+def _verify_meta_signature(raw: bytes, header: str) -> bool:
+    """Valida X-Hub-Signature-256. Sin secreto configurado, no bloquea.
+
+    Mismo criterio degradable que el aislamiento por WABA_PHONE_ID: la
+    ausencia de configuracion se hace visible como ERROR pero no deja mudo al
+    bot al desplegar. Con META_APP_SECRET presente la verificacion es
+    estricta.
+    """
+    global _WARNED_NO_APP_SECRET
+    if not META_APP_SECRET:
+        if not _WARNED_NO_APP_SECRET:
+            log.error(
+                "❌ META_APP_SECRET no configurado: el webhook acepta cuerpos sin "
+                "firmar. Configuralo en Render para cerrar F-01."
+            )
+            _WARNED_NO_APP_SECRET = True
+        return True
+    header = (header or "").strip()
+    if not header.startswith("sha256="):
+        return False
+    esperado = "sha256=" + hmac.new(META_APP_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(esperado, header)
+
+
 def _is_campaign_paused() -> bool:
     """CF-4: lee el kill switch de la campana outbound desde Sheets.
 
@@ -834,13 +1029,76 @@ def match_client_in_sheets(phone_last10: str) -> Optional[Dict[str, Any]]:
                 estatus = _cell(row, i_status).strip() if i_status is not None else ""
                 last_at = _cell(row, i_last).strip() if i_last is not None else ""
                 log.info("✅ Cliente encontrado en Sheets: %s (%s)", nombre, target)
-                return {"row": row_number, "nombre": nombre, "estatus": estatus, "last_message_at": last_at, "raw": row}
+                return {
+                    "row": row_number,
+                    "nombre": nombre,
+                    "estatus": estatus,
+                    "last_message_at": last_at,
+                    # Identidad del contrato con Radar. Se lee, no se sella
+                    # aqui: el sellado ocurre al seleccionar la fila para
+                    # enviar, que es el unico momento definido por el
+                    # contrato 1.1. Un mensaje entrante no crea identidad.
+                    "lead_id": _cell(row, _idx(headers, LEAD_ID_COLUMN)).strip(),
+                    "raw": row,
+                }
 
         log.info("ℹ️ Cliente no encontrado en Sheets: %s", target)
         return None
     except Exception:
         log.exception("❌ Error buscando en Sheets")
         return None
+
+
+def _seal_lead_id(row_number_1based: int, headers: List[str], row: List[str]) -> str:
+    """Devuelve el LEAD_ID de la fila, generandolo y escribiendolo si falta.
+
+    Contrato 1.1, regla de identidad de SECOM: Vicky es duena del
+    identificador. Al seleccionar una fila para enviar lee su LEAD_ID; si esta
+    vacio genera SC-<uuid4>, lo persiste en esa misma fila y usa el valor
+    escrito. Si ya existe lo respeta sin transformarlo.
+
+    Sellar aqui y no en otro sitio no es arbitrario: Vicky no crea filas -- los
+    prospectos se capturan a mano en la hoja -- asi que la seleccion para envio
+    es el unico momento en que este servicio toca de forma fiable cada fila
+    antes de que su identidad importe.
+
+    Si la escritura falla se devuelve el identificador generado igualmente: es
+    preferible emitir el evento con una identidad que no quedo persistida (y
+    que Radar guardara con lead_matched:false) a perder el hecho por completo.
+    El fallo queda en el log.
+    """
+    j = _idx(headers, LEAD_ID_COLUMN)
+    if j is None:
+        log.warning("⚠️ No existe la columna '%s' en el Sheet; no se puede sellar", LEAD_ID_COLUMN)
+        return ""
+    existente = _cell(row, j).strip()
+    if existente:
+        return existente
+
+    nuevo = f"SC-{uuid.uuid4()}"
+    try:
+        _update_row_cells(int(row_number_1based), {LEAD_ID_COLUMN: nuevo}, headers)
+        log.info("🏷️ Fila %s sellada con %s", row_number_1based, nuevo)
+    except Exception:
+        log.exception("⚠️ No se pudo persistir %s en la fila %s", LEAD_ID_COLUMN, row_number_1based)
+    return nuevo
+
+
+def _lead_identity_for_phone(phone_last10: str) -> Dict[str, str]:
+    """Resuelve la identidad de contrato a partir de un telefono.
+
+    La usan los eventos que nacen de un webhook de Meta, donde lo unico que
+    llega es el numero del destinatario. No sella: si la fila no tiene
+    LEAD_ID todavia, el evento se emite sin identidad persistida y Radar lo
+    guarda con lead_matched:false hasta que el enlace exacto aparezca.
+    """
+    last10 = _normalize_phone_last10(phone_last10)
+    match = match_client_in_sheets(last10) or {}
+    return {
+        "lead_id": str(match.get("lead_id") or ""),
+        "nombre": str(match.get("nombre") or ""),
+        "phone_last10": last10,
+    }
 
 
 def append_envio_status(phone: str, message_id: str, status: str, template_name: str, timestamp_iso: str) -> None:
@@ -2646,10 +2904,352 @@ def _handle_awaiting_template_response(phone: str, text: str, match: Optional[Di
     return True
 
 
+def _handle_meta_statuses(local_values: List[Dict[str, Any]]) -> int:
+    """Convierte los `statuses` de Meta en eventos anotados en la bitacora.
+
+    Es la correccion del hallazgo F-03. Meta informa por webhook cada sent,
+    delivered, read y failed; el codigo anterior solo miraba esta lista cuando
+    el evento no traia mensajes, y de ella solo escribia un warning para los
+    fallos. Todo lo demas se perdia, y con ello la unica forma de distinguir
+    ENVIO_REALIZADO de entrega, de lectura y de contacto efectivo.
+
+    Solo observa: no toca user_state, ni funnels, ni manda mensajes. Un
+    webhook de estados jamas debe producir efectos comerciales.
+
+    Devuelve cuantos eventos se anotaron, para pruebas y logs.
+    """
+    anotados = 0
+    for value in local_values:
+        phone_number_id = str(((value.get("metadata") or {}).get("phone_number_id")) or "")
+        for st in radar_events.statuses_from_value(value):
+            if st["status"] == "failed":
+                # Se conserva el volcado completo: es la unica fuente de los
+                # codigos de error de Meta mientras la bitacora se consolida.
+                log.warning("❌ STATUS failed (detalle): %s", json.dumps(st, ensure_ascii=False))
+
+            event_type = radar_events.STATUS_TO_EVENT.get(st["status"])
+            if not event_type:
+                log.info("ℹ️ Status de Meta no mapeado: %s", st["status"])
+                continue
+
+            identidad = _lead_identity_for_phone(st["recipient"])
+            lead_id = identidad["lead_id"]
+            if not lead_id:
+                # Sin identidad persistida el sobre no cumple el contrato. Se
+                # deja rastro y se sigue: perder el hecho seria peor que no
+                # poder atarlo todavia.
+                log.warning(
+                    "⚠️ Status %s sin LEAD_ID para %s; no se anota evento",
+                    st["status"], st["recipient"][-4:],
+                )
+                continue
+
+            evento = record_radar_event(
+                event_type=event_type,
+                lead_id=lead_id,
+                phone_e164=_normalize_to_e164_mx(st["recipient"]),
+                phone_last10=identidad["phone_last10"],
+                name=identidad["nombre"] or None,
+                phone_number_id=phone_number_id,
+                occurred_at=st["occurred_at"],
+                wamid=st["wamid"],
+                direction="outbound",
+                delivery_status=st["status"],
+                error_code=st["error_code"],
+                error_title=st["error_title"],
+                trace={"service": "vicky-bot-secom", "origen": "webhook_status"},
+            )
+            if evento:
+                anotados += 1
+    return anotados
+
+
+def _handle_inbound_message(msg: Dict[str, Any]) -> None:
+    """Procesa UN mensaje entrante del webhook.
+
+    Extraido de webhook_receive sin cambio de logica: el cuerpo siempre
+    estuvo escrito para un solo mensaje y terminaba respondiendo HTTP 200.
+    Ahora responde el llamador, una vez, despues de recorrerlos todos.
+
+    El motivo del cambio es que Meta puede agrupar varios mensajes en un
+    mismo evento y el codigo tomaba `messages[0]`: los demas se perdian sin
+    log ni error (hallazgo F-02). Redes ya recorria la lista completa.
+    """
+    intent_handled = False
+    phone = msg.get("from")
+    if not phone:
+        log.warning("⚠️ Mensaje sin número de teléfono")
+        return
+
+    last10 = _normalize_phone_last10(phone)
+    match = match_client_in_sheets(last10)
+    st_now = user_state.get(phone, "")
+    idle = st_now in ("", "__greeted__")
+
+    mtype = msg.get("type")
+    if mtype == "text" and "text" in msg:
+        text = (msg.get("text") or {}).get("body", "").strip()
+        log.info("💬 Texto recibido de %s: %s", phone, text)
+
+        try:
+            append_respuesta_cliente(phone, _match_name(match), text, _utc_now_iso())
+        except Exception:
+            pass
+
+        _ensure_user(phone)["last_message"] = text
+
+        if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
+            # ACTIVE_DETERMINISTIC_FUNNEL_TURN (DOC-0043 regla 3): continua
+            # localmente sin bloquear en Boardroom por cada paso.
+            _emit_boardroom_observation(phone, msg, match, mtype, text)
+            _route_command(phone, text, match)
+            return
+
+        if SECOM_LOCAL_FALLBACK_ENABLED and st_now.startswith("awaiting_info:"):
+            _emit_boardroom_observation(phone, msg, match, mtype, text)
+            if _handle_awaiting_template_response(phone, text, match):
+                return
+            _stateless_text_fallback(phone, text, match, idle, last10)
+            return
+
+        if BOARDROOM_IS_AUTHORITY:
+            if SECOM_LOCAL_FALLBACK_ENABLED:
+                outcome, body = _consult_boardroom(phone, msg, match, mtype, text)
+                if outcome == "HANDLED":
+                    _execute_handled_boardroom_instruction(phone, body)
+                else:
+                    _stateless_text_fallback(phone, text, match, idle, last10)
+            else:
+                _handle_boardroom_authority(phone, msg, match, mtype, text)
+            return
+
+        # HOTFIX 2: si hay estado activo local, NO entra Boardroom ni interceptores globales.
+        active_local_state = user_state.get(phone, "").startswith(ACTIVE_FUNNEL_PREFIXES)
+        log.info("🧭 Router input phone=%s state=%s text=%s", phone, user_state.get(phone, ""), text)
+
+        if active_local_state:
+            _route_command(phone, text, match)
+            return
+
+        if _handle_awaiting_template_response(phone, text, match):
+            return
+
+        _emit_bus_event(phone=phone, text=text)
+
+        if BOARDROOM_ENABLED:
+            boardroom_result = send_to_boardroom(
+                phone,
+                text,
+                match=match,
+                message_id=msg.get("id"),
+                state=user_state.get(phone, ""),
+            )
+            if execute_boardroom_decision(phone, boardroom_result, match=match):
+                return
+
+        t_norm_info = text.strip().lower()
+        if t_norm_info in ("info", "informacion", "información", "mas info", "más info"):
+            last_tpl = ""
+            st = user_state.get(phone, "")
+            if st.startswith("awaiting_info:"):
+                last_tpl = st.split(":", 1)[1].strip()
+            if not last_tpl:
+                last_tpl = get_last_envio_template(last10)
+            if last_tpl in ("tpv_3", "promo_tpv", TPV_TEMPLATE_NAME):
+                user_state[phone] = "tpv_giro"
+                try:
+                    _notify_advisor(
+                        "🧾 Respuesta a plantilla (TPV)\n"
+                        f"Template: {last_tpl}\n"
+                        f"WhatsApp: {phone}\n"
+                        f"Nombre: {_match_name(match) or '(sin nombre)'}\n"
+                        f"Mensaje: {text}"
+                    )
+                except Exception:
+                    pass
+                send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+                return
+
+        if idle and match:
+            if _auto_is_context(match) and _explicit_non_auto_intent(text):
+                log.info("🔀 Escape de flujo AUTO por intención explícita: %s", text)
+            else:
+                if _alianza_is_context(match):
+                    if _handle_alianza_context_response(phone, text, match):
+                        intent_handled = True
+                if intent_handled:
+                    return
+
+                if _auto_is_context(match):
+                    if _handle_auto_context_response(phone, text, match):
+                        intent_handled = True
+                if intent_handled:
+                    return
+
+            if _tpv_is_context(match):
+                if tpv_start_from_reply(phone, text, match):
+                    intent_handled = True
+            if intent_handled:
+                return
+
+        if idle:
+            t_norm = text.strip().lower()
+            greet_words = {
+                "hola", "buenas", "buenos dias", "buenos días", "buen dia", "buen día",
+                "buenas tardes", "buenas noches", "hey", "que tal", "qué tal", "holi",
+            }
+            if t_norm in greet_words:
+                base = "Dime qué necesitas y con gusto te guío para ayudarte a encontrar el servicio que necesitas."
+                nombre = _match_name(match)
+                send_message(phone, f"Hola {nombre} 👋 {base}" if nombre else f"Hola 👋 {base}")
+                user_state[phone] = "__greeted__"
+                return
+
+            tpv_keywords = (
+                "tpv", "terminal", "terminales", "punto de venta", "punto-de-venta",
+                "cobrar con tarjeta", "cobro con tarjeta", "pagar con tarjeta",
+                "ligas de pago", "link de pago", "link pago", "cobro a distancia",
+            )
+            if any(k in t_norm for k in tpv_keywords):
+                user_state[phone] = "tpv_giro"
+                _notify_advisor(
+                    "🧠 Interés detectado (TPV)\n"
+                    f"WhatsApp: {phone}\n"
+                    f"Nombre: {_match_name(match) or '(sin nombre)'}\n"
+                    f"Mensaje: {text}"
+                )
+                send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
+                return
+
+        if idle and interpret_response(text) == "negative":
+            send_message(phone, "Gracias por tu respuesta. Quedo a tus órdenes para cualquier duda o si más adelante deseas revisarlo.")
+            user_state[phone] = "__greeted__"
+            send_main_menu(phone)
+            return
+
+        t_lower = text.lower().strip()
+        valid_commands = {
+            "1", "2", "3", "4", "5", "6", "7",
+            "menu", "menú", "inicio", "hola",
+            "imss", "ley 73", "prestamo", "préstamo", "pension", "pensión",
+            "auto", "seguro auto", "seguros de auto",
+            "vida", "salud", "seguro de vida", "seguro de salud",
+            "vrim", "tarjeta medica", "tarjeta médica",
+            "empresarial", "pyme", "credito", "crédito", "credito empresarial", "crédito empresarial",
+            "financiamiento", "financiamiento practico", "financiamiento práctico",
+            "contactar", "asesor", "contactar con christian",
+        }
+        if not t_lower.isdigit() and t_lower not in valid_commands and idle:
+            _notify_advisor(
+                "📩 Cliente INTERESADO / DUDA detectada\n"
+                f"WhatsApp: {phone}\n"
+                f"Mensaje: {text}"
+            )
+
+        if phone not in user_state:
+            user_state[phone] = "__greeted__"
+            if not match:
+                _greet_and_match(phone)
+
+        if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
+            prompt = text.split("sgpt:", 1)[1].strip()
+            try:
+                log.info("🧠 Procesando solicitud GPT para %s", phone)
+                completion = openai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.4,
+                )
+                answer = completion.choices[0].message.content.strip()
+                send_message(phone, answer)
+                return
+            except Exception:
+                log.exception("❌ Error llamando a OpenAI")
+                send_message(phone, "Hubo un detalle al procesar tu solicitud. Intentemos de nuevo.")
+                return
+
+        _route_command(phone, text, match)
+        return
+
+    if mtype in {"image", "document", "audio", "video"}:
+        log.info("📎 Multimedia recibida de %s: %s", phone, mtype)
+
+        if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
+            _emit_boardroom_observation(phone, msg, match, mtype, _message_text(msg, mtype))
+            _handle_media(phone, msg)
+            return
+
+        if BOARDROOM_IS_AUTHORITY:
+            if SECOM_LOCAL_FALLBACK_ENABLED:
+                outcome, body = _consult_boardroom(phone, msg, match, mtype, _message_text(msg, mtype))
+                if outcome == "HANDLED":
+                    _execute_handled_boardroom_instruction(phone, body)
+                else:
+                    _handle_media(phone, msg)
+            else:
+                _handle_boardroom_authority(phone, msg, match, mtype, _message_text(msg, mtype))
+            return
+        _handle_media(phone, msg)
+        return
+
+    if mtype == "button":
+        _btn = msg.get("button") or {}
+        button_text = (_btn.get("text") or _btn.get("payload") or "").strip()
+        if button_text:
+            log.info("🔘 Botón Quick Reply de %s: %s", phone, button_text)
+            try:
+                append_respuesta_cliente(phone, _match_name(match), button_text, _utc_now_iso())
+            except Exception:
+                pass
+
+            if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
+                _emit_boardroom_observation(phone, msg, match, mtype, button_text)
+                _route_command(phone, button_text, match)
+                return
+
+            if BOARDROOM_IS_AUTHORITY:
+                if SECOM_LOCAL_FALLBACK_ENABLED:
+                    outcome, body = _consult_boardroom(phone, msg, match, mtype, button_text)
+                    if outcome == "HANDLED":
+                        _execute_handled_boardroom_instruction(phone, body)
+                    elif not _handle_awaiting_template_response(phone, button_text, match):
+                        _route_command(phone, button_text, match)
+                else:
+                    _handle_boardroom_authority(phone, msg, match, mtype, button_text)
+                return
+            if _handle_awaiting_template_response(phone, button_text, match):
+                return
+            _route_command(phone, button_text, match)
+        return
+
+    if BOARDROOM_IS_AUTHORITY:
+        if SECOM_LOCAL_FALLBACK_ENABLED:
+            outcome, body = _consult_boardroom(phone, msg, match, mtype or "unknown", "")
+            if outcome == "HANDLED":
+                _execute_handled_boardroom_instruction(phone, body)
+            # NOT_HANDLED/FAILED: sin accion local segura definida para
+            # tipos de mensaje desconocidos -- se responde 200 sin enviar
+            # nada, igual que el log "tipo no manejado" de mas abajo.
+        else:
+            _handle_boardroom_authority(phone, msg, match, mtype or "unknown", "")
+        return
+
+    log.info("ℹ️ Tipo de mensaje no manejado: %s", mtype)
+    return
+
+
 @app.post("/webhook")
 def webhook_receive():
     try:
-        intent_handled = False
+        # F-01: la firma se verifica ANTES de mirar el cuerpo. Sin esto, un
+        # tercero con la URL podia fabricar un mensaje entrante y disparar
+        # avisos al asesor, respuestas reales al prospecto y escrituras en la
+        # hoja. Redes ya lo hacia; SECOM no.
+        raw = request.get_data()
+        if not _verify_meta_signature(raw, request.headers.get("X-Hub-Signature-256", "")):
+            log.warning("❌ Webhook rechazado: firma de Meta ausente o invalida")
+            return jsonify({"ok": False, "error": "invalid_signature"}), 403
+
         payload = request.get_json(force=True, silent=True) or {}
         log.info("📥 Webhook recibido: %s...", json.dumps(payload, ensure_ascii=False)[:500])
 
@@ -2700,277 +3300,24 @@ def webhook_receive():
             for st in (value.get("statuses") or [])
         ]
 
+        # Estados de Meta (sent/delivered/read/failed). Se procesan SIEMPRE,
+        # haya mensajes o no: antes solo se miraban cuando el evento venia
+        # sin mensajes, y aun asi se descartaban tras un warning. Son los
+        # unicos hechos que distinguen 'se envio' de 'llego' y de 'lo leyo'
+        # (hallazgo F-03).
+        _handle_meta_statuses(local_values)
+
         if not messages:
-            if statuses:
-                for st in statuses:
-                    try:
-                        if (st.get("status") or "").lower() == "failed":
-                            log.warning("❌ STATUS failed (detalle): %s", json.dumps(st, ensure_ascii=False))
-                    except Exception:
-                        pass
             log.info("ℹ️ Webhook sin mensajes (posible status update)")
             return jsonify({"ok": True}), 200
 
-        msg = messages[0]
-        phone = msg.get("from")
-        if not phone:
-            log.warning("⚠️ Mensaje sin número de teléfono")
-            return jsonify({"ok": True}), 200
-
-        last10 = _normalize_phone_last10(phone)
-        match = match_client_in_sheets(last10)
-        st_now = user_state.get(phone, "")
-        idle = st_now in ("", "__greeted__")
-
-        mtype = msg.get("type")
-        if mtype == "text" and "text" in msg:
-            text = (msg.get("text") or {}).get("body", "").strip()
-            log.info("💬 Texto recibido de %s: %s", phone, text)
-
+        # Un fallo procesando un mensaje no puede impedir los siguientes.
+        for mensaje in messages:
             try:
-                append_respuesta_cliente(phone, _match_name(match), text, _utc_now_iso())
+                _handle_inbound_message(mensaje)
             except Exception:
-                pass
+                log.exception("❌ Error procesando un mensaje del webhook")
 
-            _ensure_user(phone)["last_message"] = text
-
-            if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
-                # ACTIVE_DETERMINISTIC_FUNNEL_TURN (DOC-0043 regla 3): continua
-                # localmente sin bloquear en Boardroom por cada paso.
-                _emit_boardroom_observation(phone, msg, match, mtype, text)
-                _route_command(phone, text, match)
-                return jsonify({"ok": True}), 200
-
-            if SECOM_LOCAL_FALLBACK_ENABLED and st_now.startswith("awaiting_info:"):
-                _emit_boardroom_observation(phone, msg, match, mtype, text)
-                if _handle_awaiting_template_response(phone, text, match):
-                    return jsonify({"ok": True}), 200
-                _stateless_text_fallback(phone, text, match, idle, last10)
-                return jsonify({"ok": True}), 200
-
-            if BOARDROOM_IS_AUTHORITY:
-                if SECOM_LOCAL_FALLBACK_ENABLED:
-                    outcome, body = _consult_boardroom(phone, msg, match, mtype, text)
-                    if outcome == "HANDLED":
-                        _execute_handled_boardroom_instruction(phone, body)
-                    else:
-                        _stateless_text_fallback(phone, text, match, idle, last10)
-                else:
-                    _handle_boardroom_authority(phone, msg, match, mtype, text)
-                return jsonify({"ok": True}), 200
-
-            # HOTFIX 2: si hay estado activo local, NO entra Boardroom ni interceptores globales.
-            active_local_state = user_state.get(phone, "").startswith(ACTIVE_FUNNEL_PREFIXES)
-            log.info("🧭 Router input phone=%s state=%s text=%s", phone, user_state.get(phone, ""), text)
-
-            if active_local_state:
-                _route_command(phone, text, match)
-                return jsonify({"ok": True}), 200
-
-            if _handle_awaiting_template_response(phone, text, match):
-                return jsonify({"ok": True}), 200
-
-            _emit_bus_event(phone=phone, text=text)
-
-            if BOARDROOM_ENABLED:
-                boardroom_result = send_to_boardroom(
-                    phone,
-                    text,
-                    match=match,
-                    message_id=msg.get("id"),
-                    state=user_state.get(phone, ""),
-                )
-                if execute_boardroom_decision(phone, boardroom_result, match=match):
-                    return jsonify({"ok": True}), 200
-
-            t_norm_info = text.strip().lower()
-            if t_norm_info in ("info", "informacion", "información", "mas info", "más info"):
-                last_tpl = ""
-                st = user_state.get(phone, "")
-                if st.startswith("awaiting_info:"):
-                    last_tpl = st.split(":", 1)[1].strip()
-                if not last_tpl:
-                    last_tpl = get_last_envio_template(last10)
-                if last_tpl in ("tpv_3", "promo_tpv", TPV_TEMPLATE_NAME):
-                    user_state[phone] = "tpv_giro"
-                    try:
-                        _notify_advisor(
-                            "🧾 Respuesta a plantilla (TPV)\n"
-                            f"Template: {last_tpl}\n"
-                            f"WhatsApp: {phone}\n"
-                            f"Nombre: {_match_name(match) or '(sin nombre)'}\n"
-                            f"Mensaje: {text}"
-                        )
-                    except Exception:
-                        pass
-                    send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
-                    return jsonify({"ok": True}), 200
-
-            if idle and match:
-                if _auto_is_context(match) and _explicit_non_auto_intent(text):
-                    log.info("🔀 Escape de flujo AUTO por intención explícita: %s", text)
-                else:
-                    if _alianza_is_context(match):
-                        if _handle_alianza_context_response(phone, text, match):
-                            intent_handled = True
-                    if intent_handled:
-                        return jsonify({"ok": True}), 200
-
-                    if _auto_is_context(match):
-                        if _handle_auto_context_response(phone, text, match):
-                            intent_handled = True
-                    if intent_handled:
-                        return jsonify({"ok": True}), 200
-
-                if _tpv_is_context(match):
-                    if tpv_start_from_reply(phone, text, match):
-                        intent_handled = True
-                if intent_handled:
-                    return jsonify({"ok": True}), 200
-
-            if idle:
-                t_norm = text.strip().lower()
-                greet_words = {
-                    "hola", "buenas", "buenos dias", "buenos días", "buen dia", "buen día",
-                    "buenas tardes", "buenas noches", "hey", "que tal", "qué tal", "holi",
-                }
-                if t_norm in greet_words:
-                    base = "Dime qué necesitas y con gusto te guío para ayudarte a encontrar el servicio que necesitas."
-                    nombre = _match_name(match)
-                    send_message(phone, f"Hola {nombre} 👋 {base}" if nombre else f"Hola 👋 {base}")
-                    user_state[phone] = "__greeted__"
-                    return jsonify({"ok": True}), 200
-
-                tpv_keywords = (
-                    "tpv", "terminal", "terminales", "punto de venta", "punto-de-venta",
-                    "cobrar con tarjeta", "cobro con tarjeta", "pagar con tarjeta",
-                    "ligas de pago", "link de pago", "link pago", "cobro a distancia",
-                )
-                if any(k in t_norm for k in tpv_keywords):
-                    user_state[phone] = "tpv_giro"
-                    _notify_advisor(
-                        "🧠 Interés detectado (TPV)\n"
-                        f"WhatsApp: {phone}\n"
-                        f"Nombre: {_match_name(match) or '(sin nombre)'}\n"
-                        f"Mensaje: {text}"
-                    )
-                    send_message(phone, "✅ Perfecto. Para recomendarte la mejor terminal Inbursa, dime: ¿*a qué giro* pertenece tu negocio?")
-                    return jsonify({"ok": True}), 200
-
-            if idle and interpret_response(text) == "negative":
-                send_message(phone, "Gracias por tu respuesta. Quedo a tus órdenes para cualquier duda o si más adelante deseas revisarlo.")
-                user_state[phone] = "__greeted__"
-                send_main_menu(phone)
-                return jsonify({"ok": True}), 200
-
-            t_lower = text.lower().strip()
-            valid_commands = {
-                "1", "2", "3", "4", "5", "6", "7",
-                "menu", "menú", "inicio", "hola",
-                "imss", "ley 73", "prestamo", "préstamo", "pension", "pensión",
-                "auto", "seguro auto", "seguros de auto",
-                "vida", "salud", "seguro de vida", "seguro de salud",
-                "vrim", "tarjeta medica", "tarjeta médica",
-                "empresarial", "pyme", "credito", "crédito", "credito empresarial", "crédito empresarial",
-                "financiamiento", "financiamiento practico", "financiamiento práctico",
-                "contactar", "asesor", "contactar con christian",
-            }
-            if not t_lower.isdigit() and t_lower not in valid_commands and idle:
-                _notify_advisor(
-                    "📩 Cliente INTERESADO / DUDA detectada\n"
-                    f"WhatsApp: {phone}\n"
-                    f"Mensaje: {text}"
-                )
-
-            if phone not in user_state:
-                user_state[phone] = "__greeted__"
-                if not match:
-                    _greet_and_match(phone)
-
-            if text.lower().startswith("sgpt:") and openai and OPENAI_API_KEY:
-                prompt = text.split("sgpt:", 1)[1].strip()
-                try:
-                    log.info("🧠 Procesando solicitud GPT para %s", phone)
-                    completion = openai.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.4,
-                    )
-                    answer = completion.choices[0].message.content.strip()
-                    send_message(phone, answer)
-                    return jsonify({"ok": True}), 200
-                except Exception:
-                    log.exception("❌ Error llamando a OpenAI")
-                    send_message(phone, "Hubo un detalle al procesar tu solicitud. Intentemos de nuevo.")
-                    return jsonify({"ok": True}), 200
-
-            _route_command(phone, text, match)
-            return jsonify({"ok": True}), 200
-
-        if mtype in {"image", "document", "audio", "video"}:
-            log.info("📎 Multimedia recibida de %s: %s", phone, mtype)
-
-            if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
-                _emit_boardroom_observation(phone, msg, match, mtype, _message_text(msg, mtype))
-                _handle_media(phone, msg)
-                return jsonify({"ok": True}), 200
-
-            if BOARDROOM_IS_AUTHORITY:
-                if SECOM_LOCAL_FALLBACK_ENABLED:
-                    outcome, body = _consult_boardroom(phone, msg, match, mtype, _message_text(msg, mtype))
-                    if outcome == "HANDLED":
-                        _execute_handled_boardroom_instruction(phone, body)
-                    else:
-                        _handle_media(phone, msg)
-                else:
-                    _handle_boardroom_authority(phone, msg, match, mtype, _message_text(msg, mtype))
-                return jsonify({"ok": True}), 200
-            _handle_media(phone, msg)
-            return jsonify({"ok": True}), 200
-
-        if mtype == "button":
-            _btn = msg.get("button") or {}
-            button_text = (_btn.get("text") or _btn.get("payload") or "").strip()
-            if button_text:
-                log.info("🔘 Botón Quick Reply de %s: %s", phone, button_text)
-                try:
-                    append_respuesta_cliente(phone, _match_name(match), button_text, _utc_now_iso())
-                except Exception:
-                    pass
-
-                if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
-                    _emit_boardroom_observation(phone, msg, match, mtype, button_text)
-                    _route_command(phone, button_text, match)
-                    return jsonify({"ok": True}), 200
-
-                if BOARDROOM_IS_AUTHORITY:
-                    if SECOM_LOCAL_FALLBACK_ENABLED:
-                        outcome, body = _consult_boardroom(phone, msg, match, mtype, button_text)
-                        if outcome == "HANDLED":
-                            _execute_handled_boardroom_instruction(phone, body)
-                        elif not _handle_awaiting_template_response(phone, button_text, match):
-                            _route_command(phone, button_text, match)
-                    else:
-                        _handle_boardroom_authority(phone, msg, match, mtype, button_text)
-                    return jsonify({"ok": True}), 200
-                if _handle_awaiting_template_response(phone, button_text, match):
-                    return jsonify({"ok": True}), 200
-                _route_command(phone, button_text, match)
-            return jsonify({"ok": True}), 200
-
-        if BOARDROOM_IS_AUTHORITY:
-            if SECOM_LOCAL_FALLBACK_ENABLED:
-                outcome, body = _consult_boardroom(phone, msg, match, mtype or "unknown", "")
-                if outcome == "HANDLED":
-                    _execute_handled_boardroom_instruction(phone, body)
-                # NOT_HANDLED/FAILED: sin accion local segura definida para
-                # tipos de mensaje desconocidos -- se responde 200 sin enviar
-                # nada, igual que el log "tipo no manejado" de mas abajo.
-            else:
-                _handle_boardroom_authority(phone, msg, match, mtype or "unknown", "")
-            return jsonify({"ok": True}), 200
-
-        log.info("ℹ️ Tipo de mensaje no manejado: %s", mtype)
         return jsonify({"ok": True}), 200
 
     except Exception:
@@ -3339,43 +3686,145 @@ def ext_auto_send_one():
                     "template": template_name,
                 }), 400
 
-        ok = send_template_message(
+        # --- Identidad e idempotencia (F-04, F-09) --------------------------
+        # El orden importa y antes estaba al reves: se enviaba primero y se
+        # marcaba la fila despues. Si la marca fallaba, o el proceso reiniciaba
+        # en medio, la siguiente corrida volvia a elegir la misma fila y el
+        # prospecto recibia el mensaje otra vez, sin que quedara rastro.
+        lead_id = _seal_lead_id(nxt["row_number"], headers, nxt.get("row") or [])
+        request_id = str(uuid.uuid4())
+        reservado_en = _utc_now_iso()
+
+        # Reserva: escribir LAST_MESSAGE_AT saca la fila de _pick_next_pending,
+        # asi que a partir de aqui nadie mas puede elegirla. Si el proceso
+        # muere despues de esto, la fila queda visible como ENVIANDO y NO se
+        # reenvia: preferimos una fila atorada que un segundo mensaje al
+        # prospecto. Si la reserva falla no se envia nada.
+        try:
+            _update_row_cells(
+                nxt["row_number"],
+                {"ESTATUS": "ENVIANDO", "LAST_MESSAGE_AT": reservado_en},
+                headers,
+            )
+        except Exception as exc:
+            log.exception("❌ No se pudo reservar la fila %s; no se envia", nxt["row_number"])
+            return jsonify({
+                "ok": False, "sent": False, "reason": "reserva_fallida",
+                "row": nxt["row_number"], "error": str(exc),
+            }), 503
+
+        evento_base = {
+            "lead_id": lead_id,
+            "phone_e164": to,
+            "phone_last10": _normalize_phone_last10(to),
+            "name": nombre if nombre != "Cliente" else None,
+            "phone_number_id": WABA_PHONE_ID,
+            "request_id": request_id,
+            "template": template_name,
+            "campaign": RADAR_CAMPAIGN or None,
+            "direction": "outbound",
+        }
+        record_radar_event(
+            event_type="message_requested",
+            occurred_at=radar_events.canonical_ts(),
+            delivery_status="requested",
+            trace={"service": "vicky-bot-secom", "sheet_row": nxt["row_number"]},
+            **evento_base,
+        )
+
+        detalle = send_template_message(
             to,
             template_name,
             params=params,
             image_url=image_url,
             components=components,
             language=language,
+            # Un timeout aqui no se reintenta: ver send_template_message.
+            retry_on_timeout=False,
+            return_detail=True,
         )
+        if not isinstance(detalle, dict):
+            # Tolerancia al contrato historico de la funcion, que devolvia un
+            # bool. Mantiene en pie a cualquier llamador o doble de prueba que
+            # todavia asuma esa forma.
+            detalle = {"ok": bool(detalle), "wamid": "", "motivo": "" if detalle else "desconocido"}
+        ok = bool(detalle.get("ok"))
+        wamid = str(detalle.get("wamid") or "")
+        motivo = str(detalle.get("motivo") or "")
+        incierto = (not ok) and motivo == "timeout"
 
         if ok:
             user_state[to] = f"awaiting_info:{template_name}"
             data = _ensure_user(to)
             data["awaiting_info_started_at"] = _utc_now_iso()
+            record_radar_event(
+                event_type="message_sent",
+                occurred_at=radar_events.canonical_ts(),
+                wamid=wamid,
+                delivery_status="sent",
+                trace={"service": "vicky-bot-secom", "sheet_row": nxt["row_number"]},
+                **evento_base,
+            )
+        elif incierto:
+            # No se emite message_failed: seria afirmar que no llego, y nadie
+            # lo sabe. El message_requested queda sin resolucion, que es
+            # exactamente la verdad disponible.
+            log.error(
+                "⁉️ Envio incierto a %s (timeout sin respuesta de Meta); fila %s marcada para revision",
+                to, nxt["row_number"],
+            )
         else:
             try:
                 append_envio_status(to, "", "failed", template_name, _utc_now_iso())
             except Exception:
                 pass
+            record_radar_event(
+                event_type="message_failed",
+                occurred_at=radar_events.canonical_ts(),
+                delivery_status="failed",
+                error_title=motivo or None,
+                trace={"service": "vicky-bot-secom", "sheet_row": nxt["row_number"]},
+                **evento_base,
+            )
 
+        # Un envio incierto cuenta como fallo para la auto-pausa: si Meta deja
+        # de responder, la campana debe frenarse igual.
         auto_paused = _register_send_result(ok)
 
         now_iso = _utc_now_iso()
-        if not ok:
-            estatus_val = "FALLO_ENVIO"
-        else:
+        if ok:
             estatus_val = success_status or _status_for_template(template_name)
-        _update_row_cells(nxt["row_number"], {"ESTATUS": estatus_val, "LAST_MESSAGE_AT": now_iso}, headers)
+        elif incierto:
+            estatus_val = "ENVIO_INCIERTO"
+        else:
+            estatus_val = "FALLO_ENVIO"
+        # Cierre de la reserva. Si esta escritura falla la fila se queda en
+        # ENVIANDO, que sigue siendo seguro: no se reenvia.
+        try:
+            _update_row_cells(
+                nxt["row_number"], {"ESTATUS": estatus_val, "LAST_MESSAGE_AT": now_iso}, headers
+            )
+        except Exception:
+            log.exception(
+                "⚠️ Envio resuelto como %s pero no se pudo cerrar la fila %s; queda en ENVIANDO",
+                estatus_val, nxt["row_number"],
+            )
 
         response = {
             "ok": True,
             "sent": bool(ok),
             "to": to,
             "row": nxt["row_number"],
+            "lead_id": lead_id,
+            "request_id": request_id,
+            "wamid": wamid,
             "nombre": nombre,
             "template": template_name,
+            "estatus": estatus_val,
             "timestamp": now_iso,
         }
+        if incierto:
+            response["uncertain"] = True
         if auto_paused:
             response["auto_paused"] = True
         return jsonify(response), 200

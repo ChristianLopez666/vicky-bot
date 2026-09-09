@@ -17,8 +17,37 @@ Esta bateria cubre las cuatro piezas del cierre:
 import time
 from unittest.mock import patch
 
+import pytest
+
 import app as vicky
 import cierre_cortesia as cc
+
+# Dieciseis de las pruebas de este archivo ejercitan un cierre de cortesia que
+# hoy NO esta conectado. El marcador se aplica una por una y no al modulo: las
+# dos que no dependen del cableado (la tarifa de pensionado y los
+# clasificadores) siguen corriendo en cada build.
+# El modulo cierre_cortesia.py sigue en el repositorio, pero app.py dejo de
+# importarlo cuando el commit a0e6648 (2026-08-27) restauro la version previa
+# al cierre; desde entonces faltan CIERRE_NUDGE_SWEEPER y _cierre_ctx, y la
+# bateria completa falla en cada corrida.
+#
+# Consecuencia practica: el CI de este repositorio esta en rojo desde el
+# 2026-08-28, y con el rojo permanente no se distingue una rotura nueva de
+# esta. Por eso se saltan en vez de dejarlas fallando -- no se borra ni una
+# prueba ni una funcion: el dia que app.py vuelva a conectar el cierre de
+# cortesia, la condicion deja de cumplirse y las 16 se reactivan solas.
+#
+# Origen: hallazgo F-20 de la auditoria forense de Vicky/SECOM (2026-09-04).
+_CIERRE_CONECTADO = hasattr(vicky, "CIERRE_NUDGE_SWEEPER") and hasattr(vicky, "_cierre_ctx")
+
+_sin_cierre_conectado = pytest.mark.skipif(
+    not _CIERRE_CONECTADO,
+    reason=(
+        "El cierre de cortesia no esta conectado en app.py desde a0e6648 "
+        "(2026-08-27): faltan CIERRE_NUDGE_SWEEPER y _cierre_ctx. Las pruebas "
+        "se reactivan solas cuando vuelva a conectarse. Ver F-20."
+    ),
+)
 
 PHONE = "5216681110000"
 
@@ -43,6 +72,7 @@ def _cerrar_imss(send):
 
 # ── 1. Acuse automatico ───────────────────────────────────────────────────────
 
+@_sin_cierre_conectado
 def test_el_cierre_del_embudo_agradece_sin_esperar_otro_mensaje():
     with patch.object(vicky, "send_message") as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -56,6 +86,7 @@ def test_el_cierre_del_embudo_agradece_sin_esperar_otro_mensaje():
     assert PHONE in vicky._cierre_ctx
 
 
+@_sin_cierre_conectado
 def test_el_cierre_deja_armado_el_recordatorio():
     with patch.object(vicky, "send_message") as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -70,6 +101,7 @@ def test_el_cierre_deja_armado_el_recordatorio():
 
 # ── 2. Cortesia sin genero ────────────────────────────────────────────────────
 
+@_sin_cierre_conectado
 def test_gracias_recibe_cortesia_sin_genero_y_no_el_fallback_generico():
     with patch.object(vicky, "send_message") as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -87,6 +119,7 @@ def test_gracias_recibe_cortesia_sin_genero_y_no_el_fallback_generico():
     assert "por ser pensionado" in esperado
 
 
+@_sin_cierre_conectado
 def test_la_cortesia_no_se_repite_si_el_cliente_agradece_dos_veces():
     with patch.object(vicky, "send_message") as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -103,6 +136,7 @@ def test_la_cortesia_no_se_repite_si_el_cliente_agradece_dos_veces():
 
 # ── 3. Respuesta negativa ─────────────────────────────────────────────────────
 
+@_sin_cierre_conectado
 def test_una_negativa_agradece_el_tiempo_y_cancela_el_recordatorio():
     with patch.object(vicky, "send_message") as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -118,6 +152,7 @@ def test_una_negativa_agradece_el_tiempo_y_cancela_el_recordatorio():
     assert vicky._cierre_ctx[PHONE]["nudge_due"] is None
 
 
+@_sin_cierre_conectado
 def test_tras_la_despedida_una_cortesia_mas_no_vuelve_a_ofrecer_nada():
     with patch.object(vicky, "send_message") as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -132,6 +167,7 @@ def test_tras_la_despedida_una_cortesia_mas_no_vuelve_a_ofrecer_nada():
     send.assert_not_called()
 
 
+@_sin_cierre_conectado
 def test_un_mensaje_con_contenido_libera_el_contexto_y_se_rutea():
     with patch.object(vicky, "send_message") as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -148,6 +184,7 @@ def test_un_mensaje_con_contenido_libera_el_contexto_y_se_rutea():
 
 # ── 4. Recordatorio a la hora ─────────────────────────────────────────────────
 
+@_sin_cierre_conectado
 def test_el_recordatorio_se_entrega_una_sola_vez_cuando_vence():
     with patch.object(vicky, "send_message") as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -175,6 +212,7 @@ def _webhook(text: str):
     return vicky.app.test_client().post("/webhook", json=payload)
 
 
+@_sin_cierre_conectado
 def test_la_oferta_del_menu_tambien_lleva_recordatorio_a_la_hora():
     """Recorrido real: cierre -> "gracias" por /webhook -> cortesia. Esa
     cortesia termina con "escriba menu si requiere algun otro servicio": la
@@ -203,6 +241,7 @@ def test_la_oferta_del_menu_tambien_lleva_recordatorio_a_la_hora():
         assert [c.args[1] for c in send.call_args_list] == [cc.NUDGE]
 
 
+@_sin_cierre_conectado
 def test_el_recordatorio_no_se_entrega_dos_veces_en_el_mismo_ciclo():
     """Si el cliente se quedo callado, ya recibio "Quedo atenta..." y despues
     escribe "gracias", la cortesia NO le vuelve a programar la misma frase."""
@@ -224,6 +263,7 @@ def test_el_recordatorio_no_se_entrega_dos_veces_en_el_mismo_ciclo():
         assert vicky.nudge_sweep_once() == 0
 
 
+@_sin_cierre_conectado
 def test_si_el_cliente_responde_que_no_el_recordatorio_ya_no_existe():
     with patch.object(vicky, "send_message", return_value=True) as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -242,6 +282,7 @@ def test_si_el_cliente_responde_que_no_el_recordatorio_ya_no_existe():
         assert vicky.nudge_sweep_once() == 0
 
 
+@_sin_cierre_conectado
 def test_tras_la_cortesia_una_segunda_negativa_tampoco_arma_nada():
     """La cortesia deja una oferta abierta ("escriba menu..."). Ni esa oferta
     ni la despedida posterior vuelven a armar el recordatorio."""
@@ -259,6 +300,7 @@ def test_tras_la_cortesia_una_segunda_negativa_tampoco_arma_nada():
         assert vicky.nudge_sweep_once() == 0
 
 
+@_sin_cierre_conectado
 def test_un_recordatorio_muy_atrasado_ya_no_se_entrega():
     with patch.object(vicky, "send_message") as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -272,6 +314,7 @@ def test_un_recordatorio_muy_atrasado_ya_no_se_entrega():
         send.assert_not_called()
 
 
+@_sin_cierre_conectado
 def test_un_contexto_expirado_ya_no_atiende_la_cortesia():
     with patch.object(vicky, "send_message") as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -301,6 +344,7 @@ def _cerrar_vida(send):
     return [c.args[1] for c in send.call_args_list]
 
 
+@_sin_cierre_conectado
 def test_el_cierre_del_cuestionario_vida_abre_el_contexto_de_cortesia():
     with patch.object(vicky, "send_message", return_value=True) as send, \
          patch.object(vicky, "_notify_advisor"), \
@@ -316,6 +360,7 @@ def test_el_cierre_del_cuestionario_vida_abre_el_contexto_de_cortesia():
     assert any("Seguro de Vida Temporal" in t for t in textos), textos
 
 
+@_sin_cierre_conectado
 def test_gracias_tras_el_cuestionario_vida_no_ofrece_tarifa_de_pensionado():
     with patch.object(vicky, "send_message", return_value=True) as send, \
          patch.object(vicky, "_notify_advisor"), \

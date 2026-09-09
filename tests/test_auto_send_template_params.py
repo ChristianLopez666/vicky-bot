@@ -331,7 +331,10 @@ def test_success_status_from_cron_is_used(client, auto_send_token, sheet_and_wpp
     })
 
     assert resp.status_code == 200
-    _, updates = sheet_and_wpp["row_updates"][0]
+    # [-1] y no [0]: desde la correccion de idempotencia (F-04) la primera
+    # escritura es la RESERVA de la fila (ESTATUS=ENVIANDO), hecha antes de
+    # llamar a Meta, y el estatus definitivo se escribe al cerrar.
+    _, updates = sheet_and_wpp["row_updates"][-1]
     assert updates["ESTATUS"] == "ENVIADO_VIDA_TEMPORAL"
     assert updates["LAST_MESSAGE_AT"]
 
@@ -340,7 +343,10 @@ def test_without_success_status_falls_back_to_status_for_template(client, auto_s
     resp = _send(client, {"template": "promo_vrim_prestamo"})
 
     assert resp.status_code == 200
-    _, updates = sheet_and_wpp["row_updates"][0]
+    # [-1] y no [0]: desde la correccion de idempotencia (F-04) la primera
+    # escritura es la RESERVA de la fila (ESTATUS=ENVIANDO), hecha antes de
+    # llamar a Meta, y el estatus definitivo se escribe al cerrar.
+    _, updates = sheet_and_wpp["row_updates"][-1]
     assert updates["ESTATUS"] == vicky._status_for_template("promo_vrim_prestamo")
 
 
