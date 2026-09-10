@@ -91,7 +91,7 @@ class TestValidarLote:
         a = _evento(1)
         b = _evento(2)
         b["source"] = "vicky_redes"
-        with pytest.raises(ValueError, match="fuentes"):
+        with pytest.raises(ValueError, match="cargador solo admite source"):
             rb.validar_lote([a, b])
 
     def test_numeros_mezclados_se_rechaza(self):
@@ -100,6 +100,33 @@ class TestValidarLote:
         b["channel"]["phone_number_id"] = "876953768824165"
         with pytest.raises(ValueError, match="phone_number_id"):
             rb.validar_lote([a, b])
+
+    def test_solo_admite_source_vicky_secom(self):
+        """Aunque el lote sea internamente consistente (una sola fuente),
+        si esa fuente no es vicky_secom este cargador lo rechaza -- no es
+        un canal generico para cualquier emisor del contrato."""
+        ev = _evento(1)
+        ev["source"] = "vicky_redes"
+        with pytest.raises(ValueError, match="cargador solo admite source"):
+            rb.validar_lote([ev])
+
+    def test_rechaza_tipos_de_evento_no_permitidos(self):
+        ev = radar_events.build_event(
+            "message_delivered", lead_id="SC-a", phone_number_id=PHONE_ID,
+            occurred_at="2026-08-28T23:10:59.000Z", delivery_status="delivered",
+            wamid="wamid.no-permitido", request_id="req-1", backfill=False,
+        )
+        with pytest.raises(ValueError, match="event_type"):
+            rb.validar_lote([ev])
+
+    def test_rechaza_eventos_sin_backfill_true(self):
+        ev = radar_events.build_event(
+            "message_sent", lead_id="SC-a", phone_number_id=PHONE_ID,
+            occurred_at="2026-08-28T23:10:59.000Z", delivery_status="sent",
+            wamid="wamid.sin-backfill", backfill=False,
+        )
+        with pytest.raises(ValueError, match="backfill"):
+            rb.validar_lote([ev])
 
 
 # ==========================================================================
@@ -142,6 +169,32 @@ class TestCargaBasica:
         # es que load_batches nunca improvisa un secreto propio.
         firma = poster.llamadas[0]["headers"]["X-Vicky-Signature"]
         assert firma.startswith("sha256=")
+
+
+class TestFormaRealDeLosLotes:
+    """backfill_historico.en_lotes() -- lo que realmente construyo los 3
+    lotes de envios y el lote de fallos ya guardados en disco -- envuelve
+    cada lote como {"events": [...]}, no como lista simple. Sin esta
+    normalizacion, load_batches habria rechazado los archivos reales."""
+
+    def test_acepta_un_lote_envuelto_en_events(self, poster):
+        lote_envuelto = {"events": [_evento(1), _evento(2)]}
+        reporte = rb.load_batches(
+            url=URL_EVENTO, token="t", hmac_secret="s", dispatch_token="",
+            batches=[lote_envuelto], poster=poster,
+        )
+        assert reporte["completo"] is True
+        assert reporte["eventos_enviados"] == 2
+        cuerpo_enviado = json.loads(poster.llamadas[0]["data"])
+        assert len(cuerpo_enviado["events"]) == 2
+
+    def test_mezcla_de_formas_envuelta_y_simple_funciona_igual(self, poster):
+        reporte = rb.load_batches(
+            url=URL_EVENTO, token="t", hmac_secret="s", dispatch_token="",
+            batches=[{"events": [_evento(1)]}, [_evento(2)]], poster=poster,
+        )
+        assert reporte["eventos_totales_a_cargar"] == 2
+        assert reporte["completo"] is True
 
 
 class TestSeDetieneEnElPrimerFallo:
@@ -195,6 +248,63 @@ class TestUnServidorInalcanzable:
         reporte = _cargar(revienta)
         assert reporte["completo"] is False
         assert reporte["resultados"][0]["status_code"] is None
+        # El primer lote por defecto (_cargar) trae 2 eventos.
+        assert reporte["totales_por_categoria"]["errores"] == 2
+
+
+# ==========================================================================
+# resumen por lote: aceptados / duplicados / conciliados / no_conciliados / errores
+# ==========================================================================
+class TestResumenPorLote:
+    def test_sin_desglose_por_evento_se_cuenta_como_aceptado_a_nivel_de_lote(self, poster):
+        """El PosterFalso por defecto responde 200 sin una lista de resultados
+        por evento -- exactamente lo que pasaria si Radar acepta el lote pero
+        su respuesta de /events/batch no trae el desglose fino. No se inventan
+        duplicados ni conciliaciones que no se pueden ver."""
+        reporte = _cargar(poster)
+        assert reporte["totales_por_categoria"] == {
+            "aceptados": 3, "duplicados": 0, "conciliados": 0,
+            "no_conciliados": 0, "errores": 0,
+        }
+        assert reporte["resultados"][0]["resumen"]["detalle_por_evento"] is False
+
+    def test_con_desglose_por_evento_cuenta_duplicados_y_conciliacion(self, poster):
+        poster._respuestas = [FakeResp(200, {"results": [
+            {"event_id": "a", "duplicate": False, "lead_matched": True},
+            {"event_id": "b", "duplicate": True, "lead_matched": True},
+        ]})]
+        reporte = _cargar(poster, batches=[[_evento(1), _evento(2)]])
+        resumen = reporte["resultados"][0]["resumen"]
+        assert resumen["detalle_por_evento"] is True
+        assert resumen == {
+            "aceptados": 1, "duplicados": 1, "conciliados": 2,
+            "no_conciliados": 0, "errores": 0, "detalle_por_evento": True,
+        }
+
+    def test_lead_no_conciliado_se_cuenta_aparte(self, poster):
+        poster._respuestas = [FakeResp(200, {"results": [
+            {"event_id": "a", "duplicate": False, "lead_matched": False},
+        ]})]
+        reporte = _cargar(poster, batches=[[_evento(1)]])
+        resumen = reporte["resultados"][0]["resumen"]
+        assert resumen["no_conciliados"] == 1
+        assert resumen["conciliados"] == 0
+
+    def test_un_lote_rechazado_cuenta_como_error_no_como_aceptado(self, poster):
+        poster._respuestas = [FakeResp(400, {"error": "invalid"})]
+        reporte = _cargar(poster, batches=[[_evento(1), _evento(2)]])
+        assert reporte["totales_por_categoria"]["errores"] == 2
+        assert reporte["totales_por_categoria"]["aceptados"] == 0
+
+    def test_los_totales_suman_a_traves_de_varios_lotes(self, poster):
+        poster._respuestas = [
+            FakeResp(200, {"results": [{"event_id": "a", "duplicate": False, "lead_matched": True}]}),
+            FakeResp(200, {"results": [{"event_id": "b", "duplicate": True, "lead_matched": True}]}),
+        ]
+        reporte = _cargar(poster, batches=[[_evento(1)], [_evento(2)]])
+        assert reporte["totales_por_categoria"]["aceptados"] == 1
+        assert reporte["totales_por_categoria"]["duplicados"] == 1
+        assert reporte["totales_por_categoria"]["conciliados"] == 2
 
 
 # ==========================================================================

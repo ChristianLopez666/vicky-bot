@@ -3460,10 +3460,11 @@ def radar_backfill_load():
     Las credenciales que usa son las MISMAS que ya carga _radar_client desde
     el entorno -- se leen de ahi, no se piden de nuevo.
 
-    Cuerpo esperado: {"batches": [[evento, evento, ...], [evento, ...], ...]}
-    -- una lista de lotes, cada uno ya en el formato del contrato 1.1 (ver
-    backfill_historico.construir_fallos_de_prospecto() /
-    construir_envios_de_hoja() + en_lotes()).
+    Cuerpo esperado: {"batches": [lote, lote, ...]} -- una lista de lotes.
+    Cada lote puede ser una lista simple de eventos, o el dict {"events":
+    [...]} que produce backfill_historico.en_lotes() (la forma real en que
+    ya estan guardados los 4 lotes historicos); radar_backfill.load_batches
+    normaliza ambas formas.
 
     Protegido por un secreto propio (RADAR_BACKFILL_TOKEN), distinto de
     RADAR_ACCEPTANCE_TOKEN y de cualquier otro token de este servicio. Sin
