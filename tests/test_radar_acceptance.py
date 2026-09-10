@@ -76,6 +76,17 @@ class PosterFalso:
                 "detail": "lead.phone_e164 debe usar 521 + 10 dígitos.",
             })
 
+        # Segundo hallazgo real del 2026-09-10, en la misma corrida ya
+        # corregida de telefono: message_requested exige delivery.status
+        # explicito en "requested" (contrato, seccion 6).
+        if evento.get("event_type") == "message_requested":
+            estado = (evento.get("delivery") or {}).get("status")
+            if estado != "requested":
+                return FakeResp(400, {
+                    "ok": False, "error": "invalid_payload",
+                    "detail": "message_requested requiere delivery.status=requested.",
+                })
+
         event_id = evento["event_id"]
         if event_id in self._vistos:
             return FakeResp(200, {"ok": True, "event_id": event_id, "duplicate": True})
@@ -172,6 +183,18 @@ class TestValidoYDuplicado:
         valido = next(r for r in reporte["resultados"] if r["check"] == "valido")
         assert valido["obtenido"]["body"]["lead_matched"] is False
         assert valido["paso"] is False
+
+    def test_todos_los_eventos_declaran_delivery_status_requested(self, poster):
+        """Segundo hallazgo real del 2026-09-10, en la misma corrida ya
+        corregida de telefono: message_requested exige delivery.status
+        explicito en "requested"; sin esto Radar lo rechaza igual que sin
+        telefono, con un 400 que tampoco prueba lo que cada check dice
+        probar."""
+        _run(poster)
+        for llamada in poster.llamadas:
+            cuerpo = json.loads(llamada["data"])
+            if cuerpo.get("event_type") == "message_requested":
+                assert cuerpo["delivery"]["status"] == "requested", cuerpo
 
     def test_el_telefono_del_evento_valido_usa_el_formato_521_mas_10(self, poster):
         """Hallazgo del 2026-09-10: el primer intento real no mandaba

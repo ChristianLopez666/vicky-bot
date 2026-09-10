@@ -169,6 +169,12 @@ def run(
             phone_last10=phone_last10,
             phone_number_id=phone_number_id,
             request_id=str(uuid.uuid4()),
+            # Segundo hallazgo real (2026-09-10, misma corrida corregida de
+            # telefono): Radar exige delivery.status="requested" explicito
+            # para message_requested -- lo dice el contrato (seccion 6) y el
+            # sobre no lo mandaba porque build_event() deja delivery_status
+            # en None si no se pasa.
+            delivery_status="requested",
             trace={"origen": "prueba_aceptacion", "check": check},
         )
 
