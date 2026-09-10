@@ -48,6 +48,7 @@ except Exception:  # pragma: no cover - dependencia opcional
 # la identidad de los eventos y la bitacora; no envia nada por si mismo.
 import radar_events
 import radar_acceptance
+import radar_backfill
 
 
 # ==========================
@@ -844,6 +845,11 @@ RADAR_ACCEPTANCE_KNOWN_LEAD_PHONE_LAST10 = os.getenv(
 # metadata.phone_number_id de cada webhook -- solo se usa aqui para el check
 # opcional de aislamiento por numero.
 RADAR_REDES_PHONE_NUMBER_ID = os.getenv("RADAR_REDES_PHONE_NUMBER_ID", "876953768824165").strip()
+
+# Secreto propio de /ext/radar/backfill-load, distinto de RADAR_ACCEPTANCE_TOKEN
+# y de cualquier otro token de este servicio. Vacio por defecto: sin el, el
+# endpoint responde 401 y no ejecuta nada.
+RADAR_BACKFILL_TOKEN = os.getenv("RADAR_BACKFILL_TOKEN", "").strip()
 
 
 def record_radar_event(**kwargs) -> Optional[Dict[str, Any]]:
@@ -3433,6 +3439,71 @@ def radar_acceptance_test():
     log.info(
         "🧪 Prueba de aceptacion de Radar: %s/%s checks con criterio duro aprobados",
         reporte.get("aprobados"), reporte.get("checks_con_criterio_duro"),
+    )
+    return jsonify({"ok": True, **reporte}), 200
+
+
+@app.post("/ext/radar/backfill-load")
+def radar_backfill_load():
+    """Carga puntual de los 146 eventos historicos a Radar (contrato 1.1).
+
+    Pedido puntual del 2026-09-10, posterior a la aceptacion 6/6: cargar los
+    140 message_sent + 6 message_failed de la campana de agosto, ya
+    construidos y con hash verificado por Work y por Code. Este endpoint no
+    los conoce de antemano -- los recibe en el cuerpo de la peticion, para
+    no comitear telefonos ni nombres de prospectos reales a este
+    repositorio (ver radar_backfill.py).
+
+    NO activa el emisor general. radar_backfill.load_batches() construye su
+    propio RadarClient desechable con enabled=True solo dentro de esa
+    llamada; este endpoint nunca toca _radar_client ni RADAR_EMIT_ENABLED.
+    Las credenciales que usa son las MISMAS que ya carga _radar_client desde
+    el entorno -- se leen de ahi, no se piden de nuevo.
+
+    Cuerpo esperado: {"batches": [[evento, evento, ...], [evento, ...], ...]}
+    -- una lista de lotes, cada uno ya en el formato del contrato 1.1 (ver
+    backfill_historico.construir_fallos_de_prospecto() /
+    construir_envios_de_hoja() + en_lotes()).
+
+    Protegido por un secreto propio (RADAR_BACKFILL_TOKEN), distinto de
+    RADAR_ACCEPTANCE_TOKEN y de cualquier otro token de este servicio. Sin
+    ese secreto en el entorno, responde 401 y no ejecuta nada.
+    """
+    token = (request.headers.get("X-Radar-Backfill-Token") or "").strip()
+    if not RADAR_BACKFILL_TOKEN or not hmac.compare_digest(token, RADAR_BACKFILL_TOKEN):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    if not (_radar_client.url and _radar_client.token and _radar_client.hmac_secret):
+        return jsonify({
+            "ok": False,
+            "error": "faltan credenciales de Radar en el entorno "
+                     "(RADAR_EVENTS_URL/RADAR_VICKY_TOKEN/RADAR_VICKY_HMAC_SECRET)",
+        }), 400
+
+    cuerpo = request.get_json(silent=True) or {}
+    batches = cuerpo.get("batches")
+    if not isinstance(batches, list) or not batches:
+        return jsonify({"ok": False, "error": "cuerpo debe traer 'batches': lista no vacia"}), 400
+
+    try:
+        reporte = radar_backfill.load_batches(
+            url=_radar_client.url,
+            token=_radar_client.token,
+            hmac_secret=_radar_client.hmac_secret,
+            dispatch_token=_radar_client.dispatch_token,
+            batches=batches,
+            batch_url_override=os.getenv("RADAR_EVENTS_BATCH_URL", "").strip(),
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        log.exception("❌ Error ejecutando la carga historica a Radar")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    log.info(
+        "📦 Carga historica a Radar: %s/%s lotes completados, %s/%s eventos enviados",
+        reporte.get("lotes_completados"), reporte.get("total_lotes"),
+        reporte.get("eventos_enviados"), reporte.get("eventos_totales_a_cargar"),
     )
     return jsonify({"ok": True, **reporte}), 200
 
