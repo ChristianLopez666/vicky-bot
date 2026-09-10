@@ -402,12 +402,20 @@ class RadarClient:
     def configured(self) -> bool:
         return bool(self.enabled and self.url and self.token and self.hmac_secret)
 
-    def headers_for(self, cuerpo: bytes, *, delivery_id: str, timestamp: str) -> Dict[str, str]:
+    def headers_for(self, cuerpo: bytes, *, delivery_id: str, timestamp: str,
+                     source: Optional[str] = None) -> Dict[str, str]:
         """Cabeceras del contrato 1.1, seccion 3.
 
         La firma cubre `timestamp.delivery_id.cuerpo_crudo`, no solo el cuerpo:
         eso ata cada firma a un instante y a un intento concreto, de modo que
         una peticion capturada no puede reutilizarse indefinidamente.
+
+        `source` sobreescribe SOURCE ("vicky_secom") en la cabecera. En envios
+        reales de este servicio nunca se pasa: existe unicamente para que la
+        prueba de aceptacion (radar_acceptance.py) pueda construir, a
+        proposito, una peticion que declara ser Redes mientras se autentica
+        con el token y el HMAC reales de SECOM -- el caso que debe rechazar el
+        aislamiento entre fuentes del contrato.
         """
         import hashlib
         import hmac as _hmac
@@ -417,7 +425,7 @@ class RadarClient:
         cabeceras = {
             "Content-Type": "application/json; charset=utf-8",
             "X-Vicky-Contract": CONTRACT_VERSION,
-            "X-Vicky-Source": SOURCE,
+            "X-Vicky-Source": source or SOURCE,
             "X-Vicky-Token": self.token,
             "X-Vicky-Timestamp": timestamp,
             # Cambia en cada intento HTTP. No confundir con message.request_id,
