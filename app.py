@@ -831,6 +831,15 @@ RADAR_ACCEPTANCE_KNOWN_LEAD_ID = os.getenv(
     "RADAR_ACCEPTANCE_KNOWN_LEAD_ID", "SC-0088db7a-385f-4f48-bbae-2aa79ae92c5d"
 ).strip()
 
+# Telefono real (ultimos 10 digitos) del prospecto de RADAR_ACCEPTANCE_KNOWN_LEAD_ID
+# en la hoja de leads (Antonio Cota Lugo). No es secreto -- ya esta en la
+# columna WhatsApp de la hoja. Hallazgo del primer intento real de correr la
+# aceptacion (2026-09-10): sin esto, Radar rechaza los seis eventos por
+# formato de telefono antes de llegar a lo que cada check realmente prueba.
+RADAR_ACCEPTANCE_KNOWN_LEAD_PHONE_LAST10 = os.getenv(
+    "RADAR_ACCEPTANCE_KNOWN_LEAD_PHONE_LAST10", "6681735052"
+).strip()
+
 # phone_number_id de Vicky Redes. Tampoco es secreto -- Meta lo entrega en
 # metadata.phone_number_id de cada webhook -- solo se usa aqui para el check
 # opcional de aislamiento por numero.
@@ -3414,6 +3423,7 @@ def radar_acceptance_test():
             dispatch_token=_radar_client.dispatch_token,
             phone_number_id=WABA_PHONE_ID,
             known_lead_id=RADAR_ACCEPTANCE_KNOWN_LEAD_ID,
+            known_lead_phone_last10=RADAR_ACCEPTANCE_KNOWN_LEAD_PHONE_LAST10,
             other_phone_number_id=RADAR_REDES_PHONE_NUMBER_ID,
         )
     except Exception as exc:

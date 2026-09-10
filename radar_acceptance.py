@@ -47,6 +47,13 @@ LEAD_ID_DESCONOCIDO = "SC-00000000-0000-4000-8000-000000000000"
 # ella -- basta con que sea sintacticamente una firma sha256 y no la correcta.
 FIRMA_INVALIDA = "sha256=" + "0" * 64
 
+# Telefono de relleno para los checks que no necesitan un prospecto real
+# (firma_invalida, lead_desconocido, aislamiento_fuente): cumple el formato
+# que Radar exige (521 + 10 digitos) sin corresponder a nadie. El check
+# "valido" (y "duplicado", que lo reenvia) usa en su lugar el telefono real
+# ligado a known_lead_id, para que la prueba sea representativa de verdad.
+TELEFONO_RELLENO_LAST10 = "0000000000"
+
 
 def _post(
     client: "radar_events.RadarClient",
@@ -107,6 +114,7 @@ def run(
     dispatch_token: str,
     phone_number_id: str,
     known_lead_id: str,
+    known_lead_phone_last10: str,
     other_phone_number_id: str = "",
     poster: Optional[Callable] = None,
 ) -> Dict[str, Any]:
@@ -120,10 +128,13 @@ def run(
 
     `known_lead_id` debe ser un LEAD_ID real, ya presente entre los enlaces
     precargados en Radar, para que el check "valido" pueda tambien reportar
-    si Radar lo reconocio (lead_matched). No es un requisito duro: el check
-    pasa con que Radar acepte el evento (200, duplicate:false) aunque el
-    LEAD_ID indicado no estuviera entre los ya enlazados -- eso solo se
-    reporta aparte, informativamente.
+    si Radar lo reconocio (lead_matched). `known_lead_phone_last10` debe ser
+    el telefono real asociado a ese mismo LEAD_ID en la hoja: Radar valida el
+    formato del telefono (521 + 10 digitos) antes de llegar a lo que cada
+    check realmente quiere probar, asi que un telefono ausente o inventado
+    hace fallar los seis checks por esa razon, no por la que se esta
+    evaluando -- exactamente el defecto que este parametro corrige (hallazgo
+    del primer intento real de correr esto, 2026-09-10).
 
     `other_phone_number_id`, si se da, dispara un sexto check opcional
     (aislamiento por numero). Sin el, se omiten los checks que lo requieren.
@@ -136,6 +147,12 @@ def run(
         raise ValueError("falta phone_number_id de SECOM")
     if not known_lead_id:
         raise ValueError("falta known_lead_id")
+    if not known_lead_phone_last10:
+        raise ValueError(
+            "falta known_lead_phone_last10; sin telefono valido Radar rechaza "
+            "el evento en la validacion de formato antes de llegar a lo que "
+            "cada check realmente quiere probar"
+        )
 
     cliente = radar_events.RadarClient(
         url=url, token=token, hmac_secret=hmac_secret,
@@ -144,10 +161,12 @@ def run(
 
     resultados: List[Dict[str, Any]] = []
 
-    def _evento(lead_id: str, check: str) -> Dict[str, Any]:
+    def _evento(lead_id: str, check: str, phone_last10: str = TELEFONO_RELLENO_LAST10) -> Dict[str, Any]:
         return radar_events.build_event(
             "message_requested",
             lead_id=lead_id,
+            phone_e164=f"521{phone_last10}",
+            phone_last10=phone_last10,
             phone_number_id=phone_number_id,
             request_id=str(uuid.uuid4()),
             trace={"origen": "prueba_aceptacion", "check": check},
@@ -157,7 +176,7 @@ def run(
     # Sobre correcto, credenciales correctas, firma deliberadamente rota.
     # Radar debe rechazar antes de mirar el cuerpo: nunca debe validarse un
     # payload cuya firma no coincide con lo que se recibio.
-    r1 = _post(cliente, _evento(known_lead_id, "firma_invalida"),
+    r1 = _post(cliente, _evento(known_lead_id, "firma_invalida", known_lead_phone_last10),
                signature_override=FIRMA_INVALIDA, poster=poster)
     resultados.append({
         "check": "firma_invalida",
@@ -170,7 +189,7 @@ def run(
     # known_lead_id debe ser un LEAD_ID confirmado por Work como ya presente
     # en vicky_lead_links (no cualquier LEAD_ID real de la hoja sirve: el
     # criterio exige lead_matched:true, no solo que Radar acepte el evento).
-    evento_valido = _evento(known_lead_id, "valido")
+    evento_valido = _evento(known_lead_id, "valido", known_lead_phone_last10)
     r2 = _post(cliente, evento_valido, poster=poster)
     cuerpo2 = r2.get("body") or {}
     resultados.append({
@@ -223,7 +242,7 @@ def run(
     # (vicky_secom, la que prueban el token y el HMAC) y el cuerpo declara
     # vicky_redes -- una inconsistencia dentro de la MISMA peticion, que
     # Radar ya rechaza con 400 segun confirmo Work.
-    evento_inconsistente = _evento(known_lead_id, "aislamiento_fuente")
+    evento_inconsistente = _evento(known_lead_id, "aislamiento_fuente", known_lead_phone_last10)
     evento_inconsistente["source"] = OTRA_FUENTE
     r5 = _post(cliente, evento_inconsistente, poster=poster)  # sin source_override: la cabecera sigue siendo vicky_secom
     resultados.append({
@@ -245,7 +264,7 @@ def run(
     if other_phone_number_id:
         # El evento de este check reemplaza su propio phone_number_id, no el
         # de SECOM usado en los demas.
-        evento6 = _evento(known_lead_id, "aislamiento_numero")
+        evento6 = _evento(known_lead_id, "aislamiento_numero", known_lead_phone_last10)
         evento6["channel"]["phone_number_id"] = other_phone_number_id
         r6 = _post(cliente, evento6, poster=poster)
         resultados.append({

@@ -9,6 +9,7 @@ modulo ni el endpoint puedan encender el emisor general por accidente.
 import hashlib
 import hmac
 import json
+import re
 from unittest.mock import patch
 
 import pytest
@@ -63,6 +64,18 @@ class PosterFalso:
         if numero != PHONE_ID:
             return FakeResp(403, {"ok": False, "error": "phone_number_id_not_authorized"})
 
+        # Replica el hallazgo real del 2026-09-10: Radar exige 521 + 10
+        # digitos en lead.phone_e164 y rechaza con 400 antes de mirar nada
+        # mas si el formato no cuadra. El primer intento real de correr esta
+        # bateria no mandaba telefono en ningun evento y los seis checks
+        # fallaron por esto, no por lo que cada uno pretendia probar.
+        telefono = (evento.get("lead") or {}).get("phone_e164", "")
+        if not re.fullmatch(r"521\d{10}", telefono):
+            return FakeResp(400, {
+                "ok": False, "error": "invalid_payload",
+                "detail": "lead.phone_e164 debe usar 521 + 10 dígitos.",
+            })
+
         event_id = evento["event_id"]
         if event_id in self._vistos:
             return FakeResp(200, {"ok": True, "event_id": event_id, "duplicate": True})
@@ -80,11 +93,15 @@ def poster():
     return PosterFalso()
 
 
+LEAD_PHONE_LAST10 = "6681735052"  # telefono de prueba, formato real
+
+
 def _run(poster, **overrides):
     kwargs = dict(
         url="https://radar.test/api/v1/vicky/events",
         token="tok-secom", hmac_secret="sec-secom", dispatch_token="disp-secom",
         phone_number_id=PHONE_ID, known_lead_id=LEAD_ID,
+        known_lead_phone_last10=LEAD_PHONE_LAST10,
         other_phone_number_id=OTRO_PHONE_ID, poster=poster,
     )
     kwargs.update(overrides)
@@ -155,6 +172,25 @@ class TestValidoYDuplicado:
         valido = next(r for r in reporte["resultados"] if r["check"] == "valido")
         assert valido["obtenido"]["body"]["lead_matched"] is False
         assert valido["paso"] is False
+
+    def test_el_telefono_del_evento_valido_usa_el_formato_521_mas_10(self, poster):
+        """Hallazgo del 2026-09-10: el primer intento real no mandaba
+        telefono en ningun evento y los seis checks fallaron por formato,
+        no por lo que cada uno pretendia probar."""
+        _run(poster)
+        cuerpo_valido = json.loads(poster.llamadas[1]["data"])
+        assert cuerpo_valido["lead"]["phone_e164"] == f"521{LEAD_PHONE_LAST10}"
+        assert cuerpo_valido["lead"]["phone_last10"] == LEAD_PHONE_LAST10
+
+    def test_un_telefono_sin_el_formato_521_mas_10_lo_rechaza_el_poster(self, poster):
+        """Contraprueba directa sobre el doble de Radar: confirma que el
+        propio simulador (no solo run()) habria atrapado el defecto del
+        2026-09-10 si algo se hubiera colado sin pasar por _evento()."""
+        vacio = {"lead": {"phone_e164": "", "lead_id": LEAD_ID}, "event_id": "x",
+                 "channel": {"phone_number_id": PHONE_ID}, "source": "vicky_secom"}
+        resp = poster(url="https://radar.test", data=json.dumps(vacio),
+                      headers={"X-Vicky-Source": "vicky_secom", "X-Vicky-Signature": "sha256=abc"})
+        assert resp.status_code == 400
 
 
 class TestLeadDesconocido:
@@ -233,13 +269,25 @@ class TestValidaciones:
     def test_sin_credenciales_no_ejecuta_nada(self, poster):
         with pytest.raises(ValueError):
             ra.run(url="", token="", hmac_secret="", dispatch_token="",
-                   phone_number_id=PHONE_ID, known_lead_id=LEAD_ID, poster=poster)
+                   phone_number_id=PHONE_ID, known_lead_id=LEAD_ID,
+                   known_lead_phone_last10=LEAD_PHONE_LAST10, poster=poster)
         assert poster.llamadas == []
 
     def test_sin_phone_number_id_no_ejecuta_nada(self, poster):
         with pytest.raises(ValueError):
             ra.run(url="https://radar.test", token="t", hmac_secret="s", dispatch_token="",
-                   phone_number_id="", known_lead_id=LEAD_ID, poster=poster)
+                   phone_number_id="", known_lead_id=LEAD_ID,
+                   known_lead_phone_last10=LEAD_PHONE_LAST10, poster=poster)
+        assert poster.llamadas == []
+
+    def test_sin_telefono_del_lead_conocido_no_ejecuta_nada(self, poster):
+        """El hallazgo del 2026-09-10: sin esto, los seis checks fallan por
+        formato de telefono en vez de por lo que cada uno prueba. Ahora es
+        un requisito duro antes de disparar ninguna peticion."""
+        with pytest.raises(ValueError, match="known_lead_phone_last10"):
+            ra.run(url="https://radar.test", token="t", hmac_secret="s", dispatch_token="",
+                   phone_number_id=PHONE_ID, known_lead_id=LEAD_ID,
+                   known_lead_phone_last10="", poster=poster)
         assert poster.llamadas == []
 
 
