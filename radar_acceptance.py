@@ -42,6 +42,16 @@ OTRA_FUENTE = "vicky_redes"
 # prueba y se puede filtrar o borrar sin tocar datos comerciales.
 LEAD_ID_DESCONOCIDO = "SC-00000000-0000-4000-8000-000000000000"
 
+# lead_id con formato RS-<uuid5> valido, reservado y nunca real, para el
+# check aislamiento_fuente. Correccion de Work (2026-09-10, verificada antes
+# de autorizar el merge): las dos corridas anteriores usaban known_lead_id
+# (formato SC-), y Radar rechazaba con 400 "Vicky Redes requiere
+# lead.lead_id RS-<uuid5>" -- un 400 real, pero por el formato del lead_id,
+# no por la inconsistencia cabecera/cuerpo que el check dice probar. Con un
+# RS-<uuid5> sintacticamente valido, el 400 solo puede venir de que la
+# cabecera declara vicky_secom y el cuerpo declara vicky_redes.
+LEAD_ID_REDES_FORMATO_VALIDO = "RS-00000000-0000-5000-8000-000000000000"
+
 # Firma deliberadamente invalida: 64 hex de ceros. Nunca coincide con ningun
 # HMAC real, y no depende de acertarle a la firma correcta para diferir de
 # ella -- basta con que sea sintacticamente una firma sha256 y no la correcta.
@@ -248,15 +258,18 @@ def run(
     # (vicky_secom, la que prueban el token y el HMAC) y el cuerpo declara
     # vicky_redes -- una inconsistencia dentro de la MISMA peticion, que
     # Radar ya rechaza con 400 segun confirmo Work.
-    evento_inconsistente = _evento(known_lead_id, "aislamiento_fuente", known_lead_phone_last10)
+    evento_inconsistente = _evento(
+        LEAD_ID_REDES_FORMATO_VALIDO, "aislamiento_fuente", known_lead_phone_last10,
+    )
     evento_inconsistente["source"] = OTRA_FUENTE
     r5 = _post(cliente, evento_inconsistente, poster=poster)  # sin source_override: la cabecera sigue siendo vicky_secom
     resultados.append({
         "check": "aislamiento_fuente",
         "esperado": (
-            "400 (inconsistencia cabecera/cuerpo). No demuestra aislamiento "
-            "de credenciales entre SECOM y Redes -- eso requiere que Redes "
-            "tenga su propio token real configurado en Radar."
+            "400 (inconsistencia cabecera/cuerpo, con lead_id ya en formato "
+            "RS-<uuid5> para que el 400 no pueda venir de ahi). No demuestra "
+            "aislamiento de credenciales entre SECOM y Redes -- eso requiere "
+            "que Redes tenga su propio token real configurado en Radar."
         ),
         "obtenido": r5,
         "paso": r5.get("status_code") == 400,

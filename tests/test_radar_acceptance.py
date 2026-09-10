@@ -55,8 +55,24 @@ class PosterFalso:
         if firma == ra.FIRMA_INVALIDA:
             return FakeResp(401, {"ok": False, "error": "invalid_signature"})
 
-        fuente_cabecera = headers.get("X-Vicky-Source", "")
+        # Orden real observado en Radar (2026-09-10, antes de autorizar el
+        # merge de PR #15): cuando el cuerpo declara source=vicky_redes,
+        # Radar exige lead_id en formato RS-<uuid> ANTES de evaluar si la
+        # cabecera coincide con el cuerpo. Con un lead_id formato SC-, las
+        # dos primeras corridas reales del check aislamiento_fuente dieron
+        # 400 por esta regla, no por la inconsistencia cabecera/cuerpo que
+        # el check dice probar -- correccion de Work, verificada antes de
+        # mergear.
         fuente_cuerpo = evento.get("source", "")
+        if fuente_cuerpo == "vicky_redes":
+            lead_id = (evento.get("lead") or {}).get("lead_id", "")
+            if not re.fullmatch(r"RS-[0-9a-fA-F-]{36}", lead_id):
+                return FakeResp(400, {
+                    "ok": False, "error": "invalid_payload",
+                    "detail": "Vicky Redes requiere lead.lead_id RS-<uuid5>.",
+                })
+
+        fuente_cabecera = headers.get("X-Vicky-Source", "")
         if fuente_cabecera != fuente_cuerpo:
             return FakeResp(400, {"ok": False, "error": "source_header_body_mismatch"})
 
@@ -245,6 +261,18 @@ class TestAislamiento:
         assert llamada["headers"]["X-Vicky-Source"] == "vicky_secom"
         assert cuerpo["source"] == "vicky_redes"
 
+    def test_aislamiento_por_fuente_usa_un_lead_id_formato_rs_valido(self, poster):
+        """Correccion de Work verificada antes de autorizar el merge de PR
+        #15: las dos corridas reales anteriores usaban un lead_id formato
+        SC-, y Radar devolvia 400 por eso -- no por la inconsistencia
+        cabecera/cuerpo que el check dice probar. Con RS-<uuid5> valido, el
+        400 solo puede venir de la inconsistencia."""
+        _run(poster)
+        cuerpo = json.loads(poster.llamadas[4]["data"])
+        assert cuerpo["lead"]["lead_id"] == ra.LEAD_ID_REDES_FORMATO_VALIDO
+        assert re.fullmatch(r"RS-[0-9a-fA-F-]{36}", cuerpo["lead"]["lead_id"])
+        assert not cuerpo["lead"]["lead_id"].startswith("SC-")
+
     def test_aislamiento_por_fuente_usa_la_firma_real_no_una_invalida(self, poster):
         _run(poster)
         llamada = poster.llamadas[4]
@@ -255,6 +283,23 @@ class TestAislamiento:
         fuente = next(r for r in reporte["resultados"] if r["check"] == "aislamiento_fuente")
         assert fuente["obtenido"]["status_code"] == 400
         assert fuente["paso"] is True
+
+    def test_un_lead_id_formato_sc_con_source_redes_falla_por_el_motivo_equivocado(self, poster):
+        """Contraprueba directa: replica exactamente el bug de las dos
+        corridas reales (SC- en vez de RS-) sobre el simulador, para
+        documentar y bloquear que vuelva a pasar desapercibido. El 400 real
+        de Radar en ambas corridas dijo 'Vicky Redes requiere lead.lead_id
+        RS-<uuid5>.', no algo relacionado con cabecera/cuerpo."""
+        evento_con_bug = {
+            "event_id": "x", "source": "vicky_redes",
+            "lead": {"lead_id": "SC-0088db7a-385f-4f48-bbae-2aa79ae92c5d",
+                     "phone_e164": f"521{LEAD_PHONE_LAST10}"},
+            "channel": {"phone_number_id": PHONE_ID},
+        }
+        resp = poster(url="https://radar.test", data=json.dumps(evento_con_bug),
+                      headers={"X-Vicky-Source": "vicky_secom", "X-Vicky-Signature": "sha256=abc"})
+        assert resp.status_code == 400
+        assert "RS-<uuid5>" in resp.json()["detail"]
 
     def test_aislamiento_por_fuente_no_afirma_probar_isolamiento_de_redes(self, poster):
         """La aclaracion de Work debe quedar escrita en el reporte, no solo
