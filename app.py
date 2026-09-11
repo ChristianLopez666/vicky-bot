@@ -47,6 +47,7 @@ except Exception:  # pragma: no cover - dependencia opcional
 # Enchufe hacia Radar (contrato 1.1, commit f78ea40). Solo define el sobre,
 # la identidad de los eventos y la bitacora; no envia nada por si mismo.
 import radar_events
+import radar_outbox
 import radar_acceptance
 import radar_backfill
 
@@ -817,6 +818,27 @@ _radar_client = radar_events.RadarClient(
     enabled=os.getenv("RADAR_EMIT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"),
 )
 
+def _radar_outbox_repository():
+    if not (google_ready and GOOGLE_CREDENTIALS_JSON and SHEETS_ID_LEADS):
+        raise RuntimeError("Sheets no disponible para recuperar eventos")
+    # googleapiclient/httplib2 transports must not be shared across threads.
+    outbox_credentials = service_account.Credentials.from_service_account_info(
+        json.loads(GOOGLE_CREDENTIALS_JSON),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    outbox_service = build("sheets", "v4", credentials=outbox_credentials, cache_discovery=False)
+    return radar_outbox.SheetsOutbox(outbox_service, SHEETS_ID_LEADS)
+
+
+_radar_outbox = radar_outbox.OutboxWorker(_radar_outbox_repository, _radar_client)
+
+
+@app.before_request
+def _start_radar_outbox():
+    # Starts after Gunicorn forks, including on health checks after restart.
+    _radar_outbox.start()
+
+
 # Secreto propio de /ext/radar/acceptance-test, distinto de cualquier otro
 # token de este servicio (regla de la auditoria forense: nunca reutilizar un
 # secreto compartido para una superficie nueva).
@@ -877,17 +899,10 @@ def record_radar_event(**kwargs) -> Optional[Dict[str, Any]]:
     except Exception:
         log.exception("⚠️ No se pudo anotar el evento %s", event.get("event_id"))
 
-    # La entrega va en un hilo aparte para no meter a Radar en la ruta critica
-    # del webhook, que ya tarda segundos con Sheets, Meta y Boardroom. Si falla,
-    # el evento se queda PENDIENTE en la bitacora y un barrido posterior lo
-    # reintenta con el mismo event_id: Radar lo descartara como duplicado si en
-    # realidad si habia llegado.
-    if _radar_client.configured():
-        def _entregar() -> None:
-            estado = _radar_client.send(event)
-            if estado != radar_events.PENDIENTE:
-                _mark_event_delivery(fila, estado)
-        threading.Thread(target=_entregar, daemon=True, name="RadarEmit").start()
+    # Only the durable outbox delivers. It scans PENDIENTE after restarts,
+    # correlates status webhooks and owns a separate Google HTTP client.
+    if fila is not None:
+        _radar_outbox.start()
 
     return event
 
@@ -3000,6 +3015,24 @@ def _handle_meta_statuses(local_values: List[Dict[str, Any]]) -> int:
     return anotados
 
 
+def _record_inbound_radar(msg, match, phone):
+    if msg.get("id"):
+        try:
+            identity = match or {}
+            if identity.get("lead_id"):
+                record_radar_event(
+                    event_type="message_inbound", lead_id=identity["lead_id"],
+                    phone_e164=_normalize_to_e164_mx(phone), phone_last10=_normalize_phone_last10(phone),
+                    name=identity.get("nombre") or None, phone_number_id=WABA_PHONE_ID,
+                    occurred_at=radar_events.canonical_ts(msg.get("timestamp")),
+                    wamid=msg["id"], direction="inbound",
+                    text=(msg.get("text") or {}).get("body"),
+                    trace={"service": "vicky-bot-secom", "origen": "webhook_inbound"},
+                )
+        except Exception:
+            log.exception("No se pudo registrar el mensaje entrante en Radar")
+
+
 def _handle_inbound_message(msg: Dict[str, Any]) -> None:
     """Procesa UN mensaje entrante del webhook.
 
@@ -3019,6 +3052,7 @@ def _handle_inbound_message(msg: Dict[str, Any]) -> None:
 
     last10 = _normalize_phone_last10(phone)
     match = match_client_in_sheets(last10)
+    _record_inbound_radar(msg, match, phone)
     st_now = user_state.get(phone, "")
     idle = st_now in ("", "__greeted__")
 
@@ -4034,3 +4068,4 @@ if __name__ == "__main__":
     log.info("📊 Google Sheets/Drive: %s", google_ready)
     log.info("🧠 OpenAI: %s", bool(openai and OPENAI_API_KEY))
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
