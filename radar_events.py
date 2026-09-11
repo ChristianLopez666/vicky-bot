@@ -267,16 +267,6 @@ class EventLog:
         self._seen: deque = deque(maxlen=dedupe_size)
         self._seen_set: set = set()
 
-    def _already_seen(self, event_id: str) -> bool:
-        with self._lock:
-            if event_id in self._seen_set:
-                return True
-            if len(self._seen) >= self._seen.maxlen:
-                self._seen_set.discard(self._seen[0])
-            self._seen.append(event_id)
-            self._seen_set.add(event_id)
-            return False
-
     def record(self, event: Dict[str, Any]) -> Optional[int]:
         """Anota el evento. Devuelve el numero de fila escrito, o None.
 
@@ -293,9 +283,6 @@ class EventLog:
         if not event_id:
             log.warning("evento sin event_id; no se anota")
             return None
-        if self._already_seen(event_id):
-            return None
-
         lead = event.get("lead") or {}
         message = event.get("message") or {}
         delivery = event.get("delivery") or {}
@@ -320,11 +307,28 @@ class EventLog:
             "",
             json.dumps(event, ensure_ascii=False)[:45000],
         ]
-        try:
-            return self._append(EVENTS_TAB, fila)
-        except Exception:
-            log.exception("no se pudo anotar el evento %s en %s", event_id, EVENTS_TAB)
-            return None
+        # Serializar comprobacion, escritura y confirmacion. Marcar "visto"
+        # antes de persistir descartaba el reintento si Sheets fallaba. El
+        # lock tambien evita que dos webhooks simultaneos escriban dos filas;
+        # si el primero falla, el segundo todavia puede intentar guardarlo.
+        with self._lock:
+            if event_id in self._seen_set:
+                return None
+            try:
+                row_number = self._append(EVENTS_TAB, fila)
+            except Exception:
+                log.exception("no se pudo anotar el evento %s en %s", event_id, EVENTS_TAB)
+                return None
+            if row_number is None:
+                # Sin acuse de fila no se confirma la deduplicacion. Si la
+                # escritura si ocurrio, Radar deduplica por event_id.
+                return None
+            if self._seen.maxlen:
+                if len(self._seen) >= self._seen.maxlen:
+                    self._seen_set.discard(self._seen[0])
+                self._seen.append(event_id)
+                self._seen_set.add(event_id)
+            return row_number
 
 
 # ==========================
