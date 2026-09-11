@@ -311,8 +311,11 @@ class EventLog:
         # antes de persistir descartaba el reintento si Sheets fallaba. El
         # lock tambien evita que dos webhooks simultaneos escriban dos filas;
         # si el primero falla, el segundo todavia puede intentar guardarlo.
+        # Preserve the richer original receipt if a status with the same
+        # event_id arrived first without its request_id.
+        cache_key = (event_id, bool(message.get("request_id")))
         with self._lock:
-            if event_id in self._seen_set:
+            if cache_key in self._seen_set:
                 return None
             try:
                 row_number = self._append(EVENTS_TAB, fila)
@@ -326,8 +329,8 @@ class EventLog:
             if self._seen.maxlen:
                 if len(self._seen) >= self._seen.maxlen:
                     self._seen_set.discard(self._seen[0])
-                self._seen.append(event_id)
-                self._seen_set.add(event_id)
+                self._seen.append(cache_key)
+                self._seen_set.add(cache_key)
             return row_number
 
 
@@ -466,7 +469,14 @@ class RadarClient:
 
         codigo = getattr(resp, "status_code", 0)
         if codigo == 200:
-            return ENVIADO
+            try:
+                ack = resp.json()
+            except Exception:
+                return PENDIENTE
+            if isinstance(ack, dict) and ack.get("ok") is True and ack.get("event_id") == event.get("event_id"):
+                return ENVIADO
+            log.warning("Radar devolvio 200 sin acuse del evento; queda pendiente")
+            return PENDIENTE
         if codigo in (400, 413):
             log.error(
                 "Radar rechazo el evento %s con %s: %s",

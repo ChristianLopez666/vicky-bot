@@ -486,7 +486,7 @@ class TestClienteRadar:
         (503, radar_events.PENDIENTE),
     ])
     def test_cada_respuesta_deja_el_estado_que_corresponde(self, codigo, esperado):
-        cliente = self._cliente(poster=lambda *a, **k: FakeResp(codigo, {}))
+        cliente = self._cliente(poster=lambda *a, **k: FakeResp(codigo, {"ok": True, "event_id": "x"}))
         assert cliente.send({"event_id": "x"}) == esperado
 
     def test_un_401_apaga_el_emisor_en_vez_de_insistir(self):
@@ -534,3 +534,4 @@ class TestBitacora:
         log = radar_events.EventLog(revienta)
         evento = radar_events.build_event("message_sent", lead_id="SC-1", wamid="wamid.A")
         assert log.record(evento) is None
+
