@@ -211,6 +211,32 @@ else:
     log.warning("⚠️ Credenciales de Google no disponibles. Modo mínimo activo.")
 
 
+# googleapiclient rearma el recurso desde el discovery en cada .spreadsheets():
+# ~50 ms y varios MB de basura ciclica por llamada. Con cientos de acuses de
+# Meta eso llenaba los 512 MB y reiniciaba el servicio.
+_google_resources: Dict[str, Tuple[Any, Any]] = {}
+
+
+def _cached_resource(key: str, service: Any, factory) -> Any:
+    cached = _google_resources.get(key)
+    if cached is None or cached[0] is not service:
+        cached = (service, factory(service))
+        _google_resources[key] = cached
+    return cached[1]
+
+
+def _sheets() -> Any:
+    return _cached_resource("sheets", sheets_svc, lambda svc: svc.spreadsheets())
+
+
+def _sheets_values() -> Any:
+    return _cached_resource("sheets_values", sheets_svc, lambda svc: _sheets().values())
+
+
+def _drive_files() -> Any:
+    return _cached_resource("drive_files", drive_svc, lambda svc: svc.files())
+
+
 # =================================
 # Estado por usuario en memoria
 # =================================
@@ -607,7 +633,7 @@ def _sheet_get_rows() -> Tuple[List[str], List[List[str]]]:
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS and SHEETS_TITLE_LEADS):
         raise RuntimeError("Sheets no disponible (google_ready/SHEETS_ID_LEADS/SHEETS_TITLE_LEADS).")
     rng = f"{SHEETS_TITLE_LEADS}!A:Z"
-    values = sheets_svc.spreadsheets().values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
+    values = _sheets_values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
     rows = values.get("values", [])
     if not rows:
         return [], []
@@ -643,7 +669,7 @@ def _update_row_cells(row_number_1based: int, updates: Dict[str, str], headers: 
     if not data:
         return
     body = {"valueInputOption": "USER_ENTERED", "data": data}
-    sheets_svc.spreadsheets().values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
+    _sheets_values().batchUpdate(spreadsheetId=SHEETS_ID_LEADS, body=body).execute()
 
 
 def _ensure_tab(title: str, header: list, filas: int = 500) -> None:
@@ -658,7 +684,7 @@ def _ensure_tab(title: str, header: list, filas: int = 500) -> None:
     por defecto, addSheet respondia HTTP 400 ("would increase the number of
     cells in the workbook above the limit") y la pestana no se creaba nunca.
     """
-    meta = sheets_svc.spreadsheets().get(
+    meta = _sheets().get(
         spreadsheetId=SHEETS_ID_LEADS, fields="sheets.properties.title"
     ).execute()
     existentes = {
@@ -668,7 +694,7 @@ def _ensure_tab(title: str, header: list, filas: int = 500) -> None:
     if title in existentes:
         return
 
-    sheets_svc.spreadsheets().batchUpdate(
+    _sheets().batchUpdate(
         spreadsheetId=SHEETS_ID_LEADS,
         body={"requests": [{"addSheet": {"properties": {
             "title": title,
@@ -680,7 +706,7 @@ def _ensure_tab(title: str, header: list, filas: int = 500) -> None:
     ).execute()
     if header:
         ultima = chr(ord("A") + len(header) - 1)
-        sheets_svc.spreadsheets().values().update(
+        _sheets_values().update(
             spreadsheetId=SHEETS_ID_LEADS,
             range=f"{title}!A1:{ultima}1",
             valueInputOption="RAW",
@@ -731,7 +757,7 @@ def _log_conversacion(mensaje: str) -> None:
         return
     try:
         _ensure_conversaciones_tab()
-        sheets_svc.spreadsheets().values().append(
+        _sheets_values().append(
             spreadsheetId=SHEETS_ID_LEADS,
             range=f"{CONVERSACIONES_TAB}!A:F",
             valueInputOption="RAW",
@@ -772,7 +798,7 @@ def _append_event_row(tab: str, fila: List[Any]) -> Optional[int]:
         raise RuntimeError("Sheets no disponible para la bitacora de eventos.")
     _ensure_eventos_radar_tab()
     ultima = chr(ord("A") + len(radar_events.EVENTS_HEADER) - 1)
-    resp = sheets_svc.spreadsheets().values().append(
+    resp = _sheets_values().append(
         spreadsheetId=SHEETS_ID_LEADS,
         range=f"{tab}!A:{ultima}",
         valueInputOption="RAW",
@@ -793,7 +819,7 @@ def _mark_event_delivery(row_number: Optional[int], estado: str) -> None:
         i_try = radar_events.EVENTS_HEADER.index("radar_last_try")
         col_state = chr(ord("A") + i_state)
         col_try = chr(ord("A") + i_try)
-        sheets_svc.spreadsheets().values().batchUpdate(
+        _sheets_values().batchUpdate(
             spreadsheetId=SHEETS_ID_LEADS,
             body={"valueInputOption": "RAW", "data": [
                 {"range": f"{radar_events.EVENTS_TAB}!{col_state}{row_number}",
@@ -951,7 +977,7 @@ def _is_campaign_paused() -> bool:
     try:
         _ensure_control_tab()
         rng = f"{CAMPAIGN_CONTROL_TAB}!{CAMPAIGN_PAUSE_CELL}"
-        result = sheets_svc.spreadsheets().values().get(
+        result = _sheets_values().get(
             spreadsheetId=SHEETS_ID_LEADS, range=rng
         ).execute()
         values = result.get("values", [])
@@ -980,7 +1006,7 @@ def _set_campaign_paused(paused: bool) -> None:
     rng = f"{CAMPAIGN_CONTROL_TAB}!{CAMPAIGN_PAUSE_CELL}"
     value = "" if paused else CAMPAIGN_ACTIVE_VALUE
     body = {"values": [[value]]}
-    sheets_svc.spreadsheets().values().update(
+    _sheets_values().update(
         spreadsheetId=SHEETS_ID_LEADS,
         range=rng,
         valueInputOption="USER_ENTERED",
@@ -1157,7 +1183,7 @@ def append_envio_status(phone: str, message_id: str, status: str, template_name:
         return
     try:
         body = {"values": [[_normalize_phone_last10(phone), message_id or "", status or "", timestamp_iso or "", template_name or ""]]}
-        sheets_svc.spreadsheets().values().append(
+        _sheets_values().append(
             spreadsheetId=SHEETS_ID_LEADS,
             range="ENVIO_STATUS!A:E",
             valueInputOption="USER_ENTERED",
@@ -1173,7 +1199,7 @@ def append_respuesta_cliente(phone: str, nombre: str, mensaje: str, fecha_iso: s
         return
     try:
         body = {"values": [[_normalize_phone_last10(phone), nombre or "", mensaje or "", fecha_iso or ""]]}
-        sheets_svc.spreadsheets().values().append(
+        _sheets_values().append(
             spreadsheetId=SHEETS_ID_LEADS,
             range="RESPUESTAS_CLIENTE!A:D",
             valueInputOption="USER_ENTERED",
@@ -1190,7 +1216,7 @@ def write_followup_to_sheets(row: int | str, note: str, date_iso: str) -> None:
         return
     try:
         body = {"values": [[str(row), date_iso, note]]}
-        sheets_svc.spreadsheets().values().append(
+        _sheets_values().append(
             spreadsheetId=SHEETS_ID_LEADS,
             range="Seguimiento!A:C",
             valueInputOption="USER_ENTERED",
@@ -1206,7 +1232,7 @@ def get_last_envio_template(phone_last10: str) -> str:
     if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
         return ""
     try:
-        resp = sheets_svc.spreadsheets().values().get(
+        resp = _sheets_values().get(
             spreadsheetId=SHEETS_ID_LEADS,
             range="ENVIO_STATUS!A:E",
         ).execute()
@@ -1230,11 +1256,11 @@ def _find_or_create_client_folder(folder_name: str) -> Optional[str]:
             f"name = '{safe_name}' and mimeType = 'application/vnd.google-apps.folder' "
             f"and '{DRIVE_PARENT_FOLDER_ID}' in parents and trashed = false"
         )
-        resp = drive_svc.files().list(q=q, fields="files(id, name)").execute()
+        resp = _drive_files().list(q=q, fields="files(id, name)").execute()
         items = resp.get("files", [])
         if items:
             return items[0]["id"]
-        created = drive_svc.files().create(
+        created = _drive_files().create(
             body={
                 "name": folder_name,
                 "mimeType": "application/vnd.google-apps.folder",
@@ -1257,7 +1283,7 @@ def upload_to_drive(file_name: str, file_bytes: bytes, mime_type: str, folder_na
         if not folder_id:
             return None
         media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
-        created = drive_svc.files().create(
+        created = _drive_files().create(
             body={"name": file_name, "parents": [folder_id]},
             media_body=media,
             fields="id, webViewLink",
