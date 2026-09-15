@@ -59,7 +59,7 @@ def test_manual_reply_activates_handoff_and_records_meta_identity():
     assert response.status_code == 200
     assert response.get_json()["wamid"] == "wamid.test"
     set_handoff.assert_called_once_with(PHONE, True, body["window_expires_at"], body["actor"])
-    send.assert_called_once_with(PHONE, body["text"], return_detail=True)
+    send.assert_called_once_with(PHONE, body["text"], return_detail=True, retry_on_timeout=False)
     assert [event["event_type"] for event in events] == ["message_requested", "message_sent"]
     assert events[1]["wamid"] == "wamid.test"
     assert events[1]["text"] == body["text"]

@@ -441,7 +441,7 @@ def _backoff(attempt: int) -> None:
     time.sleep(2**attempt)
 
 
-def send_message(to: str, text: str, return_detail: bool = False) -> bool | Dict[str, Any]:
+def send_message(to: str, text: str, return_detail: bool = False, retry_on_timeout: bool = True) -> bool | Dict[str, Any]:
     """Envía texto dentro de una conversación activa y conserva el wamid."""
     def _result(ok: bool, wamid: str = "", motivo: str = "") -> bool | Dict[str, Any]:
         return {"ok": ok, "wamid": wamid, "motivo": motivo} if return_detail else ok
@@ -475,7 +475,7 @@ def send_message(to: str, text: str, return_detail: bool = False) -> bool | Dict
             return _result(False, motivo=f"http_{resp.status_code}")
         except requests.exceptions.Timeout:
             log.error("⏰ Timeout enviando mensaje a %s (intento %s)", to, attempt + 1)
-            if attempt < 2:
+            if retry_on_timeout and attempt < 2:
                 _backoff(attempt)
                 continue
             return _result(False, motivo="timeout")
@@ -4150,7 +4150,7 @@ def ext_radar_reply():
         delivery_status="requested", trace=trace, **event_base,
     )
 
-    detail = send_message(to, text, return_detail=True)
+    detail = send_message(to, text, return_detail=True, retry_on_timeout=False)
     if not isinstance(detail, dict):
         detail = {"ok": bool(detail), "wamid": "", "motivo": "desconocido"}
     if detail.get("ok") and detail.get("wamid"):
