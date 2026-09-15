@@ -115,6 +115,7 @@ SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS", "").strip()
 SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto").strip()
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID", "").strip()
 AUTO_SEND_TOKEN = os.getenv("AUTO_SEND_TOKEN", "").strip()
+RADAR_REPLY_TOKEN = os.getenv("RADAR_REPLY_TOKEN", "").strip()
 
 # CF-4: kill switch de la campana outbound (auto-send-one), persistente en
 # Sheets para sobrevivir un reinicio del servicio mientras esta pausada.
@@ -159,6 +160,15 @@ _control_tab_ready = False
 CONVERSACIONES_TAB = os.getenv("SHEETS_TITLE_CONVERSACIONES", "CONVERSACIONES").strip()
 _CONVERSACIONES_HEADER = ["Phone", "Nombre", "Mensaje", "Fecha", "Tipo", "Origen"]
 _conversaciones_tab_ready = False
+
+# Modo humano iniciado desde Radar. Vive en Sheets para sobrevivir reinicios
+# de Render y evitar que Vicky responda al mismo tiempo que el asesor.
+HUMAN_HANDOFF_TAB = os.getenv("SHEETS_TITLE_HUMAN_HANDOFF", "MODO_HUMANO").strip()
+_HUMAN_HANDOFF_HEADER = ["PHONE_LAST10", "STATUS", "EXPIRES_AT", "ACTOR", "UPDATED_AT"]
+_human_handoff_tab_ready = False
+_human_handoff_cache: Dict[str, Dict[str, str]] = {}
+_human_handoff_cache_loaded_at = 0.0
+_human_handoff_lock = threading.Lock()
 
 # Bitacora de eventos del contrato con Radar. Se crea sola como las anteriores.
 _eventos_radar_tab_ready = False
@@ -431,11 +441,14 @@ def _backoff(attempt: int) -> None:
     time.sleep(2**attempt)
 
 
-def send_message(to: str, text: str) -> bool:
-    """Envía mensaje de texto WPP dentro de conversación activa."""
+def send_message(to: str, text: str, return_detail: bool = False) -> bool | Dict[str, Any]:
+    """Envía texto dentro de una conversación activa y conserva el wamid."""
+    def _result(ok: bool, wamid: str = "", motivo: str = "") -> bool | Dict[str, Any]:
+        return {"ok": ok, "wamid": wamid, "motivo": motivo} if return_detail else ok
+
     if not (META_TOKEN and WPP_API_URL):
         log.error("❌ WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID faltan).")
-        return False
+        return _result(False, motivo="whatsapp_no_configurado")
 
     payload = {
         "messaging_product": "whatsapp",
@@ -449,27 +462,30 @@ def send_message(to: str, text: str) -> bool:
             log.info("📤 Enviando mensaje a %s (intento %s)", to, attempt + 1)
             resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
             if resp.status_code in (200, 201):
+                try:
+                    wamid = str((((resp.json() or {}).get("messages") or [{}])[0]).get("id") or "")
+                except Exception:
+                    wamid = ""
                 log.info("✅ Mensaje enviado exitosamente a %s", to)
-                return True
+                return _result(True, wamid=wamid)
             log.warning("⚠️ WPP send_message falló %s: %s", resp.status_code, resp.text[:200])
             if _should_retry(resp.status_code) and attempt < 2:
                 _backoff(attempt)
                 continue
-            return False
+            return _result(False, motivo=f"http_{resp.status_code}")
         except requests.exceptions.Timeout:
             log.error("⏰ Timeout enviando mensaje a %s (intento %s)", to, attempt + 1)
             if attempt < 2:
                 _backoff(attempt)
                 continue
-            return False
+            return _result(False, motivo="timeout")
         except Exception:
             log.exception("❌ Error en send_message a %s", to)
             if attempt < 2:
                 _backoff(attempt)
                 continue
-            return False
-    return False
-
+            return _result(False, motivo="exception")
+    return _result(False, motivo="unknown")
 
 def send_template_message(
     to: str,
@@ -1348,6 +1364,125 @@ def _within_24h(value: str) -> bool:
         return False
     now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.utcnow()
     return (now - dt) <= timedelta(hours=24)
+
+
+def _ensure_human_handoff_tab() -> None:
+    global _human_handoff_tab_ready
+    if _human_handoff_tab_ready:
+        return
+    _ensure_tab(HUMAN_HANDOFF_TAB, _HUMAN_HANDOFF_HEADER, filas=500)
+    _human_handoff_tab_ready = True
+
+
+def _reload_human_handoff_cache(force: bool = False) -> None:
+    global _human_handoff_cache_loaded_at
+    if not (google_ready and sheets_svc and SHEETS_ID_LEADS):
+        raise RuntimeError("Sheets no disponible para modo humano.")
+    if not force and time.time() - _human_handoff_cache_loaded_at < 30:
+        return
+    _ensure_human_handoff_tab()
+    values = _sheets_values().get(
+        spreadsheetId=SHEETS_ID_LEADS, range=f"{HUMAN_HANDOFF_TAB}!A:E"
+    ).execute().get("values", [])
+    loaded: Dict[str, Dict[str, str]] = {}
+    for row_number, row in enumerate(values[1:], start=2):
+        last10 = _normalize_phone_last10(_cell(row, 0))
+        if last10:
+            loaded[last10] = {
+                "status": _cell(row, 1).strip().upper(),
+                "expires_at": _cell(row, 2).strip(),
+                "actor": _cell(row, 3).strip(),
+                "updated_at": _cell(row, 4).strip(),
+                "row": str(row_number),
+            }
+    _human_handoff_cache.clear()
+    _human_handoff_cache.update(loaded)
+    _human_handoff_cache_loaded_at = time.time()
+
+
+def _human_handoff_status(phone: str, force: bool = False) -> Dict[str, Any]:
+    last10 = _normalize_phone_last10(phone)
+    if len(last10) != 10:
+        raise ValueError("telefono_invalido")
+    with _human_handoff_lock:
+        _reload_human_handoff_cache(force=force)
+        row = dict(_human_handoff_cache.get(last10) or {})
+    expires = _parse_dt_maybe(row.get("expires_at") or "")
+    now = datetime.now(expires.tzinfo) if expires and expires.tzinfo else datetime.utcnow()
+    active = bool(row.get("status") == "ACTIVE" and expires and expires > now)
+    return {
+        "active": active,
+        "expires_at": row.get("expires_at") or "",
+        "actor": row.get("actor") or "",
+        "updated_at": row.get("updated_at") or "",
+    }
+
+
+def _set_human_handoff(phone: str, active: bool, expires_at: str = "", actor: str = "") -> Dict[str, Any]:
+    global _human_handoff_cache_loaded_at
+    last10 = _normalize_phone_last10(phone)
+    if len(last10) != 10:
+        raise ValueError("telefono_invalido")
+    now_iso = radar_events.canonical_ts()
+    status = "ACTIVE" if active else "RELEASED"
+    row_values = [last10, status, expires_at if active else "", str(actor or "")[:160], now_iso]
+    with _human_handoff_lock:
+        _reload_human_handoff_cache(force=True)
+        existing = _human_handoff_cache.get(last10) or {}
+        if existing.get("row"):
+            _sheets_values().update(
+                spreadsheetId=SHEETS_ID_LEADS,
+                range=f"{HUMAN_HANDOFF_TAB}!A{existing['row']}:E{existing['row']}",
+                valueInputOption="RAW",
+                body={"values": [row_values]},
+            ).execute()
+            row_number = existing["row"]
+        else:
+            response = _sheets_values().append(
+                spreadsheetId=SHEETS_ID_LEADS,
+                range=f"{HUMAN_HANDOFF_TAB}!A:E",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [row_values]},
+            ).execute()
+            updated_range = ((response or {}).get("updates") or {}).get("updatedRange") or ""
+            found = re.search(r"!\D+(\d+)", updated_range)
+            row_number = found.group(1) if found else ""
+        _human_handoff_cache[last10] = {
+            "status": status, "expires_at": row_values[2], "actor": row_values[3],
+            "updated_at": now_iso, "row": str(row_number),
+        }
+        _human_handoff_cache_loaded_at = time.time()
+    return _human_handoff_status(phone)
+
+
+def _human_handoff_active(phone: str) -> bool:
+    try:
+        return bool(_human_handoff_status(phone).get("active"))
+    except Exception:
+        last10 = _normalize_phone_last10(phone)
+        row = dict(_human_handoff_cache.get(last10) or {})
+        expires = _parse_dt_maybe(row.get("expires_at") or "")
+        now = datetime.now(expires.tzinfo) if expires and expires.tzinfo else datetime.utcnow()
+        active = bool(row.get("status") == "ACTIVE" and expires and expires > now)
+        if active:
+            log.warning("⚠️ Sheets no respondió; se conserva modo humano desde caché")
+        return active
+
+
+def _extend_human_handoff_from_inbound(phone: str, msg: Dict[str, Any], actor: str = "") -> None:
+    try:
+        current = _human_handoff_status(phone)
+        if not current["active"]:
+            return
+        occurred = _parse_dt_maybe(radar_events.canonical_ts(msg.get("timestamp")))
+        if not occurred:
+            return
+        expires = occurred + timedelta(hours=24)
+        expires_at = expires.isoformat().replace("+00:00", "Z")
+        _set_human_handoff(phone, True, expires_at, current.get("actor") or actor)
+    except Exception:
+        log.exception("⚠️ No se pudo extender el modo humano")
 
 
 def _tpv_is_context(match: Optional[Dict[str, Any]]) -> bool:
@@ -3156,6 +3291,11 @@ def _handle_inbound_message(msg: Dict[str, Any]) -> None:
 
         _ensure_user(phone)["last_message"] = text
 
+        if _human_handoff_active(phone):
+            _extend_human_handoff_from_inbound(phone, msg)
+            log.info("👤 Modo humano activo para %s; Vicky registra pero no responde", last10)
+            return
+
         if _brain_enabled_for(last10) and _handoff_turn_to_brain(phone, msg, match, mtype, text):
             return
 
@@ -3335,6 +3475,11 @@ def _handle_inbound_message(msg: Dict[str, Any]) -> None:
     if mtype in {"image", "document", "audio", "video"}:
         log.info("📎 Multimedia recibida de %s: %s", phone, mtype)
 
+        if _human_handoff_active(phone):
+            _extend_human_handoff_from_inbound(phone, msg)
+            log.info("👤 Multimedia registrada con modo humano activo para %s", last10)
+            return
+
         if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
             _emit_boardroom_observation(phone, msg, match, mtype, _message_text(msg, mtype))
             _handle_media(phone, msg)
@@ -3362,6 +3507,11 @@ def _handle_inbound_message(msg: Dict[str, Any]) -> None:
                 append_respuesta_cliente(phone, _match_name(match), button_text, _utc_now_iso())
             except Exception:
                 pass
+
+            if _human_handoff_active(phone):
+                _extend_human_handoff_from_inbound(phone, msg)
+                log.info("👤 Quick Reply registrado con modo humano activo para %s", last10)
+                return
 
             if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
                 _emit_boardroom_observation(phone, msg, match, mtype, button_text)
@@ -3920,6 +4070,105 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
         return {"row_number": row_number, "nombre": nombre, "whatsapp": wa, "row": row}
 
     return None
+
+
+@app.post("/ext/radar/reply")
+def ext_radar_reply():
+    """Responde desde Radar dentro de la ventana de servicio de Meta."""
+    token = (request.headers.get("X-RADAR-REPLY-TOKEN") or "").strip()
+    if not RADAR_REPLY_TOKEN or not hmac.compare_digest(token, RADAR_REPLY_TOKEN):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("action") or "reply").strip().lower()
+    to = _normalize_to_e164_mx(str(body.get("to") or ""))
+    last10 = _normalize_phone_last10(to)
+    if len(last10) != 10:
+        return jsonify({"ok": False, "error": "telefono_invalido"}), 400
+
+    match = match_client_in_sheets(last10)
+    lead_id = str(body.get("lead_id") or "").strip()
+    if not match or not match.get("lead_id") or match.get("lead_id") != lead_id:
+        return jsonify({"ok": False, "error": "prospecto_no_conciliado"}), 409
+
+    actor = str(body.get("actor") or "Radar").strip()[:160]
+    if action == "status":
+        try:
+            return jsonify({"ok": True, "human_handoff": _human_handoff_status(to)}), 200
+        except Exception:
+            log.exception("❌ No se pudo consultar modo humano")
+            return jsonify({"ok": False, "error": "handoff_unavailable"}), 503
+
+    if action == "release":
+        try:
+            state = _set_human_handoff(to, False, actor=actor)
+            return jsonify({"ok": True, "human_handoff": state}), 200
+        except Exception:
+            log.exception("❌ No se pudo liberar modo humano")
+            return jsonify({"ok": False, "error": "handoff_unavailable"}), 503
+
+    if action != "reply":
+        return jsonify({"ok": False, "error": "accion_invalida"}), 400
+
+    text = str(body.get("text") or "").strip()
+    if not text or len(text) > 500:
+        return jsonify({"ok": False, "error": "mensaje_invalido"}), 400
+
+    expires_at = str(body.get("window_expires_at") or "").strip()
+    expires = _parse_dt_maybe(expires_at)
+    now = datetime.now(expires.tzinfo) if expires and expires.tzinfo else datetime.utcnow()
+    if not expires or expires <= now:
+        return jsonify({"ok": False, "error": "ventana_24h_cerrada"}), 409
+    if expires - now > timedelta(hours=25):
+        return jsonify({"ok": False, "error": "ventana_24h_invalida"}), 400
+
+    raw_request_id = str(body.get("request_id") or "").strip()
+    try:
+        request_id = str(uuid.UUID(raw_request_id))
+    except Exception:
+        return jsonify({"ok": False, "error": "request_id_invalido"}), 400
+
+    try:
+        handoff = _set_human_handoff(to, True, expires_at, actor)
+    except Exception:
+        log.exception("❌ No se pudo activar modo humano; no se envia")
+        return jsonify({"ok": False, "error": "handoff_unavailable"}), 503
+
+    event_base = {
+        "lead_id": lead_id,
+        "phone_e164": to,
+        "phone_last10": last10,
+        "name": _match_name(match) or None,
+        "phone_number_id": WABA_PHONE_ID,
+        "request_id": request_id,
+        "direction": "outbound",
+        "text": text,
+    }
+    trace = {"service": "vicky-bot-secom", "origen": "radar_manual_reply", "actor": actor}
+    record_radar_event(
+        event_type="message_requested", occurred_at=radar_events.canonical_ts(),
+        delivery_status="requested", trace=trace, **event_base,
+    )
+
+    detail = send_message(to, text, return_detail=True)
+    if not isinstance(detail, dict):
+        detail = {"ok": bool(detail), "wamid": "", "motivo": "desconocido"}
+    if detail.get("ok") and detail.get("wamid"):
+        record_radar_event(
+            event_type="message_sent", occurred_at=radar_events.canonical_ts(),
+            wamid=str(detail.get("wamid")), delivery_status="sent", trace=trace, **event_base,
+        )
+        return jsonify({
+            "ok": True, "sent": True, "wamid": str(detail.get("wamid")),
+            "request_id": request_id, "human_handoff": handoff,
+        }), 200
+
+    reason = str(detail.get("motivo") or "send_failed")
+    record_radar_event(
+        event_type="message_failed", occurred_at=radar_events.canonical_ts(),
+        delivery_status="failed", error_title=reason, trace=trace, **event_base,
+    )
+    return jsonify({"ok": False, "sent": False, "error": reason, "request_id": request_id}), 502
 
 
 @app.post("/ext/auto-send-one")
