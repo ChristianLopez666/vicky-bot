@@ -102,6 +102,14 @@ _BOARDROOM_ALLOWED_INSTRUCTIONS = {
     "no_action",
 }
 
+# Cerebro de Boardroom: solo para estos numeros (ultimos 10 digitos). Vacio = apagado.
+BRAIN_PHONES = {
+    digits[-10:]
+    for digits in (re.sub(r"\D", "", p) for p in re.split(r"[,\s]+", os.getenv("BRAIN_PHONES", "")))
+    if len(digits) >= 10
+}
+BRAIN_CALLBACK_TOKEN = os.getenv("BRAIN_CALLBACK_TOKEN", "").strip()
+
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 SHEETS_ID_LEADS = os.getenv("SHEETS_ID_LEADS", "").strip()
 SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto").strip()
@@ -1727,6 +1735,60 @@ def _request_boardroom_instruction(payload: Dict[str, Any]) -> Tuple[Optional[Di
         return None, "exception"
 
 
+_brain_seen_ids: Dict[str, None] = {}
+_brain_seen_lock = threading.Lock()
+
+
+def _brain_enabled_for(last10: str) -> bool:
+    return bool(BRAIN_CALLBACK_TOKEN and last10 in BRAIN_PHONES)
+
+
+def _handoff_turn_to_brain(
+    phone: str,
+    msg: Dict[str, Any],
+    match: Optional[Dict[str, Any]],
+    mtype: str,
+    text: str,
+) -> bool:
+    """Entrega el turno al cerebro de Boardroom sin esperarlo; la respuesta llega
+    por /ext/boardroom/instruction. False = el guion local atiende el turno."""
+    msg_id = str(msg.get("id") or "")
+    with _brain_seen_lock:
+        if msg_id and msg_id in _brain_seen_ids:
+            log.info("🧠 Reenvio de Meta ya entregado al cerebro msg_id=%s", msg_id)
+            return True
+    if not _BUS_ACTIVE or not BUS_URL or not BUS_INTERNAL_TOKEN:
+        return False
+
+    payload = _build_boardroom_event(phone, text, msg, mtype, match)
+    payload["brain"] = {"mode": "async"}
+    try:
+        resp = requests.post(
+            _bus_event_url(),
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {BUS_INTERNAL_TOKEN}",
+                "X-Source-System": "vicky",
+                "X-Event-Type": "inbound_message",
+            },
+            timeout=3,
+        )
+        body = resp.json() if resp.text else {}
+    except Exception as exc:
+        log.warning("🧠 Cerebro no disponible (%s); atiende el guion", type(exc).__name__)
+        return False
+
+    accepted = resp.status_code == 202 and isinstance(body, dict) and body.get("status") == "accepted"
+    log.info("🧠 brain_handoff phone_last4=%s accepted=%s http=%s", phone[-4:], accepted, resp.status_code)
+    if accepted and msg_id:
+        with _brain_seen_lock:
+            _brain_seen_ids[msg_id] = None
+            while len(_brain_seen_ids) > 500:
+                _brain_seen_ids.pop(next(iter(_brain_seen_ids)))
+    return accepted
+
+
 def _instruction_message(instruction: Dict[str, Any]) -> str:
     message = str(instruction.get("message") or "").strip()
     options = instruction.get("options")
@@ -3094,6 +3156,9 @@ def _handle_inbound_message(msg: Dict[str, Any]) -> None:
 
         _ensure_user(phone)["last_message"] = text
 
+        if _brain_enabled_for(last10) and _handoff_turn_to_brain(phone, msg, match, mtype, text):
+            return
+
         if SECOM_LOCAL_FALLBACK_ENABLED and _is_active_funnel_state(st_now):
             # ACTIVE_DETERMINISTIC_FUNNEL_TURN (DOC-0043 regla 3): continua
             # localmente sin bloquear en Boardroom por cada paso.
@@ -3432,6 +3497,42 @@ def index():
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "service": "Vicky Bot Inbursa", "timestamp": _utc_now_iso()}), 200
+
+
+@app.post("/ext/boardroom/instruction")
+def boardroom_brain_instruction():
+    """Respuesta asincrona del cerebro de Boardroom para un turno ya entregado."""
+    auth = request.headers.get("Authorization", "").strip()
+    token = auth.split(" ", 1)[1].strip() if auth.lower().startswith("bearer ") else ""
+    if not BRAIN_CALLBACK_TOKEN or not hmac.compare_digest(token, BRAIN_CALLBACK_TOKEN):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        body = {}
+    phone = re.sub(r"\D", "", str(body.get("phone") or ""))
+    if phone[-10:] not in BRAIN_PHONES:
+        return jsonify({"ok": False, "error": "phone_not_enabled"}), 403
+
+    if body.get("status") == "ok" and _is_boardroom_instruction_executable(body):
+        executed, delivery_status, error = _execute_boardroom_instruction(phone, body)
+        if not executed:
+            _send_neutral_fallback(phone)
+        log.info(
+            "🧠 Instruccion del cerebro phone_last4=%s tipo=%s executed=%s",
+            phone[-4:], (body.get("instruction") or {}).get("type"), executed,
+        )
+        return jsonify({"ok": True, "executed": executed, "delivery_status": delivery_status, "error": error}), 200
+
+    text = str(body.get("text") or "").strip()
+    _notify_advisor(
+        "🧠 El cerebro no pudo contestar; atiende tú\n"
+        f"WhatsApp: {phone}\n"
+        f"Mensaje: {text or '(sin texto)'}"
+    )
+    _send_neutral_fallback(phone)
+    log.warning("🧠 Cerebro en fallback phone_last4=%s motivo=%s", phone[-4:], body.get("error") or body.get("status"))
+    return jsonify({"ok": True, "executed": False, "fallback": True}), 200
 
 
 @app.get("/ext/health")
