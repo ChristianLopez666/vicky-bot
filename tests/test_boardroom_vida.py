@@ -142,7 +142,7 @@ def test_boardroom_reply_handled_before_local_router():
         rv = vicky.app.test_client().post("/webhook", json=_payload("hola"))
 
     assert rv.status_code == 200
-    send_message.assert_called_once_with(PHONE, "Respuesta Boardroom")
+    send_message.assert_called_once_with(PHONE, "Respuesta Boardroom", return_detail=True)
     route.assert_not_called()
 
 

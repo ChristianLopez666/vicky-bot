@@ -145,7 +145,7 @@ def test_legacy_mode_status_fallback_still_executes_as_handled(no_external_io, b
         rv = vicky.app.test_client().post("/webhook", json=_payload("hola"))
 
     assert rv.status_code == 200
-    send_message.assert_called_once_with(PHONE, vicky.NEUTRAL_FALLBACK_MESSAGE)
+    send_message.assert_called_once_with(PHONE, vicky.NEUTRAL_FALLBACK_MESSAGE, return_detail=True)
     assert PHONE not in vicky.user_state
 
 
@@ -210,7 +210,7 @@ def test_fix_mode_status_ok_takes_precedence_over_local_routing(no_external_io, 
         rv = vicky.app.test_client().post("/webhook", json=_payload("imss"))
 
     assert rv.status_code == 200
-    send_message.assert_called_once_with(PHONE, "Decision real de Boardroom")
+    send_message.assert_called_once_with(PHONE, "Decision real de Boardroom", return_detail=True)
     assert PHONE not in vicky.user_state  # imss_start jamas se ejecuto
 
 
@@ -226,7 +226,7 @@ def test_ok_send_message_with_valid_message_is_handled(no_external_io, bus_confi
         rv = vicky.app.test_client().post("/webhook", json=_payload("imss"))
 
     assert rv.status_code == 200
-    send_message.assert_called_once_with(PHONE, "Decision real")
+    send_message.assert_called_once_with(PHONE, "Decision real", return_detail=True)
     assert PHONE not in vicky.user_state
 
 
@@ -417,7 +417,7 @@ def test_legacy_mode_active_funnel_still_blocked(no_external_io, bus_configured)
 
     assert rv.status_code == 200
     assert vicky.user_state[PHONE] == "vida_edad"  # no avanzo
-    send_message.assert_called_once_with(PHONE, vicky.NEUTRAL_FALLBACK_MESSAGE)
+    send_message.assert_called_once_with(PHONE, vicky.NEUTRAL_FALLBACK_MESSAGE, return_detail=True)
 
 
 # ==========================

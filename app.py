@@ -21,6 +21,7 @@ import re
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1873,9 +1874,72 @@ def _request_boardroom_instruction(payload: Dict[str, Any]) -> Tuple[Optional[Di
 _brain_seen_ids: Dict[str, None] = {}
 _brain_seen_lock = threading.Lock()
 
+# Instrucciones del cerebro ya atendidas. Boardroom reintenta la entrega cuando
+# esta tarda (20 s) y hasta el 15-sep un reintento mandaba el mismo mensaje dos
+# veces al prospecto: el mismo riesgo que ya cerramos en las respuestas
+# manuales del Radar. La llave es instruction_id (o event_id si no viniera).
+_brain_done: "OrderedDict[str, Optional[Dict[str, Any]]]" = OrderedDict()
+_brain_done_lock = threading.Lock()
+
+# Turnos entregados al cerebro que todavia no tienen respuesta. Si el cerebro
+# se cae o se reinicia a media decision, nadie se enteraba: el prospecto
+# quedaba esperando en silencio. El vigilante avisa a Christian; no le escribe
+# al prospecto, para no competir con una respuesta que llegue tarde.
+BRAIN_WATCHDOG_SECONDS = float(os.getenv("BRAIN_WATCHDOG_SECONDS", "45").strip() or 45)
+_brain_waiting: Dict[str, Dict[str, Any]] = {}
+_brain_waiting_lock = threading.Lock()
+
 
 def _brain_enabled_for(last10: str) -> bool:
     return bool(BRAIN_CALLBACK_TOKEN and last10 in BRAIN_PHONES)
+
+
+def _brain_claim_instruction(key: str) -> Optional[Dict[str, Any]]:
+    """Aparta la instruccion para ejecutarla una sola vez. Devuelve la respuesta
+    anterior si ya se atendio (o un aviso si sigue en curso)."""
+    with _brain_done_lock:
+        if key in _brain_done:
+            previous = _brain_done[key]
+            return dict(previous) if previous else {"ok": True, "duplicate": True, "in_progress": True}
+        _brain_done[key] = None
+        while len(_brain_done) > 500:
+            _brain_done.popitem(last=False)
+    return None
+
+
+def _brain_store_result(key: str, result: Dict[str, Any]) -> None:
+    with _brain_done_lock:
+        _brain_done[key] = dict(result)
+
+
+def _brain_wait_start(event_id: str, phone: str, text: str) -> None:
+    if not event_id or BRAIN_WATCHDOG_SECONDS <= 0:
+        return
+    with _brain_waiting_lock:
+        _brain_waiting[event_id] = {"phone": phone, "text": text}
+    timer = threading.Timer(BRAIN_WATCHDOG_SECONDS, _brain_wait_expired, args=(event_id,))
+    timer.daemon = True  # un reinicio no debe esperar al vigilante
+    timer.start()
+
+
+def _brain_wait_done(event_id: str) -> None:
+    if not event_id:
+        return
+    with _brain_waiting_lock:
+        _brain_waiting.pop(event_id, None)
+
+
+def _brain_wait_expired(event_id: str) -> None:
+    with _brain_waiting_lock:
+        pending = _brain_waiting.pop(event_id, None)
+    if not pending:
+        return
+    log.error("🧠 El cerebro no contesto en %.0f s event_id=%s", BRAIN_WATCHDOG_SECONDS, event_id)
+    _notify_advisor(
+        "🧠 El cerebro no contestó y el prospecto sigue esperando\n"
+        f"WhatsApp: {pending.get('phone')}\n"
+        f"Último mensaje: {pending.get('text')}"
+    )
 
 
 def _handoff_turn_to_brain(
@@ -1921,6 +1985,8 @@ def _handoff_turn_to_brain(
             _brain_seen_ids[msg_id] = None
             while len(_brain_seen_ids) > 500:
                 _brain_seen_ids.pop(next(iter(_brain_seen_ids)))
+    if accepted:
+        _brain_wait_start(str(payload.get("event_id") or ""), phone, text)
     return accepted
 
 
@@ -1937,6 +2003,70 @@ def _instruction_message(instruction: Dict[str, Any]) -> str:
     return message
 
 
+def _brain_trace(body: Dict[str, Any], origen: str) -> Dict[str, Any]:
+    """Traza de Radar con lo que decidio el cerebro, para que el expediente
+    muestre no solo el texto enviado sino por que se envio."""
+    return {
+        "service": "vicky-bot-secom",
+        "origen": origen,
+        "decision": body.get("decision"),
+        "motivo": (body.get("authority") or {}).get("escalation_reason"),
+        "confianza": body.get("confidence"),
+        "datos": body.get("fields"),
+        "instruction_id": body.get("instruction_id"),
+        "trace_id": body.get("trace_id"),
+    }
+
+
+_brain_radar_threads: List[threading.Thread] = []
+_brain_radar_lock = threading.Lock()
+
+
+def _record_brain_radar_event(phone: str, event_type: str, body: Dict[str, Any], **extra: Any) -> None:
+    """Anota en Radar un hecho de una respuesta del cerebro.
+
+    Hasta el 15-sep el cerebro contestaba con send_message() y no emitia nada:
+    el expediente mostraba la pregunta del prospecto pero no lo que Vicky
+    contesto (auditoria de Work).
+
+    En hilo aparte a proposito: resolver la identidad del lead lee la hoja, y
+    la ruta sincrona de Boardroom corre dentro del webhook, donde Meta solo
+    espera 3-5 s. Anotar un hecho no puede robarle tiempo a la respuesta.
+    """
+    occurred_at = radar_events.canonical_ts()
+
+    def _run() -> None:
+        try:
+            identity = _lead_identity_for_phone(phone)
+            if not identity.get("lead_id"):
+                return
+            record_radar_event(
+                event_type=event_type, lead_id=identity["lead_id"],
+                phone_e164=_normalize_to_e164_mx(phone), phone_last10=identity["phone_last10"],
+                name=identity.get("nombre") or None, phone_number_id=WABA_PHONE_ID,
+                occurred_at=occurred_at, direction="outbound",
+                trace=_brain_trace(body, "cerebro_boardroom"), **extra,
+            )
+        except Exception:
+            log.exception("No se pudo registrar en Radar la respuesta del cerebro (%s)", event_type)
+
+    thread = threading.Thread(target=_run, name="BrainRadarEvent", daemon=True)
+    with _brain_radar_lock:
+        _brain_radar_threads.append(thread)
+        del _brain_radar_threads[:-20]
+    thread.start()
+
+
+def _brain_radar_flush(timeout: float = 5.0) -> None:
+    """Espera los apuntes de Radar en vuelo. Para las pruebas: en produccion
+    nadie espera a Radar."""
+    with _brain_radar_lock:
+        pendientes = list(_brain_radar_threads)
+        _brain_radar_threads.clear()
+    for thread in pendientes:
+        thread.join(timeout)
+
+
 def _execute_boardroom_instruction(phone: str, body: Dict[str, Any]) -> Tuple[bool, str, Optional[str]]:
     instruction = body.get("instruction") or {}
     instruction_type = instruction.get("type")
@@ -1945,6 +2075,11 @@ def _execute_boardroom_instruction(phone: str, body: Dict[str, Any]) -> Tuple[bo
     try:
         if advisor.get("required") and advisor.get("message"):
             _notify_advisor(str(advisor.get("message")))
+            _record_brain_radar_event(
+                phone, "advisor_notified", body,
+                text=str(advisor.get("message")),
+                advisor_notification={"required": True, "to": str(advisor.get("to") or "christian")},
+            )
 
         if instruction_type == "no_action":
             return True, delivery_status, None
@@ -1956,8 +2091,17 @@ def _execute_boardroom_instruction(phone: str, body: Dict[str, Any]) -> Tuple[bo
             return True, delivery_status, None
 
         message = _instruction_message(instruction) or NEUTRAL_FALLBACK_MESSAGE
-        ok = send_message(phone, message)
+        detail = send_message(phone, message, return_detail=True)
+        if not isinstance(detail, dict):
+            detail = {"ok": bool(detail), "wamid": "", "motivo": "desconocido"}
+        ok = bool(detail.get("ok"))
         delivery_status = "sent" if ok else "failed"
+        if ok:
+            _record_brain_radar_event(phone, "message_sent", body, text=message,
+                                      wamid=str(detail.get("wamid") or "") or None, delivery_status="sent")
+        else:
+            _record_brain_radar_event(phone, "message_failed", body, text=message, delivery_status="failed",
+                                      error_title=str(detail.get("motivo") or "send_failed"))
         return ok, delivery_status, None if ok else "send_failed"
     except Exception as exc:
         log.exception("Boardroom instruction execution failed")
@@ -3664,6 +3808,19 @@ def boardroom_brain_instruction():
     if phone[-10:] not in BRAIN_PHONES:
         return jsonify({"ok": False, "error": "phone_not_enabled"}), 403
 
+    event_id = str(body.get("event_id") or "")
+    # Boardroom reintenta la entrega cuando esta tarda: la misma instruccion no
+    # se ejecuta dos veces, se devuelve el resultado de la primera.
+    idem_key = str(body.get("instruction_id") or "") or event_id
+    if idem_key:
+        previous = _brain_claim_instruction(idem_key)
+        if previous is not None:
+            log.info("🧠 Instruccion repetida, no se ejecuta otra vez key=%s", idem_key)
+            _brain_wait_done(event_id)
+            return jsonify({**previous, "duplicate": True}), 200
+
+    _brain_wait_done(event_id)
+
     if body.get("status") == "ok" and _is_boardroom_instruction_executable(body):
         executed, delivery_status, error = _execute_boardroom_instruction(phone, body)
         if not executed:
@@ -3672,7 +3829,10 @@ def boardroom_brain_instruction():
             "🧠 Instruccion del cerebro phone_last4=%s tipo=%s executed=%s",
             phone[-4:], (body.get("instruction") or {}).get("type"), executed,
         )
-        return jsonify({"ok": True, "executed": executed, "delivery_status": delivery_status, "error": error}), 200
+        result = {"ok": True, "executed": executed, "delivery_status": delivery_status, "error": error}
+        if idem_key:
+            _brain_store_result(idem_key, result)
+        return jsonify(result), 200
 
     text = str(body.get("text") or "").strip()
     _notify_advisor(
@@ -3682,7 +3842,10 @@ def boardroom_brain_instruction():
     )
     _send_neutral_fallback(phone)
     log.warning("🧠 Cerebro en fallback phone_last4=%s motivo=%s", phone[-4:], body.get("error") or body.get("status"))
-    return jsonify({"ok": True, "executed": False, "fallback": True}), 200
+    result = {"ok": True, "executed": False, "fallback": True}
+    if idem_key:
+        _brain_store_result(idem_key, result)
+    return jsonify(result), 200
 
 
 @app.get("/ext/health")
