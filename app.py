@@ -20,6 +20,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta
@@ -233,23 +234,51 @@ else:
 # googleapiclient rearma el recurso desde el discovery en cada .spreadsheets():
 # ~50 ms y varios MB de basura ciclica por llamada. Con cientos de acuses de
 # Meta eso llenaba los 512 MB y reiniciaba el servicio.
-_google_resources: Dict[str, Tuple[Any, Any]] = {}
+_google_local = threading.local()
 
 
 def _cached_resource(key: str, service: Any, factory) -> Any:
-    cached = _google_resources.get(key)
+    """Cache POR HILO. googleapiclient/httplib2 no es seguro entre hilos: el
+    17-sep un hilo de Radar usando el cliente compartido tumbo un worker con
+    SIGSEGV (codigo 139) mientras el hilo principal leia la hoja. Es la misma
+    regla que ya aplicaba _radar_outbox_repository, ahora para todos."""
+    cache = getattr(_google_local, "resources", None)
+    if cache is None:
+        cache = {}
+        _google_local.resources = cache
+    cached = cache.get(key)
     if cached is None or cached[0] is not service:
         cached = (service, factory(service))
-        _google_resources[key] = cached
+        cache[key] = cached
     return cached[1]
 
 
+def _sheets_service() -> Any:
+    """El transporte del hilo principal se comparte; cada hilo secundario
+    construye el suyo una sola vez y lo conserva mientras viva."""
+    if threading.current_thread() is threading.main_thread():
+        return sheets_svc
+    propio = getattr(_google_local, "sheets_svc", None)
+    if propio is None:
+        if not (google_ready and GOOGLE_CREDENTIALS_JSON):
+            return sheets_svc
+        credenciales = service_account.Credentials.from_service_account_info(
+            json.loads(GOOGLE_CREDENTIALS_JSON),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        propio = build("sheets", "v4", credentials=credenciales, cache_discovery=False)
+        _google_local.sheets_svc = propio
+    return propio
+
+
 def _sheets() -> Any:
-    return _cached_resource("sheets", sheets_svc, lambda svc: svc.spreadsheets())
+    servicio = _sheets_service()
+    return _cached_resource("sheets", servicio, lambda svc: svc.spreadsheets())
 
 
 def _sheets_values() -> Any:
-    return _cached_resource("sheets_values", sheets_svc, lambda svc: _sheets().values())
+    servicio = _sheets_service()
+    return _cached_resource("sheets_values", servicio, lambda svc: svc.spreadsheets().values())
 
 
 def _drive_files() -> Any:
@@ -1329,9 +1358,88 @@ def send_main_menu(phone: str) -> None:
 
 ALERTAS_TAB = "ALERTAS_ASESOR"
 ALERTAS_HEADER = ["fecha_utc", "estado", "motivo", "wamid", "request_id", "mensaje"]
-# Plantilla aprobada para avisar al asesor fuera de la ventana de 24 h. Vacio =
-# sin plantilla; el aviso queda en ALERTAS_ASESOR y en Radar, nunca se pierde.
-ADVISOR_ALERT_TEMPLATE = os.getenv("ADVISOR_ALERT_TEMPLATE", "").strip()
+# Plantilla aprobada para avisar al asesor fuera de la ventana de 24 h. Mismos
+# nombres de variable que Vicky Redes, que ya resolvio esto en produccion.
+ADVISOR_ALERT_TEMPLATE = os.getenv("ADVISOR_TEMPLATE_NAME", "").strip()
+ADVISOR_ALERT_TEMPLATE_LANG = os.getenv("ADVISOR_TEMPLATE_LANG", "es_MX").strip()
+ADVISOR_WINDOW_SECONDS = 24 * 3600
+TPL_PARAM_LIMIT = 900
+TPL_PARAM_FALLBACK = "Tienes un aviso de Vicky SECOM"
+
+# Ventana de 24 h del asesor y correlacion de sus avisos. En memoria: un
+# reinicio solo devuelve el estado a "desconocido", y el reenvio reactivo por
+# statuses[].failed cubre ese hueco (mismo diseno que Redes).
+_advisor_window_ts: Optional[float] = None
+_advisor_sent: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_advisor_lock = threading.Lock()
+
+
+def _advisor_window_state() -> str:
+    """`abierta` | `cerrada` | `desconocida`."""
+    with _advisor_lock:
+        ts = _advisor_window_ts
+    if ts is None:
+        return "desconocida"
+    return "abierta" if (time.time() - ts) < ADVISOR_WINDOW_SECONDS else "cerrada"
+
+
+def _advisor_window_open() -> None:
+    global _advisor_window_ts
+    with _advisor_lock:
+        _advisor_window_ts = time.time()
+
+
+def _advisor_window_expire() -> None:
+    """El veredicto de Meta manda sobre la contabilidad local: si creiamos la
+    ventana abierta, estabamos equivocados."""
+    global _advisor_window_ts
+    with _advisor_lock:
+        _advisor_window_ts = None
+
+
+def _advisor_remember(wamid: str, nivel: str, mensaje: str, request_id: str) -> None:
+    if not wamid:
+        return
+    with _advisor_lock:
+        _advisor_sent[wamid] = {"nivel": nivel, "mensaje": mensaje[:2000], "request_id": request_id}
+        while len(_advisor_sent) > 200:
+            _advisor_sent.popitem(last=False)
+
+
+def _advisor_lookup(wamid: str) -> Optional[Dict[str, Any]]:
+    with _advisor_lock:
+        return dict(_advisor_sent.get(wamid) or {}) or None
+
+
+def _sanitize_template_param(text: str, limit: int = TPL_PARAM_LIMIT) -> str:
+    """Meta rechaza parametros de plantilla con saltos de linea, tabuladores o
+    espacios repetidos (132000/132012). Los avisos al asesor son multilinea, asi
+    que mandar el texto crudo hacia fallar SIEMPRE el nivel 2."""
+    s = str(text or "")
+    s = "".join(ch if (ch == " " or not unicodedata.category(ch).startswith("C")) else " " for ch in s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return (s[:limit].strip() if limit > 0 else s) or TPL_PARAM_FALLBACK
+
+
+def _notify_advisor_via_template(mensaje: str, motivo: str) -> Dict[str, Any]:
+    """Nivel 2: el unico formato que Meta entrega fuera de la ventana de 24 h."""
+    resultado = {"ok": False, "wamid": "", "motivo": "sin_plantilla_configurada", "nivel": "template"}
+    if not ADVISOR_ALERT_TEMPLATE:
+        log.error("❌ ADVISOR_TEMPLATE_NAME no configurado: fuera de la ventana de 24 h "
+                  "no existe ninguna ruta de entrega hacia el asesor")
+        return resultado
+    detalle = send_template_message(
+        ADVISOR_NUMBER, ADVISOR_ALERT_TEMPLATE,
+        params=[_sanitize_template_param(mensaje)],
+        language=ADVISOR_ALERT_TEMPLATE_LANG, return_detail=True,
+    )
+    if not isinstance(detalle, dict):
+        detalle = {"ok": bool(detalle), "wamid": "", "motivo": "desconocido"}
+    resultado["ok"] = bool(detalle.get("ok"))
+    resultado["wamid"] = str(detalle.get("wamid") or "")
+    resultado["motivo"] = "entregado_por_plantilla" if resultado["ok"] else str(detalle.get("motivo") or "template_failed")
+    log.info("👨‍💼 Aviso al asesor por plantilla motivo=%s ok=%s", motivo, resultado["ok"])
+    return resultado
 
 
 def _advisor_alert_strict() -> bool:
@@ -1373,28 +1481,32 @@ def _notify_advisor(text: str) -> Dict[str, Any]:
     """
     resultado: Dict[str, Any] = {
         "ok": False, "wamid": "", "motivo": "sin_numero_de_asesor",
-        "request_id": str(uuid.uuid4()),
+        "request_id": str(uuid.uuid4()), "nivel": "ninguno",
     }
     try:
         log.info("👨‍💼 Notificando al asesor: %s", text)
         if ADVISOR_NUMBER:
-            detalle = send_message(ADVISOR_NUMBER, text, return_detail=True)
-            if not isinstance(detalle, dict):
-                detalle = {"ok": bool(detalle), "wamid": "", "motivo": "desconocido"}
-            resultado["ok"] = bool(detalle.get("ok"))
-            resultado["wamid"] = str(detalle.get("wamid") or "")
-            resultado["motivo"] = "" if resultado["ok"] else str(detalle.get("motivo") or "send_failed")
+            ventana = _advisor_window_state()
+            if ventana == "cerrada" and ADVISOR_ALERT_TEMPLATE:
+                # Consta que esta cerrada: el texto libre lo aceptaria Meta con
+                # 200 y lo tiraria despues, produciendo un exito falso.
+                plantilla = _notify_advisor_via_template(text, motivo="ventana_cerrada")
+                resultado.update(plantilla)
+            else:
+                detalle = send_message(ADVISOR_NUMBER, text, return_detail=True)
+                if not isinstance(detalle, dict):
+                    detalle = {"ok": bool(detalle), "wamid": "", "motivo": "desconocido"}
+                resultado["ok"] = bool(detalle.get("ok"))
+                resultado["wamid"] = str(detalle.get("wamid") or "")
+                resultado["motivo"] = "" if resultado["ok"] else str(detalle.get("motivo") or "send_failed")
+                resultado["nivel"] = "texto_libre"
 
-            if not resultado["ok"] and ADVISOR_ALERT_TEMPLATE:
-                # Fuera de la ventana de 24 h el texto libre no pasa; la
-                # plantilla aprobada si.
-                plantilla = send_template_message(
-                    ADVISOR_NUMBER, ADVISOR_ALERT_TEMPLATE, return_detail=True
-                )
-                if isinstance(plantilla, dict) and plantilla.get("ok"):
-                    resultado["ok"] = True
-                    resultado["wamid"] = str(plantilla.get("wamid") or "")
-                    resultado["motivo"] = "entregado_por_plantilla"
+                if not resultado["ok"] and ADVISOR_ALERT_TEMPLATE:
+                    plantilla = _notify_advisor_via_template(text, motivo="texto_libre_fallo")
+                    if plantilla["ok"]:
+                        resultado.update(plantilla)
+
+            _advisor_remember(resultado["wamid"], resultado["nivel"], text, resultado["request_id"])
     except Exception as exc:
         log.exception("❌ Error notificando al asesor")
         resultado["motivo"] = f"{type(exc).__name__}"
@@ -2074,6 +2186,20 @@ def _instruction_message(instruction: Dict[str, Any]) -> str:
     return message
 
 
+def _advisor_notification_payload(aviso: Dict[str, Any]) -> Dict[str, Any]:
+    """Lo que de verdad paso con el aviso, en el formato del contrato 1.1: el
+    destino es un telefono E.164, no la palabra "christian", y se declara si
+    quedo entregado y por que via."""
+    return {
+        "required": True,
+        "to": _normalize_to_e164_mx(ADVISOR_NUMBER),
+        "channel": "whatsapp",
+        "level": str(aviso.get("nivel") or "texto_libre"),
+        "delivered": bool(aviso.get("ok")),
+        "reason": str(aviso.get("motivo") or "") or None,
+    }
+
+
 def _brain_trace(body: Dict[str, Any], origen: str) -> Dict[str, Any]:
     """Traza de Radar con lo que decidio el cerebro, para que el expediente
     muestre no solo el texto enviado sino por que se envio."""
@@ -2158,7 +2284,7 @@ def _execute_boardroom_instruction(phone: str, body: Dict[str, Any]) -> Tuple[bo
                 wamid=str(aviso.get("wamid") or "") or None,
                 delivery_status="sent" if aviso_entregado else "failed",
                 error_title=None if aviso_entregado else (str(aviso.get("motivo") or "advisor_not_delivered")),
-                advisor_notification={"required": True, "to": str(advisor.get("to") or "christian")},
+                advisor_notification=_advisor_notification_payload(aviso),
             )
 
         if instruction_type == "no_action":
@@ -2178,7 +2304,7 @@ def _execute_boardroom_instruction(phone: str, body: Dict[str, Any]) -> Tuple[bo
                     wamid=str(propio.get("wamid") or "") or None,
                     delivery_status="sent" if entregado else "failed",
                     error_title=None if entregado else (str(propio.get("motivo") or "advisor_not_delivered")),
-                    advisor_notification={"required": True, "to": "christian"},
+                    advisor_notification=_advisor_notification_payload(propio),
                 )
             # No se confirma ejecucion de un aviso que Meta rechazo.
             if not entregado and _advisor_alert_strict():
@@ -3423,6 +3549,49 @@ def _handle_awaiting_template_response(phone: str, text: str, match: Optional[Di
 # Codigos de Meta que no se arreglan reintentando: el numero no puede recibir.
 CODIGOS_NO_ENTREGABLES = {131026, 130472, 131050, 131051}
 
+_avisos_fallidos_vistos: "OrderedDict[str, None]" = OrderedDict()
+
+
+def _atender_aviso_no_entregado(st: Dict[str, Any]) -> Optional[str]:
+    """Meta rechaza el aviso al asesor DESPUES de aceptarlo (131047 llega por
+    webhook un segundo mas tarde). Hasta hoy eso se perdia: el sistema daba el
+    aviso por bueno. Ahora se expira la ventana, se reenvia por plantilla y
+    queda en la bandeja ALERTAS_ASESOR."""
+    wamid = str(st.get("wamid") or "")
+    seguimiento = _advisor_lookup(wamid)
+    if not seguimiento:
+        return None
+
+    # Meta reentrega el mismo estado: el reenvio no puede dispararse dos veces.
+    with _advisor_lock:
+        if wamid in _avisos_fallidos_vistos:
+            return None
+        _avisos_fallidos_vistos[wamid] = None
+        while len(_avisos_fallidos_vistos) > 200:
+            _avisos_fallidos_vistos.popitem(last=False)
+
+    codigo = st.get("error_code")
+    motivo = str(codigo or st.get("error_title") or "status_failed")
+    log.error("❌ AVISO AL ASESOR NO ENTREGADO (tardio) nivel=%s motivo=%s wamid=%s",
+              seguimiento.get("nivel"), motivo, wamid[:24])
+    _advisor_window_expire()
+
+    mensaje = str(seguimiento.get("mensaje") or "")
+    resultado = {"ok": False, "wamid": wamid, "motivo": motivo,
+                 "request_id": str(seguimiento.get("request_id") or "")}
+
+    if seguimiento.get("nivel") == "template":
+        log.error("❌ Tampoco entrego la plantilla: no hay nivel superior de aviso")
+    elif mensaje and ADVISOR_ALERT_TEMPLATE:
+        plantilla = _notify_advisor_via_template(mensaje, motivo="status_failed")
+        if plantilla["ok"]:
+            resultado.update(ok=True, wamid=plantilla["wamid"], motivo="entregado_por_plantilla")
+            _advisor_remember(plantilla["wamid"], "template", mensaje, resultado["request_id"])
+
+    if _advisor_alert_strict():
+        _registrar_alerta_pendiente(mensaje or "(mensaje no disponible)", resultado)
+    return "entregado_por_plantilla" if resultado["ok"] else "pendiente"
+
 
 def _reconcile_enabled() -> bool:
     """El acuse de Meta manda sobre la hoja. Hasta el 17-sep la fila quedaba en
@@ -3493,6 +3662,7 @@ def _handle_meta_statuses(local_values: List[Dict[str, Any]]) -> int:
                 # Se conserva el volcado completo: es la unica fuente de los
                 # codigos de error de Meta mientras la bitacora se consolida.
                 log.warning("❌ STATUS failed (detalle): %s", json.dumps(st, ensure_ascii=False))
+                _atender_aviso_no_entregado(st)
                 if _reconcile_enabled():
                     _reconciliar_fila_por_fallo(st)
 
@@ -3569,6 +3739,10 @@ def _handle_inbound_message(msg: Dict[str, Any]) -> None:
         return
 
     last10 = _normalize_phone_last10(phone)
+    if last10 and last10 == _normalize_phone_last10(ADVISOR_NUMBER):
+        # Christian escribio: su ventana de 24 h queda abierta y el aviso por
+        # texto libre vuelve a ser entregable.
+        _advisor_window_open()
     match = match_client_in_sheets(last10)
     _record_inbound_radar(msg, match, phone)
     st_now = user_state.get(phone, "")
