@@ -115,7 +115,9 @@ def test_una_decision_del_cerebro_se_ejecuta_y_avisa_a_christian():
 
     assert rv.status_code == 200 and rv.get_json()["executed"] is True
     notify.assert_called_once_with("🧠 Lead de Vida para ti")
-    send.assert_called_once_with(PHONE, "Te escribe Christian en breve.")
+    # return_detail=True: el wamid es lo que Radar necesita para correlacionar
+    # el envio con los acuses de Meta.
+    send.assert_called_once_with(PHONE, "Te escribe Christian en breve.", return_detail=True)
 
 
 def test_si_el_cerebro_falla_christian_atiende_y_el_cliente_no_queda_sin_respuesta():
