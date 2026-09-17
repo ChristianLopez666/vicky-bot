@@ -1327,17 +1327,88 @@ def send_main_menu(phone: str) -> None:
     send_message(phone, MAIN_MENU)
 
 
-def _notify_advisor(text: str) -> None:
+ALERTAS_TAB = "ALERTAS_ASESOR"
+ALERTAS_HEADER = ["fecha_utc", "estado", "motivo", "wamid", "request_id", "mensaje"]
+# Plantilla aprobada para avisar al asesor fuera de la ventana de 24 h. Vacio =
+# sin plantilla; el aviso queda en ALERTAS_ASESOR y en Radar, nunca se pierde.
+ADVISOR_ALERT_TEMPLATE = os.getenv("ADVISOR_ALERT_TEMPLATE", "").strip()
+
+
+def _advisor_alert_strict() -> bool:
+    """El aviso al asesor solo cuenta como entregado si Meta lo acepto de
+    verdad. Hasta el 17-sep _notify_advisor ignoraba el resultado y el sistema
+    seguia como si hubiera avisado (hallazgo de Work; 4 rechazos 131047 ese
+    dia). ADVISOR_ALERT_STRICT=0 vuelve al comportamiento anterior."""
+    return os.getenv("ADVISOR_ALERT_STRICT", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _registrar_alerta_pendiente(text: str, resultado: Dict[str, Any]) -> None:
+    """Deja el aviso no entregado en una pestana propia. Es la bandeja de
+    'esto no te llego' que hoy no existia en ningun lado."""
+    try:
+        _ensure_tab(ALERTAS_TAB, ALERTAS_HEADER)
+        _sheets_values().append(
+            spreadsheetId=SHEETS_ID_LEADS,
+            range=f"{ALERTAS_TAB}!A:F",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[
+                _utc_now_iso(),
+                "PENDIENTE" if not resultado.get("ok") else "ENTREGADA",
+                str(resultado.get("motivo") or ""),
+                str(resultado.get("wamid") or ""),
+                str(resultado.get("request_id") or ""),
+                text[:900],
+            ]]},
+        ).execute()
+    except Exception:
+        log.exception("⚠️ No se pudo registrar la alerta pendiente del asesor")
+
+
+def _notify_advisor(text: str) -> Dict[str, Any]:
+    """Avisa a Christian y DEVUELVE lo que realmente paso.
+
+    Meta responde 200 y rechaza despues por webhook: el resultado inmediato no
+    es prueba de entrega, pero un rechazo inmediato si es prueba de fallo.
+    """
+    resultado: Dict[str, Any] = {
+        "ok": False, "wamid": "", "motivo": "sin_numero_de_asesor",
+        "request_id": str(uuid.uuid4()),
+    }
     try:
         log.info("👨‍💼 Notificando al asesor: %s", text)
         if ADVISOR_NUMBER:
-            send_message(ADVISOR_NUMBER, text)
-    except Exception:
+            detalle = send_message(ADVISOR_NUMBER, text, return_detail=True)
+            if not isinstance(detalle, dict):
+                detalle = {"ok": bool(detalle), "wamid": "", "motivo": "desconocido"}
+            resultado["ok"] = bool(detalle.get("ok"))
+            resultado["wamid"] = str(detalle.get("wamid") or "")
+            resultado["motivo"] = "" if resultado["ok"] else str(detalle.get("motivo") or "send_failed")
+
+            if not resultado["ok"] and ADVISOR_ALERT_TEMPLATE:
+                # Fuera de la ventana de 24 h el texto libre no pasa; la
+                # plantilla aprobada si.
+                plantilla = send_template_message(
+                    ADVISOR_NUMBER, ADVISOR_ALERT_TEMPLATE, return_detail=True
+                )
+                if isinstance(plantilla, dict) and plantilla.get("ok"):
+                    resultado["ok"] = True
+                    resultado["wamid"] = str(plantilla.get("wamid") or "")
+                    resultado["motivo"] = "entregado_por_plantilla"
+    except Exception as exc:
         log.exception("❌ Error notificando al asesor")
+        resultado["motivo"] = f"{type(exc).__name__}"
     finally:
         # En `finally` a proposito: si el envio por WhatsApp fallo, dejar
         # rastro del aviso importa mas, no menos.
         _log_conversacion(text)
+
+    if not resultado["ok"]:
+        log.error("❌ AVISO AL ASESOR NO ENTREGADO motivo=%s request_id=%s",
+                  resultado["motivo"], resultado["request_id"])
+        if _advisor_alert_strict():
+            _registrar_alerta_pendiente(text, resultado)
+    return resultado
 
 
 def _match_name(match: Optional[Dict[str, Any]]) -> str:
@@ -2072,22 +2143,46 @@ def _execute_boardroom_instruction(phone: str, body: Dict[str, Any]) -> Tuple[bo
     instruction_type = instruction.get("type")
     advisor = body.get("advisor_notification") or {}
     delivery_status = "unknown"
+    aviso_entregado = True
     try:
         if advisor.get("required") and advisor.get("message"):
-            _notify_advisor(str(advisor.get("message")))
+            aviso = _notify_advisor(str(advisor.get("message")))
+            aviso_entregado = bool(aviso.get("ok"))
+            # request_id siempre presente: sin wamid ni request_id la llave del
+            # contrato queda vacia y el evento advisor_notified nunca se
+            # construia (hallazgo de Work, verificado en event_id_for).
             _record_brain_radar_event(
                 phone, "advisor_notified", body,
                 text=str(advisor.get("message")),
+                request_id=str(aviso.get("request_id") or ""),
+                wamid=str(aviso.get("wamid") or "") or None,
+                delivery_status="sent" if aviso_entregado else "failed",
+                error_title=None if aviso_entregado else (str(aviso.get("motivo") or "advisor_not_delivered")),
                 advisor_notification={"required": True, "to": str(advisor.get("to") or "christian")},
             )
 
         if instruction_type == "no_action":
-            return True, delivery_status, None
+            # Se reporta el aviso no entregado, pero no se marca como no
+            # ejecutada: eso mandaria al prospecto un mensaje que nadie pidio.
+            return True, delivery_status, None if aviso_entregado else "advisor_not_delivered"
 
         if instruction_type == "notify_advisor":
             message = _instruction_message(instruction)
+            entregado = aviso_entregado
             if message:
-                _notify_advisor(message)
+                propio = _notify_advisor(message)
+                entregado = bool(propio.get("ok"))
+                _record_brain_radar_event(
+                    phone, "advisor_notified", body, text=message,
+                    request_id=str(propio.get("request_id") or ""),
+                    wamid=str(propio.get("wamid") or "") or None,
+                    delivery_status="sent" if entregado else "failed",
+                    error_title=None if entregado else (str(propio.get("motivo") or "advisor_not_delivered")),
+                    advisor_notification={"required": True, "to": "christian"},
+                )
+            # No se confirma ejecucion de un aviso que Meta rechazo.
+            if not entregado and _advisor_alert_strict():
+                return False, "failed", "advisor_not_delivered"
             return True, delivery_status, None
 
         message = _instruction_message(instruction) or NEUTRAL_FALLBACK_MESSAGE
@@ -2102,7 +2197,10 @@ def _execute_boardroom_instruction(phone: str, body: Dict[str, Any]) -> Tuple[bo
         else:
             _record_brain_radar_event(phone, "message_failed", body, text=message, delivery_status="failed",
                                       error_title=str(detail.get("motivo") or "send_failed"))
-        return ok, delivery_status, None if ok else "send_failed"
+        if not ok:
+            return False, delivery_status, "send_failed"
+        # El prospecto si recibio su respuesta; lo que fallo fue el aviso.
+        return True, delivery_status, None if aviso_entregado else "advisor_not_delivered"
     except Exception as exc:
         log.exception("Boardroom instruction execution failed")
         return False, "failed", f"{type(exc).__name__}: {exc}"
@@ -3322,6 +3420,57 @@ def _handle_awaiting_template_response(phone: str, text: str, match: Optional[Di
     return True
 
 
+# Codigos de Meta que no se arreglan reintentando: el numero no puede recibir.
+CODIGOS_NO_ENTREGABLES = {131026, 130472, 131050, 131051}
+
+
+def _reconcile_enabled() -> bool:
+    """El acuse de Meta manda sobre la hoja. Hasta el 17-sep la fila quedaba en
+    ENVIADO aunque el mensaje nunca se entregara (131026, 131049, 130472), y ese
+    prospecto no se reintentaba jamas. SHEET_STATUS_RECONCILE=0 revierte."""
+    return os.getenv("SHEET_STATUS_RECONCILE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _reconciliar_fila_por_fallo(st: Dict[str, Any]) -> Optional[str]:
+    """Corrige la fila del prospecto cuando Meta avisa que no entrego.
+
+    Permanente -> NO_ENTREGABLE_<codigo>, fuera de la cola.
+    Reintentable -> vuelve a PENDIENTE una sola vez, con retry_at a 24 h para
+    no reenviarle a los cinco minutos.
+    """
+    try:
+        last10 = _normalize_phone_last10(st.get("recipient"))
+        match = match_client_in_sheets(last10)
+        if not match or not match.get("row"):
+            return None
+        estatus = (match.get("estatus") or "").strip().upper()
+        if not estatus.startswith("ENVIAD"):
+            # Solo se corrige lo que nosotros dimos por enviado.
+            return None
+
+        headers, rows = _sheet_get_rows()
+        indice = int(match["row"]) - 2
+        fila = rows[indice] if 0 <= indice < len(rows) else []
+        next_action = _cell(fila, _idx(headers, "NEXT_ACTION")).strip().lower()
+
+        codigo = int(st.get("error_code") or 0)
+        if codigo in CODIGOS_NO_ENTREGABLES:
+            updates = {"ESTATUS": f"NO_ENTREGABLE_{codigo}"}
+        elif next_action == "reintento_1":
+            updates = {"ESTATUS": "NO_ENTREGABLE_TRAS_REINTENTO"}
+        else:
+            updates = {"ESTATUS": "PENDIENTE", "LAST_MESSAGE_AT": "", "NEXT_ACTION": "reintento_1",
+                       "retry_at": (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")}
+
+        _update_row_cells(int(match["row"]), updates, headers)
+        log.warning("🔁 Fila %s reconciliada por acuse de Meta: %s -> %s (codigo %s)",
+                    match["row"], estatus, updates["ESTATUS"], codigo or "sin_codigo")
+        return updates["ESTATUS"]
+    except Exception:
+        log.exception("⚠️ No se pudo reconciliar la fila tras el fallo de entrega")
+        return None
+
+
 def _handle_meta_statuses(local_values: List[Dict[str, Any]]) -> int:
     """Convierte los `statuses` de Meta en eventos anotados en la bitacora.
 
@@ -3344,6 +3493,8 @@ def _handle_meta_statuses(local_values: List[Dict[str, Any]]) -> int:
                 # Se conserva el volcado completo: es la unica fuente de los
                 # codigos de error de Meta mientras la bitacora se consolida.
                 log.warning("❌ STATUS failed (detalle): %s", json.dumps(st, ensure_ascii=False))
+                if _reconcile_enabled():
+                    _reconciliar_fila_por_fallo(st)
 
             event_type = radar_events.STATUS_TO_EVENT.get(st["status"])
             if not event_type:
@@ -4213,6 +4364,8 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
     if i_name is None or i_wa is None:
         raise RuntimeError("Faltan columnas requeridas: 'Nombre' y/o 'WhatsApp'.")
 
+    i_retry = _idx(headers, "retry_at")
+
     for row_number, row in enumerate(rows, start=2):
         wa = _cell(row, i_wa).strip()
         if not wa:
@@ -4225,6 +4378,13 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
         estatus = _cell(row, i_status).strip().upper() if i_status is not None else ""
         if estatus not in ("", "PENDIENTE"):
             continue
+
+        # Una fila que volvio a la cola por un acuse de fallo espera su turno:
+        # reenviarle a los cinco minutos es justo lo que Meta castiga.
+        if i_retry is not None:
+            reintento = _parse_dt_maybe(_cell(row, i_retry).strip())
+            if reintento is not None and reintento > datetime.utcnow().replace(tzinfo=reintento.tzinfo):
+                continue
 
         nombre = _cell(row, i_name).strip()
         # "row" se expone para poder resolver params_from_row contra las
