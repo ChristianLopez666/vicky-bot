@@ -1411,6 +1411,17 @@ def _notify_advisor(text: str) -> Dict[str, Any]:
     return resultado
 
 
+def _radar_advisor_notification(resultado: Dict[str, Any]) -> Dict[str, Any]:
+    """Adapta el resultado real de Meta al contrato 1.1 de Radar."""
+    enviado = bool(resultado.get("ok"))
+    return {
+        "advisor_phone_e164": _normalize_to_e164_mx(ADVISOR_NUMBER),
+        "result": "sent" if enviado else "failed",
+        "wamid": str(resultado.get("wamid") or "") or None,
+        "error": None if enviado else str(resultado.get("motivo") or "advisor_not_delivered"),
+    }
+
+
 def _match_name(match: Optional[Dict[str, Any]]) -> str:
     return ((match or {}).get("nombre") or "").strip()
 
@@ -2158,7 +2169,7 @@ def _execute_boardroom_instruction(phone: str, body: Dict[str, Any]) -> Tuple[bo
                 wamid=str(aviso.get("wamid") or "") or None,
                 delivery_status="sent" if aviso_entregado else "failed",
                 error_title=None if aviso_entregado else (str(aviso.get("motivo") or "advisor_not_delivered")),
-                advisor_notification={"required": True, "to": str(advisor.get("to") or "christian")},
+                advisor_notification=_radar_advisor_notification(aviso),
             )
 
         if instruction_type == "no_action":
@@ -2178,7 +2189,7 @@ def _execute_boardroom_instruction(phone: str, body: Dict[str, Any]) -> Tuple[bo
                     wamid=str(propio.get("wamid") or "") or None,
                     delivery_status="sent" if entregado else "failed",
                     error_title=None if entregado else (str(propio.get("motivo") or "advisor_not_delivered")),
-                    advisor_notification={"required": True, "to": "christian"},
+                    advisor_notification=_radar_advisor_notification(propio),
                 )
             # No se confirma ejecucion de un aviso que Meta rechazo.
             if not entregado and _advisor_alert_strict():
