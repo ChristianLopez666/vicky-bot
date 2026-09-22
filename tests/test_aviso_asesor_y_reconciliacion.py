@@ -119,6 +119,12 @@ def test_radar_recibe_el_aviso_con_su_request_id_y_su_resultado():
     assert kwargs["request_id"] == "r-9"
     assert kwargs["delivery_status"] == "failed"
     assert kwargs["error_title"] == "131047"
+    assert kwargs["advisor_notification"] == {
+        "advisor_phone_e164": "5216682478005",
+        "result": "failed",
+        "wamid": None,
+        "error": "131047",
+    }
 
 
 def test_una_respuesta_entregada_al_prospecto_no_se_marca_como_fallida():
