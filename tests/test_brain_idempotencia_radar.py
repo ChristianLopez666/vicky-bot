@@ -135,7 +135,7 @@ def test_el_aviso_a_christian_tambien_queda_en_radar():
                        decision="escalate",
                        authority={"escalation_reason": "money_or_client_impact"})
     with a, b, patch.object(vicky, "send_message", return_value={"ok": True, "wamid": "wamid.1"}), \
-         patch.object(vicky, "_notify_advisor"), \
+         patch.object(vicky, "_notify_advisor", return_value={"ok": True, "motivo": "", "request_id": "r-advisor", "wamid": "wamid.advisor"}), \
          patch.object(vicky, "_lead_identity_for_phone",
                       return_value={"lead_id": "LEAD-1", "nombre": "Ana", "phone_last10": PHONE[-10:]}), \
          patch.object(vicky, "record_radar_event") as radar:
@@ -144,7 +144,14 @@ def test_el_aviso_a_christian_tambien_queda_en_radar():
 
     tipos = [call.kwargs["event_type"] for call in radar.call_args_list]
     assert tipos == ["advisor_notified", "message_sent"]
-    assert radar.call_args_list[0].kwargs["trace"]["motivo"] == "money_or_client_impact"
+    aviso = radar.call_args_list[0].kwargs
+    assert aviso["trace"]["motivo"] == "money_or_client_impact"
+    assert aviso["advisor_notification"] == {
+        "advisor_phone_e164": "5216682478005",
+        "result": "sent",
+        "wamid": "wamid.advisor",
+        "error": None,
+    }
 
 
 def test_si_radar_falla_la_respuesta_al_prospecto_sigue_saliendo():
