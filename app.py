@@ -3416,6 +3416,24 @@ def _download_media(media_id: str) -> Tuple[Optional[bytes], Optional[str], Opti
         return None, None, None
 
 
+# Un cliente suele mandar varios archivos seguidos (INE, tarjeta, poliza): un
+# solo "Recibido y en proceso" por rafaga, no uno por archivo. Cada archivo se
+# sigue reenviando al asesor y subiendo a Drive.
+MEDIA_ACUSE_VENTANA_SECONDS = float(os.getenv("MEDIA_ACUSE_VENTANA_SECONDS", "120") or 0)
+_media_acuse_lock = threading.Lock()
+
+
+def _media_acuse_toca(phone: str) -> bool:
+    ahora = time.time()
+    with _media_acuse_lock:
+        datos = _ensure_user(phone)
+        ultimo = datos.get("media_acuse_ts") or 0
+        if ahora - ultimo < MEDIA_ACUSE_VENTANA_SECONDS:
+            return False
+        datos["media_acuse_ts"] = ahora
+        return True
+
+
 def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
     if user_state.get(phone, "") == "auto_intro":
         _ensure_user(phone)["auto_docs_recibidos"] = True
@@ -3441,7 +3459,8 @@ def _handle_media(phone: str, msg: Dict[str, Any]) -> None:
         folder_name = f"{_match_name(match).replace(' ', '_')}_{last4}" if _match_name(match) else f"Cliente_{last4}"
         link = upload_to_drive(filename, file_bytes, mime or "application/octet-stream", folder_name)
         _notify_advisor(f"🔔 Multimedia recibida\nDesde: {phone}\nArchivo: {filename}\nDrive: {link or '(sin link Drive)'}")
-        send_message(phone, "✅ *Recibido y en proceso*. En breve te doy seguimiento.")
+        if _media_acuse_toca(phone):
+            send_message(phone, "✅ *Recibido y en proceso*. En breve te doy seguimiento.")
     except Exception:
         log.exception("❌ Error manejando multimedia")
         send_message(phone, "Recibí tu archivo, gracias. Si algo falla, lo reviso de inmediato.")
