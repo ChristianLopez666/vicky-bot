@@ -148,3 +148,33 @@ def test_quien_modifica_las_filas_no_altera_la_copia_guardada():
         rows[0][0] = "Cambiado"
         _, otra = vicky._sheet_get_rows()
     assert otra[0][0] == "Yomero"
+
+
+def _media(n):
+    return {"type": "document", "document": {"id": f"doc-{n}"}}
+
+
+def _enviar_archivos(n, ventana=120):
+    _limpiar()
+    al_cliente, al_asesor = [], []
+    with patch.object(vicky, "send_message", side_effect=lambda p, t: al_cliente.append(t) or True), \
+         patch.object(vicky, "_notify_advisor", side_effect=lambda t: al_asesor.append(t)), \
+         patch.object(vicky, "forward_media_to_advisor"), \
+         patch.object(vicky, "_download_media", return_value=(b"x", "application/pdf", "a.pdf")), \
+         patch.object(vicky, "match_client_in_sheets", return_value=None), \
+         patch.object(vicky, "upload_to_drive", return_value="link"), \
+         patch.object(vicky, "MEDIA_ACUSE_VENTANA_SECONDS", ventana):
+        for i in range(n):
+            vicky._handle_media(PHONE, _media(i))
+    return al_cliente, al_asesor
+
+
+def test_varios_documentos_seguidos_dan_un_solo_aviso_al_cliente():
+    al_cliente, al_asesor = _enviar_archivos(3)
+    assert al_cliente == ["✅ *Recibido y en proceso*. En breve te doy seguimiento."]
+    assert len(al_asesor) == 3
+
+
+def test_sin_ventana_cada_documento_recibe_su_aviso():
+    al_cliente, _ = _enviar_archivos(2, ventana=0)
+    assert len(al_cliente) == 2
