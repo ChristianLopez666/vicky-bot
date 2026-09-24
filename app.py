@@ -293,6 +293,9 @@ TPV_TEMPLATE_NAME = "promo_tpv"
 ALLIANCE_TEMPLATES = {"despachis_contables"}
 
 SECOM_VIDA_TEMPLATES = {"vida_inbursa_proveedor_v1", "vida_temporal"}
+# Plantillas de campana de auto: un "si" entra directo al embudo del menu
+# (opcion 2) y pide INE y tarjeta de circulacion, en vez de solo avisar.
+SECOM_AUTO_TEMPLATES = {"seguro_auto_70"}
 
 TEMPLATE_IMAGE_ENV = {
     "seguro_auto_70": "SEGURO_AUTO_70_IMAGE_URL",
@@ -3645,6 +3648,10 @@ def _handle_awaiting_template_response(phone: str, text: str, match: Optional[Di
                 )
         except Exception:
             log.exception("⚠️ No fue posible actualizar Sheets para interés de plantilla genérica")
+
+        if template_name in SECOM_AUTO_TEMPLATES:
+            auto_start(phone, match)
+            return True
 
         send_message(
             phone,
