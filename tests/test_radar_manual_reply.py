@@ -78,3 +78,64 @@ def test_inbound_text_is_logged_but_vicky_does_not_answer_in_human_mode():
     append.assert_called_once()
     extend.assert_called_once_with(PHONE, message)
     send.assert_not_called()
+
+
+DOC = {"link": "https://radar.example.test/api/v1/doc/0123456789abcdef0123456789abcdef/Cotizacion.pdf", "filename": "Cotizacion Ana.pdf"}
+
+
+def _doc_body():
+    return {
+        "action": "reply", "to": PHONE, "lead_id": LEAD_ID, "document": dict(DOC),
+        "window_expires_at": _future_window(), "request_id": str(uuid.uuid4()), "actor": "Radar Comercial",
+    }
+
+
+def test_manual_reply_sends_a_pdf_by_link_from_radar():
+    events = []
+    body = _doc_body()
+    handoff = {"active": True, "expires_at": body["window_expires_at"], "actor": body["actor"]}
+    with patch.object(vicky, "RADAR_REPLY_TOKEN", "radar-secret"), \
+         patch.dict("os.environ", {"RADAR_EVENTS_URL": "https://radar.example.test/api/v1/vicky/events"}), \
+         patch.object(vicky, "match_client_in_sheets", return_value=_match()), \
+         patch.object(vicky, "_set_human_handoff", return_value=handoff), \
+         patch.object(vicky, "record_radar_event", side_effect=lambda **event: events.append(event)), \
+         patch.object(vicky, "send_document", return_value={"ok": True, "wamid": "wamid.doc", "motivo": ""}) as doc, \
+         patch.object(vicky, "send_message") as text:
+        response = vicky.app.test_client().post("/ext/radar/reply", headers=_headers(), json=body)
+    assert response.status_code == 200
+    doc.assert_called_once_with(PHONE, DOC["link"], DOC["filename"], return_detail=True)
+    text.assert_not_called()
+    assert [event["event_type"] for event in events] == ["message_requested", "message_sent"]
+    assert events[1]["wamid"] == "wamid.doc"
+    assert events[1]["text"] == "[Documento] Cotizacion Ana.pdf"
+
+
+def test_manual_reply_rejects_a_document_from_another_host_or_path():
+    for link in (
+        "https://otro.example.test/api/v1/doc/0123456789abcdef0123456789abcdef/x.pdf",   # otro dominio
+        "http://radar.example.test/api/v1/doc/0123456789abcdef0123456789abcdef/x.pdf",   # sin https
+        "https://radar.example.test/api/personas/secreto.pdf",                            # otra ruta
+    ):
+        body = _doc_body()
+        body["document"]["link"] = link
+        with patch.object(vicky, "RADAR_REPLY_TOKEN", "radar-secret"), \
+             patch.dict("os.environ", {"RADAR_EVENTS_URL": "https://radar.example.test/api/v1/vicky/events"}), \
+             patch.object(vicky, "match_client_in_sheets", return_value=_match()), \
+             patch.object(vicky, "send_document") as doc:
+            response = vicky.app.test_client().post("/ext/radar/reply", headers=_headers(), json=body)
+        assert response.status_code == 400, link
+        assert response.get_json()["error"] == "documento_invalido"
+        doc.assert_not_called()
+
+
+def test_manual_reply_document_respects_the_24h_window():
+    body = _doc_body()
+    body["window_expires_at"] = (datetime.utcnow() - timedelta(minutes=1)).isoformat()
+    with patch.object(vicky, "RADAR_REPLY_TOKEN", "radar-secret"), \
+         patch.dict("os.environ", {"RADAR_EVENTS_URL": "https://radar.example.test/api/v1/vicky/events"}), \
+         patch.object(vicky, "match_client_in_sheets", return_value=_match()), \
+         patch.object(vicky, "send_document") as doc:
+        response = vicky.app.test_client().post("/ext/radar/reply", headers=_headers(), json=body)
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "ventana_24h_cerrada"
+    doc.assert_not_called()

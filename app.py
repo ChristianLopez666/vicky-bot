@@ -24,6 +24,7 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -500,6 +501,58 @@ def send_message(to: str, text: str, return_detail: bool = False, retry_on_timeo
                 continue
             return _result(False, motivo="exception")
     return _result(False, motivo="unknown")
+
+def send_document(to: str, link: str, filename: str, return_detail: bool = False) -> bool | Dict[str, Any]:
+    """Envia un PDF por enlace dentro de una conversacion activa (ventana de 24 h).
+
+    Sin reintento ante timeout: la Cloud API no tiene clave de idempotencia y un
+    reintento podria entregar la cotizacion dos veces (mismo criterio que las
+    plantillas de campana).
+    """
+    def _result(ok: bool, wamid: str = "", motivo: str = "") -> bool | Dict[str, Any]:
+        return {"ok": ok, "wamid": wamid, "motivo": motivo} if return_detail else ok
+
+    if not (META_TOKEN and WPP_API_URL):
+        log.error("❌ WhatsApp no configurado (META_TOKEN/WABA_PHONE_ID faltan).")
+        return _result(False, motivo="whatsapp_no_configurado")
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": str(to),
+        "type": "document",
+        "document": {"link": str(link), "filename": str(filename)[:100]},
+    }
+    try:
+        resp = requests.post(WPP_API_URL, headers=_wpp_headers(), json=payload, timeout=WPP_TIMEOUT)
+    except requests.exceptions.Timeout:
+        log.error("⏰ Timeout enviando documento a %s", to)
+        return _result(False, motivo="timeout")
+    except Exception:
+        log.exception("❌ Error enviando documento a %s", to)
+        return _result(False, motivo="exception")
+    if resp.status_code in (200, 201):
+        try:
+            wamid = str((((resp.json() or {}).get("messages") or [{}])[0]).get("id") or "")
+        except Exception:
+            wamid = ""
+        return _result(True, wamid=wamid)
+    log.warning("⚠️ WPP send_document falló %s: %s", resp.status_code, resp.text[:200])
+    return _result(False, motivo=f"http_{resp.status_code}")
+
+
+def _documento_de_radar(document: Any) -> Optional[Tuple[str, str]]:
+    """Valida el documento que pide Radar: https, en el mismo dominio de Radar
+    (el de RADAR_EVENTS_URL) y bajo su ruta de documentos. Devuelve (enlace, nombre)."""
+    if not isinstance(document, dict):
+        return None
+    link = str(document.get("link") or "").strip()
+    filename = " ".join(str(document.get("filename") or "").split())[:100]
+    radar_host = urlparse(os.getenv("RADAR_EVENTS_URL", "").strip()).hostname
+    partes = urlparse(link)
+    if not (filename and radar_host and partes.scheme == "https" and partes.hostname == radar_host
+            and partes.path.startswith("/api/v1/doc/")):
+        return None
+    return link, filename
+
 
 def send_template_message(
     to: str,
@@ -4750,9 +4803,16 @@ def ext_radar_reply():
     if action != "reply":
         return jsonify({"ok": False, "error": "accion_invalida"}), 400
 
-    text = str(body.get("text") or "").strip()
-    if not text or len(text) > 500:
-        return jsonify({"ok": False, "error": "mensaje_invalido"}), 400
+    documento = None
+    if body.get("document") is not None:
+        documento = _documento_de_radar(body.get("document"))
+        if not documento:
+            return jsonify({"ok": False, "error": "documento_invalido"}), 400
+        text = f"[Documento] {documento[1]}"
+    else:
+        text = str(body.get("text") or "").strip()
+        if not text or len(text) > 500:
+            return jsonify({"ok": False, "error": "mensaje_invalido"}), 400
 
     expires_at = str(body.get("window_expires_at") or "").strip()
     expires = _parse_dt_maybe(expires_at)
@@ -4790,7 +4850,10 @@ def ext_radar_reply():
         delivery_status="requested", trace=trace, **event_base,
     )
 
-    detail = send_message(to, text, return_detail=True, retry_on_timeout=False)
+    if documento:
+        detail = send_document(to, documento[0], documento[1], return_detail=True)
+    else:
+        detail = send_message(to, text, return_detail=True, retry_on_timeout=False)
     if not isinstance(detail, dict):
         detail = {"ok": bool(detail), "wamid": "", "motivo": "desconocido"}
     if detail.get("ok") and detail.get("wamid"):
