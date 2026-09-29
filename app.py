@@ -50,6 +50,7 @@ except Exception:  # pragma: no cover - dependencia opcional
 # Enchufe hacia Radar (contrato 1.1, commit f78ea40). Solo define el sobre,
 # la identidad de los eventos y la bitacora; no envia nada por si mismo.
 import radar_events
+import radar_campanas
 import radar_outbox
 import radar_acceptance
 import radar_backfill
@@ -119,6 +120,9 @@ SHEETS_TITLE_LEADS = os.getenv("SHEETS_TITLE_LEADS", "Prospectos SECOM Auto").st
 DRIVE_PARENT_FOLDER_ID = os.getenv("DRIVE_PARENT_FOLDER_ID", "").strip()
 AUTO_SEND_TOKEN = os.getenv("AUTO_SEND_TOKEN", "").strip()
 RADAR_REPLY_TOKEN = os.getenv("RADAR_REPLY_TOKEN", "").strip()
+# Radar Comercial: dar de alta campanas y encolar personas (radar_campanas.py).
+# Vacio = rutas inertes (401), igual que las demas integraciones con Radar.
+RADAR_QUEUE_TOKEN = os.getenv("RADAR_QUEUE_TOKEN", "").strip()
 
 # CF-4: kill switch de la campana outbound (auto-send-one), persistente en
 # Sheets para sobrevivir un reinicio del servicio mientras esta pausada.
@@ -4672,6 +4676,7 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
         raise RuntimeError("Faltan columnas requeridas: 'Nombre' y/o 'WhatsApp'.")
 
     i_retry = _idx(headers, "retry_at")
+    i_campana = _idx(headers, radar_campanas.CAMPANA_COLUMN)
 
     for row_number, row in enumerate(rows, start=2):
         wa = _cell(row, i_wa).strip()
@@ -4684,6 +4689,11 @@ def _pick_next_pending(headers: List[str], rows: List[List[str]]) -> Optional[Di
 
         estatus = _cell(row, i_status).strip().upper() if i_status is not None else ""
         if estatus not in ("", "PENDIENTE"):
+            continue
+
+        # Las filas de una campana de Radar llevan su propia plantilla: el
+        # camino de siempre (plantilla fija en el comando del cron) no las toca.
+        if i_campana is not None and _cell(row, i_campana).strip():
             continue
 
         # Una fila que volvio a la cola por un acuse de fallo espera su turno:
@@ -4801,6 +4811,175 @@ def ext_radar_reply():
     return jsonify({"ok": False, "sent": False, "error": reason, "request_id": request_id}), 502
 
 
+# ==========================
+# Campanas lanzadas desde Radar Comercial (radar_campanas.py)
+# ==========================
+def _radar_queue_autorizado() -> bool:
+    token = (request.headers.get("X-RADAR-QUEUE-TOKEN") or "").strip()
+    return bool(RADAR_QUEUE_TOKEN) and hmac.compare_digest(token, RADAR_QUEUE_TOKEN)
+
+
+def _campanas_filas() -> List[List[str]]:
+    _ensure_tab(radar_campanas.CAMPANAS_TAB, radar_campanas.CAMPANAS_HEADER, filas=200)
+    rng = f"{radar_campanas.CAMPANAS_TAB}!A2:I"
+    values = _sheets_values().get(spreadsheetId=SHEETS_ID_LEADS, range=rng).execute()
+    return values.get("values", [])
+
+
+def _campanas_leer() -> Dict[str, Dict[str, Any]]:
+    return radar_campanas.leer_campanas(_campanas_filas())
+
+
+def _campana_guardar(c: Dict[str, Any]) -> None:
+    """Alta o actualizacion de la receta de una campana (una fila por ID)."""
+    filas = _campanas_filas()
+    fila = radar_campanas.fila_de_campana(c, _utc_now_iso())
+    for n, f in enumerate(filas, start=2):
+        if f and str(f[0]).strip() == c["id"]:
+            _sheets_values().update(
+                spreadsheetId=SHEETS_ID_LEADS, range=f"{radar_campanas.CAMPANAS_TAB}!A{n}:I{n}",
+                valueInputOption="RAW", body={"values": [fila]},
+            ).execute()
+            return
+    _sheets_values().append(
+        spreadsheetId=SHEETS_ID_LEADS, range=f"{radar_campanas.CAMPANAS_TAB}!A:I",
+        valueInputOption="RAW", insertDataOption="INSERT_ROWS", body={"values": [fila]},
+    ).execute()
+
+
+def _asegurar_columna_campana(headers: List[str]) -> List[str]:
+    """Agrega la columna CAMPANA_RADAR al final del encabezado si falta.
+
+    La hoja se lee y escribe como A:Z (26 columnas); si ya no cabe se detiene
+    con un error claro en vez de escribir fuera de rango.
+    """
+    if radar_campanas.CAMPANA_COLUMN in headers:
+        return headers
+    if len(headers) >= 26:
+        raise RuntimeError("La hoja de leads ya usa 26 columnas (A:Z); no cabe CAMPANA_RADAR.")
+    letra = chr(ord("A") + len(headers))
+    _sheets_values().update(
+        spreadsheetId=SHEETS_ID_LEADS, range=f"{SHEETS_TITLE_LEADS}!{letra}1",
+        valueInputOption="RAW", body={"values": [[radar_campanas.CAMPANA_COLUMN]]},
+    ).execute()
+    _sheet_rows_invalidate()
+    return headers + [radar_campanas.CAMPANA_COLUMN]
+
+
+def _elegir_fila_radar(headers: List[str], rows: List[List[str]]):
+    """Primera fila encolada por Radar cuya campana esta activa y que cumple
+    las mismas reglas del cron de siempre."""
+    i_camp = _idx(headers, radar_campanas.CAMPANA_COLUMN)
+    if i_camp is None:
+        return None
+    campanas = {cid: c for cid, c in _campanas_leer().items() if c["activa"]}
+    if not campanas:
+        return None
+    ahora = datetime.utcnow()
+    i_name = _idx(headers, "Nombre")
+    i_wa = _idx(headers, "WhatsApp")
+    for row_number, row in enumerate(rows, start=2):
+        cid = _cell(row, i_camp).strip()
+        if cid not in campanas:
+            continue
+        if not radar_campanas.fila_elegible(headers, row, ahora, _parse_dt_maybe):
+            continue
+        return ({
+            "row_number": row_number,
+            "nombre": _cell(row, i_name).strip() if i_name is not None else "",
+            "whatsapp": _cell(row, i_wa).strip(),
+            "row": row,
+        }, campanas[cid])
+    return None
+
+
+def _cuerpo_de_campana(c: Dict[str, Any]) -> Dict[str, Any]:
+    """La receta de la campana con la misma forma que el comando del cron."""
+    cuerpo: Dict[str, Any] = {
+        "template": c["template"],
+        "language": c["language"],
+        "success_status": c["success_status"],
+    }
+    if c.get("image_url"):
+        cuerpo["image_url"] = c["image_url"]
+    if c.get("params_from_row") is not None:
+        cuerpo["params_from_row"] = c["params_from_row"]
+    return cuerpo
+
+
+@app.post("/ext/radar/campana")
+def ext_radar_campana():
+    """Radar da de alta o actualiza la receta de una campana (o la pausa)."""
+    if not _radar_queue_autorizado():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        c = radar_campanas.validar_campana(request.get_json(silent=True) or {})
+    except radar_campanas.CampanaInvalida as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    try:
+        _campana_guardar(c)
+    except Exception:
+        log.exception("❌ No se pudo guardar la campana %s", c["id"])
+        return jsonify({"ok": False, "error": "sheets_no_disponible"}), 503
+    return jsonify({"ok": True, "campana": c}), 200
+
+
+@app.post("/ext/radar/encolar")
+def ext_radar_encolar():
+    """Radar manda a quien enviarle una campana. No envia nada: solo deja a
+    esas personas en la cola de la hoja con su campana; el cron las envia."""
+    if not _radar_queue_autorizado():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    campana_id = str(body.get("campana_id") or "").strip()
+    items = body.get("items")
+    if not isinstance(items, list) or not 1 <= len(items) <= radar_campanas.MAX_ITEMS:
+        return jsonify({"ok": False, "error": f"items: de 1 a {radar_campanas.MAX_ITEMS}"}), 400
+    try:
+        campana = _campanas_leer().get(campana_id)
+    except Exception:
+        log.exception("❌ No se pudo leer %s", radar_campanas.CAMPANAS_TAB)
+        return jsonify({"ok": False, "error": "sheets_no_disponible"}), 503
+    if not campana:
+        return jsonify({"ok": False, "error": "campana_desconocida"}), 404
+    if not campana["activa"]:
+        return jsonify({"ok": False, "error": "campana_pausada"}), 409
+    try:
+        headers, rows = _sheet_get_rows()
+        headers = _asegurar_columna_campana(headers)
+        resultados, actualizar, nuevas = radar_campanas.planear_encolado(headers, rows, campana_id, items)
+        data = []
+        for n, cambios in actualizar.items():
+            for col, val in cambios.items():
+                j = _idx(headers, col)
+                if j is not None:
+                    data.append({"range": f"{SHEETS_TITLE_LEADS}!{chr(ord('A') + j)}{n}", "values": [[val]]})
+        if data:
+            _sheets_values().batchUpdate(
+                spreadsheetId=SHEETS_ID_LEADS, body={"valueInputOption": "RAW", "data": data},
+            ).execute()
+        if nuevas:
+            filas = [[fila.get(h, "") for h in headers] for fila in nuevas]
+            _sheets_values().append(
+                spreadsheetId=SHEETS_ID_LEADS, range=f"{SHEETS_TITLE_LEADS}!A:Z",
+                valueInputOption="RAW", insertDataOption="INSERT_ROWS", body={"values": filas},
+            ).execute()
+    except radar_campanas.CampanaInvalida as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
+    except Exception as exc:
+        log.exception("❌ No se pudo encolar la campana %s", campana_id)
+        return jsonify({"ok": False, "error": str(exc)[:200]}), 503
+    finally:
+        _sheet_rows_invalidate()
+    return jsonify({
+        "ok": True,
+        "campana_id": campana_id,
+        "encolados": sum(1 for r in resultados if r["accion"] != "omitido"),
+        "omitidos": sum(1 for r in resultados if r["accion"] == "omitido"),
+        "resultados": resultados,
+    }), 200
+
+
 @app.post("/ext/auto-send-one")
 def ext_auto_send_one():
     """Cron: envía 1 plantilla al siguiente prospecto pendiente."""
@@ -4813,6 +4992,21 @@ def ext_auto_send_one():
             return jsonify({"ok": True, "sent": False, "reason": "paused_by_boardroom"}), 200
 
         body = request.get_json(force=True, silent=True) or {}
+
+        # Modo campanas de Radar: primero las filas que Radar encolo, cada una
+        # con la receta de SU campana. Si no hay ninguna y el comando trae una
+        # plantilla, se sigue con el camino de siempre (filas sin campana).
+        campana_radar = None
+        nxt_radar = None
+        if str(body.get("modo") or "").strip() == "campanas_radar":
+            h_radar, r_radar = _sheet_get_rows()
+            elegida = _elegir_fila_radar(h_radar, r_radar)
+            if elegida:
+                nxt_radar, campana_radar = elegida
+                body = _cuerpo_de_campana(campana_radar)
+            elif not str(body.get("template", "")).strip():
+                return jsonify({"ok": True, "sent": False, "reason": "no_pending"}), 200
+
         template_name = str(body.get("template", "")).strip()
         if not template_name:
             return jsonify({
@@ -4859,7 +5053,7 @@ def ext_auto_send_one():
         if not headers:
             return jsonify({"ok": False, "error": "Sheet vacío"}), 400
 
-        nxt = _pick_next_pending(headers, rows)
+        nxt = nxt_radar or _pick_next_pending(headers, rows)
         if not nxt:
             return jsonify({"ok": True, "sent": False, "reason": "no_pending"}), 200
 
@@ -4921,7 +5115,7 @@ def ext_auto_send_one():
             "phone_number_id": WABA_PHONE_ID,
             "request_id": request_id,
             "template": template_name,
-            "campaign": RADAR_CAMPAIGN or None,
+            "campaign": (campana_radar or {}).get("id") or RADAR_CAMPAIGN or None,
             "direction": "outbound",
         }
         record_radar_event(
@@ -5023,6 +5217,8 @@ def ext_auto_send_one():
             "estatus": estatus_val,
             "timestamp": now_iso,
         }
+        if campana_radar:
+            response["campana"] = campana_radar["id"]
         if incierto:
             response["uncertain"] = True
         if auto_paused:
