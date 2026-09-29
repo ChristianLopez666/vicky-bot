@@ -210,16 +210,22 @@ def test_fila_con_reintento_futuro_espera_su_turno(entorno):
 @pytest.fixture
 def rutas():
     llamadas = MagicMock()
-    estado = {"campanas": {"vida-oct": dict(CAMPANA_VIDA)}, "headers": list(H), "rows": []}
+    hojas = MagicMock()
+    estado = {"campanas": {"vida-oct": dict(CAMPANA_VIDA)}, "headers": list(H), "rows": [], "columnas": 26}
+    hojas.get.return_value.execute.side_effect = lambda: {"sheets": [
+        {"properties": {"sheetId": 0, "title": "Otra", "gridProperties": {"columnCount": 5}}},
+        {"properties": {"sheetId": 77, "title": vicky.SHEETS_TITLE_LEADS, "gridProperties": {"columnCount": estado["columnas"]}}},
+    ]}
     vicky.app.config["TESTING"] = True
     with patch.object(vicky, "RADAR_QUEUE_TOKEN", "queue-secret"), \
             patch.object(vicky, "_campanas_leer", side_effect=lambda: estado["campanas"]), \
             patch.object(vicky, "_campana_guardar") as guardar, \
             patch.object(vicky, "_sheet_get_rows", side_effect=lambda: (estado["headers"], estado["rows"])), \
             patch.object(vicky, "_sheets_values", return_value=llamadas), \
+            patch.object(vicky, "_sheets", return_value=hojas), \
             patch.object(vicky, "_sheet_rows_invalidate"):
         with vicky.app.test_client() as c:
-            yield {"c": c, "llamadas": llamadas, "guardar": guardar, "estado": estado}
+            yield {"c": c, "llamadas": llamadas, "hojas": hojas, "guardar": guardar, "estado": estado}
 
 
 def _post(c, ruta, body, token="queue-secret"):
@@ -265,10 +271,17 @@ def test_encolar_escribe_filas_nuevas_y_actualiza_existentes(rutas):
 
 def test_encolar_agrega_la_columna_si_falta_y_frena_si_no_cabe(rutas):
     rutas["estado"]["headers"] = H[:-1]
-    r = _post(rutas["c"], "/ext/radar/encolar", {"campana_id": "vida-oct", "items": [{"telefono": "6680000001", "lead_id": LEAD_A}]})
-    assert r.status_code == 200
-    rango = rutas["llamadas"].update.call_args.kwargs["range"]
-    assert rango == f"{vicky.SHEETS_TITLE_LEADS}!G1"
+    item = {"campana_id": "vida-oct", "items": [{"telefono": "6680000001", "lead_id": LEAD_A}]}
+    # Hay espacio en la cuadricula: solo se escribe el encabezado.
+    assert _post(rutas["c"], "/ext/radar/encolar", item).status_code == 200
+    assert rutas["llamadas"].update.call_args.kwargs["range"] == f"{vicky.SHEETS_TITLE_LEADS}!G1"
+    rutas["hojas"].batchUpdate.assert_not_called()
+    # Cuadricula justa (como la hoja real, 17 columnas para 17 encabezados): se agrega
+    # UNA columna a la pestana correcta antes de escribir el encabezado.
+    rutas["estado"]["columnas"] = 6
+    assert _post(rutas["c"], "/ext/radar/encolar", item).status_code == 200
+    peticion = rutas["hojas"].batchUpdate.call_args.kwargs["body"]["requests"][0]["appendDimension"]
+    assert peticion == {"sheetId": 77, "dimension": "COLUMNS", "length": 1}
     rutas["estado"]["headers"] = [f"C{i}" for i in range(24)] + ["WhatsApp", "ESTATUS"]
     r = _post(rutas["c"], "/ext/radar/encolar", {"campana_id": "vida-oct", "items": [{"telefono": "6680000001", "lead_id": LEAD_A}]})
     assert r.status_code == 503 and "26 columnas" in r.get_json()["error"]

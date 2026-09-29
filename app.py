@@ -4857,6 +4857,27 @@ def _asegurar_columna_campana(headers: List[str]) -> List[str]:
         return headers
     if len(headers) >= 26:
         raise RuntimeError("La hoja de leads ya usa 26 columnas (A:Z); no cabe CAMPANA_RADAR.")
+    # La cuadricula de la hoja se mantiene justa (el libro roza el tope de
+    # 10 millones de celdas de Google), asi que puede no existir la columna
+    # siguiente: se agrega UNA sola, solo si hace falta.
+    meta = _sheets().get(
+        spreadsheetId=SHEETS_ID_LEADS, fields="sheets.properties(sheetId,title,gridProperties.columnCount)"
+    ).execute()
+    hoja = next(
+        (h.get("properties") or {} for h in (meta.get("sheets") or [])
+         if (h.get("properties") or {}).get("title") == SHEETS_TITLE_LEADS),
+        None,
+    )
+    if hoja is None:
+        raise RuntimeError(f"No se encontro la pestana {SHEETS_TITLE_LEADS}.")
+    columnas = int((hoja.get("gridProperties") or {}).get("columnCount") or 0)
+    if columnas <= len(headers):
+        _sheets().batchUpdate(
+            spreadsheetId=SHEETS_ID_LEADS,
+            body={"requests": [{"appendDimension": {
+                "sheetId": hoja.get("sheetId"), "dimension": "COLUMNS", "length": len(headers) + 1 - columnas,
+            }}]},
+        ).execute()
     letra = chr(ord("A") + len(headers))
     _sheets_values().update(
         spreadsheetId=SHEETS_ID_LEADS, range=f"{SHEETS_TITLE_LEADS}!{letra}1",
